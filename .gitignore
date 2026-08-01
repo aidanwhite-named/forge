@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+.venv/
+venv/
+ENV/
+
+# Python cache & test output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+frontend/.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Build & Dist
+frontend/dist/
+frontend/dist-ssr/
+*.egg-info/
+.eggs/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Data & Logs
+backend/data/
+*.log
+
+
+# IDE / Editor files
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

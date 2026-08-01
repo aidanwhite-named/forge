@@ -1,0 +1,16 @@
+services:
+  backend:
+    build: ./backend
+    ports: ["8330:8330"]
+    environment:
+      AGY_MODEL: "flash-3.6"
+    volumes:
+      - ./backend/data:/app/data
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    ports: ["5374:5374"]
+    volumes:
+      - ./frontend:/app
+    depends_on: [backend]
