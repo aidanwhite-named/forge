@@ -1,0 +1,80 @@
+.hero-stamp {
+  color: var(--ink);
+  cursor: pointer;
+  transition: transform .2s, box-shadow .2s;
+}
+
+.hero-stamp:hover:not(:disabled) {
+  transform: translate(3px, 3px) rotate(4deg);
+  box-shadow: 4px 4px 0 var(--ink);
+}
+
+.hero-stamp:active:not(:disabled) {
+  transform: translate(7px, 7px) rotate(2deg);
+  box-shadow: 0 0 0 var(--ink);
+}
+
+.hero-stamp:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+@media (max-width: 780px) {
+  .hero {
+    flex-wrap: wrap;
+  }
+
+  .hero-stamp {
+    display: flex;
+    margin-left: auto;
+  }
+}
+
+.settings label {
+  margin-bottom: 22px;
+}
+
+.settings select {
+  appearance: none;
+  min-width: 230px;
+  margin-left: 16px;
+  padding: 11px 44px 11px 16px;
+  border: 1px solid #c8cbc4;
+  border-radius: 12px;
+  background-color: #f8f8f4;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--ink) 50%),
+    linear-gradient(135deg, var(--ink) 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 50%,
+    calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 1px 0 #fff inset, 0 4px 14px #171b1c0a;
+  transition: border-color .2s, box-shadow .2s, transform .2s, background-color .2s;
+}
+
+.settings select:hover {
+  border-color: var(--ink);
+  background-color: #fff;
+  box-shadow: 0 1px 0 #fff inset, 0 7px 20px #171b1c12;
+  transform: translateY(-1px);
+}
+
+.settings select:focus-visible {
+  border-color: var(--ink);
+  outline: 3px solid var(--acid);
+  outline-offset: 2px;
+  box-shadow: 0 7px 20px #171b1c12;
+}
+
+@media (max-width: 780px) {
+  .settings select {
+    display: block;
+    width: 100%;
+    margin: 8px 0 0;
+  }
+}

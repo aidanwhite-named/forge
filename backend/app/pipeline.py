@@ -1,293 +1,255 @@
-import json
-import re
-from .agy import run_agy
-from .config import load_runtime_settings
-from .models import AnalysisResult, ClaimResult, DocumentMapping, Evidence
-from .prompts import DEFAULT_ANALYSIS_PROMPT
+"""분석 오케스트레이션.
 
-# 사용자의 분석 지시를 그대로 수행시키되, 결과만 기계가 읽을 수 있는 필드에 담게 하는 규약입니다.
-# 지시문 자체를 덮어쓰지 않도록 형식 요구만 담습니다.
-OUTPUT_CONTRACT = """
-[출력 규약]
-위 [분석 지시]를 그대로 수행하되, 결과는 아래 스키마를 따르는 JSON 객체 **하나만** 출력하십시오. 코드펜스, 머리말, 설명 문장을 붙이지 마십시오.
-{
-  "document_mapping": [
-    {
-      "reference_number": 1,
-      "document_id": "CONTEXT documents의 id",
-      "document_number": "문헌 고유번호(예: US 10,987,654 A1 / 10-2020-0012345호). 문헌에서 확인되지 않으면 빈 문자열",
-      "role": "주 인용발명 | 부 인용발명"
-    }
-  ],
-  "claims": [
-    {
-      "label": "입력 구성요소의 라벨(A, B, C…)을 그대로",
-      "similarity": 0-100 정수, 대응 인용발명이 없으면 null,
-      "grade": "동일 | 실질적 동일 | 기술 사상 동일, 세부 구현 방식의 단순 변경 | 핵심 기능 유사하나 목적/효과에 일부 차이 | 대응 안됨",
-      "emoji": "🔵 | 🟢 | 🟠 | 🟡 | ⚪",
-      "narrative": "[분석 지시]가 요구한 구성대비 서술을 라벨 없이 하나의 자연스러운 문장으로. 인용발명 명칭·문헌번호·발췌문·단락번호·판단 이유를 문장 안에 녹여 작성",
-      "difference": "차이점 한 줄. 없으면 null",
-      "combination": true 또는 false (두 개 이상의 인용발명을 결합했는지),
-      "references": ["근거가 된 document id"],
-      "evidence": [
-        {
-          "document_id": "문서 id",
-          "paragraph": "단락번호 4자리 또는 null",
-          "page": 페이지 번호 정수 또는 null,
-          "excerpt": "문서 원문 인용(외국어 문헌은 한국어 번역문)",
-          "original_excerpt": "외국어 문헌의 원문 1줄, 국문 문헌은 null",
-          "quality": "HIGH | MEDIUM | LOW | UNVERIFIED"
-        }
-      ],
-      "status": "개시됨 | 부분 개시 | 미개시",
-      "note": "판단 근거 한두 문장"
-    }
-  ],
-  "summary": "전체 분석 요약",
-  "summary_similarity": "종합 분석 요약의 유사점 한 줄",
-  "summary_difference": "종합 분석 요약의 차이점 한 줄. 없으면 빈 문자열",
-  "validation": ["검증 시 주의할 점"]
-}
+단계는 네 가지입니다.
+  1. 청구항 분해 (정규식 + 중요도 LLM 1회)
+  2. 구성요소 × 문헌 전수 비교 (LLM, 캐시됨) → 발췌 검증 (문자열 대조)
+  3. 인용발명 선정 (전부 코드)
+  4. 보고서 조립 (전부 코드)
 
-형식 규칙:
-- claims 배열의 길이·순서·label은 입력 claims와 정확히 같아야 합니다. 구성요소를 임의로 나누거나 합치지 마십시오.
-- narrative는 반드시 한 문장으로 작성하고 줄바꿈을 넣지 마십시오. "유사도:" 표기와 "→ 차이점:" 줄은 별도 필드로 나가므로 narrative 안에 다시 쓰지 마십시오.
-- document_mapping은 대응도가 높은 순서대로 reference_number 1, 2, 3…을 매기며 업로드 순서와 무관합니다. 모든 문서를 빠짐없이 한 번씩만 포함하십시오.
-- 문헌을 지칭할 때는 "인용발명 N (문헌번호)" 형태를 쓰고, N은 document_mapping에서 정한 번호를 전체 분석 내내 동일하게 유지하십시오.
-- excerpt는 CONTEXT documents에 실제로 존재하는 문장을 그대로 인용하고 지어내지 마십시오.
-- 어느 인용발명에서도 대응 구성을 찾지 못하면 similarity는 null, emoji는 "⚪", grade는 "대응 안됨", evidence는 빈 배열, status는 "미개시"로 두십시오.
-
-CONTEXT:
+LLM은 구성대비 사실만 답하고, 인용발명 조합과 보고서 문장은 전부 코드가 정합니다.
+같은 비교 매트릭스에서는 항상 같은 결과가 나옵니다.
 """
-
-_LABEL_SPLIT = re.compile(r"(?=\(\s*[A-Z]\s*\))")
-_LABEL_HEAD = re.compile(r"^\(\s*([A-Z])\s*\)\s*")
-_GRADES = ((95, "동일", "🔵"), (90, "실질적 동일", "🟢"), (85, "기술 사상 동일, 세부 구현 방식의 단순 변경", "🟠"),
-           (80, "핵심 기능 유사하나 목적/효과에 일부 차이", "🟡"), (0, "대응 안됨", "⚪"))
-
-
-def _auto_label(index: int) -> str:
-    """A…Z를 넘어가면 AA, AB…로 이어 붙입니다."""
-    label = ""
-    index += 1
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        label = chr(65 + remainder) + label
-    return label
+from . import cache
+from .chain import build_chain, matrix_for
+from .claims import ancestry, assign_importance, input_quality_warnings, parse_claims
+from .compare import compare_claims_documents, compare_document
+from .config import load_runtime_settings
+from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
+from .report import build_claim_report, build_mappings, refresh_mappings, to_markdown  # noqa: F401  (main에서 재수출)
+from .verify import verify_matches
 
 
-def split_claims(claims_text: str) -> tuple[str, list[dict]]:
-    """(A)~(Z) 라벨을 기준으로만 구성요소를 나누고 라벨을 보존합니다.
+def analyze(job_id: str, claims_text: str, documents: list[Document],
+            analysis_prompt: str = "", progress=None) -> AnalysisResult:
+    claims = parse_claims(claims_text)
+    if not claims:
+        raise RuntimeError("청구항을 인식하지 못했습니다.")
+    guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or ""
+    validation = list(assign_importance(claims))
+    validation += input_quality_warnings(claims)
+    validation += _date_eligibility_warnings(documents)
+    by_id = {document.id: document for document in documents}
 
-    줄바꿈으로 쪼개면 여러 줄에 걸친 하나의 구성이 둘로 갈려 이후 라벨이 전부 밀리므로,
-    라벨이 있으면 라벨만으로 나누고 구성 내부의 줄바꿈은 공백으로 합칩니다.
-    라벨이 없는 청구항은 문단(빈 줄) 단위로 나눈 뒤 A부터 순서대로 부여합니다.
+    matches, cached_claims, compare_warnings = _compare_all(claims, documents, guideline, progress)
+    validation += compare_warnings
+    validation += verify_matches(matches, by_id)
+
+    chains: dict[int, ChainInfo] = {}
+    for claim in _processing_order(claims):
+        claim_matrix = _claim_matrix(matches, documents, claim.number)
+        chains[claim.number] = build_chain(claim, claim_matrix, chains, claims)
+
+    ordered_chains = [chains[claim.number] for claim in claims]
+    mappings = build_mappings(documents, ordered_chains)
+
+    reports = [build_claim_report(
+        claim, chains[claim.number],
+        _claim_matrix(matches, documents, claim.number),
+        by_id, mappings)
+        for claim in claims]
+
+    for document in documents:
+        if document.ocr_required:
+            validation.append(f"{document.filename}에서 텍스트를 거의 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+
+    return AnalysisResult(
+        job_id=job_id, claim_mapping=mappings, reports=reports,
+        preamble=claims[0].preamble if claims else "",
+        validation=validation, cached_claims=sorted(cached_claims),
+    )
+
+
+def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
+                                 new_claim_numbers: set[int], documents: list[Document],
+                                 analysis_prompt: str = "", progress=None) -> AnalysisResult:
+    """기존 보고서의 인용발명을 재사용해 새 종속항 보고서를 덧붙입니다.
+
+    기존 청구항은 다시 판정하지 않습니다. 새 종속항 중 캐시에 없는 모든
+    (청구항 × 문헌) 셀만 하나의 일괄 LLM 호출로 받아 항별 보고서로 분리합니다.
     """
-    text = claims_text.replace("\r\n", "\n").strip()
-    parts = [part for part in _LABEL_SPLIT.split(text) if part.strip()]
-    labeled = [part for part in parts if _LABEL_HEAD.match(part.strip())]
-    preamble = ""
-    claims: list[dict] = []
-    if labeled:
-        if parts and not _LABEL_HEAD.match(parts[0].strip()):
-            preamble = re.sub(r"\s+", " ", parts[0]).strip()
-        for part in labeled:
-            part = part.strip()
-            label = _LABEL_HEAD.match(part).group(1)
-            body = re.sub(r"\s+", " ", _LABEL_HEAD.sub("", part)).strip()
-            claims.append({"label": label, "text": body})
-        return preamble, claims
-    blocks = [block for block in re.split(r"\n\s*\n", text) if block.strip()]
-    if len(blocks) == 1:
-        blocks = [line for line in text.split("\n") if line.strip()]
-    for index, block in enumerate(blocks):
-        claims.append({"label": _auto_label(index), "text": re.sub(r"\s+", " ", block).strip()})
-    return preamble, claims
+    all_claims = parse_claims(claims_text)
+    new_claims = [claim for claim in all_claims if claim.number in new_claim_numbers]
+    if not new_claims:
+        raise RuntimeError("추가할 종속항을 인식하지 못했습니다.")
+    guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or ""
+    validation = list(existing.validation)
+    validation += assign_importance(new_claims)
+    validation += input_quality_warnings(new_claims)
+    matches, cached_claims, warnings = _compare_all_batch(new_claims, documents, guideline, progress)
+    validation += warnings
+    by_id = {document.id: document for document in documents}
+    validation += verify_matches(matches, by_id)
+    chains = {report.claim_number: report.chain for report in existing.reports}
+    reports = list(existing.reports)
+    new_matrices: dict[int, dict[str, dict[str, ElementMatch]]] = {}
+    for claim in _processing_order(new_claims):
+        claim_matrix = _claim_matrix(matches, documents, claim.number)
+        new_matrices[claim.number] = claim_matrix
+        chains[claim.number] = build_chain(claim, claim_matrix, chains, all_claims)
+
+    existing.claim_mapping = refresh_mappings(existing.claim_mapping, list(chains.values()))
+    reports += [build_claim_report(claim, chains[claim.number], new_matrices[claim.number],
+                                   by_id, existing.claim_mapping)
+                for claim in new_claims]
+    existing.reports = sorted(reports, key=lambda report: report.claim_number)
+    existing.validation = validation
+    existing.cached_claims = sorted(set(existing.cached_claims) | cached_claims)
+    return existing
 
 
-def build_context(preamble: str, claims: list[dict], documents: list[dict]) -> str:
-    """LLM에 넘길 최소 컨텍스트. 원문 text/pages는 chunks와 중복이라 제외합니다."""
-    payload = {
-        "claim_preamble": preamble,
-        "claims": claims,
-        "documents": [
+def _claim_matrix(matches: list[ElementMatch], documents: list[Document],
+                  claim_number: int) -> dict[str, dict[str, ElementMatch]]:
+    """청구항 번호까지 먼저 거른 뒤 라벨 행렬을 만듭니다.
+
+    여러 청구항이 모두 (A), (B)를 사용하므로 전체 목록을 먼저 label로 인덱싱하면
+    뒤 항이 앞 항을 덮어씁니다. 항별 분리가 반드시 인덱싱보다 먼저 이루어져야 합니다.
+    """
+    matrix = matrix_for([match for match in matches if match.claim_number == claim_number])
+    for document in documents:
+        matrix.setdefault(document.id, {})
+    return matrix
+
+
+def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
+                 progress) -> tuple[list[ElementMatch], set[int], list[str]]:
+    """(청구항 × 문헌) 전수 비교. 캐시가 있으면 CLI를 부르지 않습니다."""
+    matches: list[ElementMatch] = []
+    cached_claims: set[int] = set()
+    warnings: list[str] = []
+    total = len(claims) * len(documents)
+    done = 0
+    for claim in claims:
+        claim_cached = bool(documents)
+        for document in documents:
+            key = cache.cache_key(claim, document, guideline)
+            cell = cache.load(key)
+            if cell is None:
+                claim_cached = False
+                cell, cell_warnings = compare_document(claim, document, guideline)
+                warnings += cell_warnings
+                if not cell_warnings:
+                    cache.store(key, cell)
+            matches += cell
+            done += 1
+            if progress:
+                progress(f"구성대비 {done}/{total} — 청구항 {claim.number} × {document.filename}")
+        if claim_cached:
+            cached_claims.add(claim.number)
+    return matches, cached_claims, warnings
+
+
+def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline: str,
+                       progress) -> tuple[list[ElementMatch], set[int], list[str]]:
+    """캐시 누락 종속항을 모아 단 한 번 비교하고 결과는 기존 셀 캐시에 나눠 저장합니다."""
+    matches: list[ElementMatch] = []
+    cached_claims: set[int] = set()
+    misses_by_claim: dict[int, list[Document]] = {}
+    claims_by_number = {claim.number: claim for claim in claims}
+    for claim in claims:
+        claim_cached = bool(documents)
+        for document in documents:
+            cell = cache.load(cache.cache_key(claim, document, guideline))
+            if cell is None:
+                claim_cached = False
+                misses_by_claim.setdefault(claim.number, []).append(document)
+            else:
+                matches += cell
+        if claim_cached:
+            cached_claims.add(claim.number)
+
+    missing_claims = [claim for claim in claims if claim.number in misses_by_claim]
+    missing_documents = [document for document in documents
+                         if any(document.id == item.id for values in misses_by_claim.values() for item in values)]
+    warnings: list[str] = []
+    if missing_claims and missing_documents:
+        if progress:
+            progress(f"종속항 {len(missing_claims)}개 × 인용발명 {len(missing_documents)}건 일괄 구성대비")
+        batch_matches, warnings = compare_claims_documents(missing_claims, missing_documents, guideline)
+        # 이미 캐시에 있던 교차 셀은 일괄 응답에 포함되더라도 기존 확정 판정을 우선합니다.
+        for claim_number, missing_documents_for_claim in misses_by_claim.items():
+            claim = claims_by_number[claim_number]
+            for document in missing_documents_for_claim:
+                cell = [match for match in batch_matches
+                        if match.claim_number == claim_number and match.document_id == document.id]
+                if not cell:
+                    continue
+                matches += cell
+                if not warnings:
+                    cache.store(cache.cache_key(claim, document, guideline), cell)
+    return matches, cached_claims, warnings
+
+
+def _processing_order(claims: list[Claim]) -> list[Claim]:
+    """독립항을 먼저, 종속항은 부모항이 확정된 뒤에 처리합니다."""
+    return sorted(claims, key=lambda claim: (len(ancestry(claims, claim.number)), claim.number))
+
+
+def _date_eligibility_warnings(documents: list[Document]) -> list[str]:
+    dated = [f"{document.filename}={document.publication_date or document.filing_date}"
+             for document in documents if document.publication_date or document.filing_date]
+    detail = f" 확인된 공개·제출일: {', '.join(dated)}." if dated else ""
+    return [
+        "이 보고서는 기술적 구성대비를 수행합니다. 선행기술 적격성과 적용 조문을 확정하려면 "
+        f"대상 청구항의 우선일과 적용 법역을 별도로 확인해야 합니다.{detail}"
+    ]
+
+
+def uncovered_elements(result: AnalysisResult, claims_text: str) -> list[dict]:
+    """선행기술 검색 대상. 완전 미대응 구성과 결합 후 남은 하위 한정을 함께 추립니다."""
+    by_number = {claim.number: claim for claim in parse_claims(claims_text)}
+    targets: list[dict] = []
+    for report in result.reports:
+        claim = by_number.get(report.claim_number)
+        coverage_by_label = {coverage.label: coverage for coverage in report.chain.element_coverage}
+        labels = list(dict.fromkeys([*report.chain.uncovered, *report.chain.residual]))
+        for label in labels:
+            element = next((item for item in (claim.elements if claim else []) if item.label == label), None)
+            # 전제부는 한정 여부가 미정이라 검색 대상에서 뺍니다. "…장치에 있어서" 같은 범주
+            # 기재로 선행기술을 검색하면 결과가 의미를 갖지 못합니다.
+            if element and not element.is_preamble:
+                coverage = coverage_by_label.get(label)
+                remaining = [value for value in (coverage.residual_difference if coverage else [])
+                             if value and not _generic_residual(value)]
+                targets.append({
+                    "claim_number": report.claim_number,
+                    "label": label,
+                    # 일부 대응 구성은 이미 개시된 넓은 문언 대신 실제로 남은 제한을 검색합니다.
+                    "text": "; ".join(remaining) if remaining else element.text,
+                    "claim_context": element.text,
+                })
+    return targets
+
+
+def _generic_residual(value: str) -> bool:
+    return any(marker in value for marker in (
+        "판정에 그쳐", "직접 개시가 아니라", "대응되는 기재가 확인되지 않았습니다"
+    ))
+
+
+def summarize_matrix(result: AnalysisResult) -> dict:
+    """판정 추적용 내부 데이터. 별도 감사 리포트는 만들지 않고 JSON으로만 남깁니다."""
+    return {
+        "job_id": result.job_id,
+        "documents": [mapping.model_dump() for mapping in result.claim_mapping],
+        "claims": [
             {
-                "id": doc["id"],
-                "filename": doc["filename"],
-                "type": doc["type"],
-                "chunks": [
-                    {"page": chunk["page"], "paragraph": chunk["paragraph"], "text": chunk["text"]}
-                    for chunk in doc["chunks"]
+                "claim_number": report.claim_number,
+                "track": report.track,
+                "rejection_basis": report.rejection_basis,
+                # chain에는 구성별 전 문헌 대응(element_coverage)이 들어 있습니다.
+                "chain": report.chain.model_dump(),
+                "elements": [
+                    {"label": item.label, "similarity": item.similarity, "grade": item.grade,
+                     "status": item.status, "difference": item.difference,
+                     "adopted_document": item.adopted_document,
+                     "adopted_reference": item.adopted_reference,
+                     "residual_difference": item.residual_difference,
+                     "reference_note": item.reference_note,
+                     "evidence": [evidence.model_dump() for evidence in item.evidence]}
+                    for item in report.claims
                 ],
             }
-            for doc in documents
+            for report in result.reports
         ],
+        "validation": result.validation,
     }
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def build_prompt(guideline: str, preamble: str, claims: list[dict], documents: list[dict]) -> str:
-    return f"[분석 지시]\n{guideline.strip()}\n{OUTPUT_CONTRACT}{build_context(preamble, claims, documents)}"
-
-
-def resolve_mapping(raw_mapping, documents: list[dict]) -> tuple[list[DocumentMapping], list[str]]:
-    """인용발명 번호는 모델이 정한 대응도 순서를 따르고, 빠진 문헌만 업로드 순서로 뒤에 붙입니다."""
-    by_id = {doc["id"]: doc for doc in documents}
-    by_name = {doc["filename"]: doc for doc in documents}
-    ordered: list[tuple[dict, str]] = []
-    seen: set[str] = set()
-    warnings: list[str] = []
-    for item in raw_mapping or []:
-        if not isinstance(item, dict):
-            continue
-        doc = by_id.get(str(item.get("document_id", "")).strip()) or by_name.get(str(item.get("filename", "")).strip())
-        if doc is None or doc["id"] in seen:
-            continue
-        seen.add(doc["id"])
-        ordered.append((doc, str(item.get("document_number") or "").strip()))
-    if not ordered:
-        warnings.append("모델이 인용발명 순위를 지정하지 않아 업로드 순서로 번호를 매겼습니다.")
-    elif len(ordered) < len(documents):
-        warnings.append("일부 문헌이 매핑 테이블에서 누락되어 업로드 순서로 뒤에 배치했습니다.")
-    for doc in documents:
-        if doc["id"] not in seen:
-            seen.add(doc["id"])
-            ordered.append((doc, ""))
-    mappings = [
-        DocumentMapping(reference_number=index, filename=doc["filename"], document_type=doc["type"],
-                        document_id=doc["id"], document_number=number,
-                        role="주 인용발명" if index == 1 else "부 인용발명")
-        for index, (doc, number) in enumerate(ordered, 1)
-    ]
-    return mappings, warnings
-
-
-def grade_for(similarity: int | None) -> tuple[str, str]:
-    if similarity is None:
-        return "대응 안됨", "⚪"
-    for threshold, name, emoji in _GRADES:
-        if similarity >= threshold:
-            return name, emoji
-    return "대응 안됨", "⚪"
-
-
-def _as_similarity(value) -> int | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        return max(0, min(100, int(value)))
-    except (TypeError, ValueError):
-        return None
-
-
-def _build_evidence(raw_evidence, mappings: list[DocumentMapping], documents: list[dict]) -> list[Evidence]:
-    by_id = {mapping.document_id: mapping for mapping in mappings}
-    names = {doc["id"]: doc["filename"] for doc in documents}
-    evidence: list[Evidence] = []
-    for item in raw_evidence or []:
-        if not isinstance(item, dict) or not str(item.get("excerpt", "")).strip():
-            continue
-        document_id = str(item.get("document_id", "")).strip()
-        mapping = by_id.get(document_id)
-        paragraph = item.get("paragraph")
-        page = item.get("page")
-        evidence.append(Evidence(
-            document_id=document_id,
-            filename=names.get(document_id) or str(item.get("filename", "")),
-            # 인용발명 번호는 매핑 테이블에서 다시 계산해 전 구성요소에 걸쳐 일관성을 강제합니다.
-            reference_number=mapping.reference_number if mapping else None,
-            document_number=(mapping.document_number if mapping else None) or None,
-            paragraph=str(paragraph) if paragraph not in (None, "") else None,
-            page=page if isinstance(page, int) else None,
-            excerpt=str(item["excerpt"]).strip(),
-            original_excerpt=str(item["original_excerpt"]).strip() if str(item.get("original_excerpt") or "").strip() else None,
-            quality=item.get("quality") if item.get("quality") in {"HIGH", "MEDIUM", "LOW", "UNVERIFIED"} else "MEDIUM",
-        ))
-    return evidence
-
-
-def build_claims(raw_claims, claims: list[dict], mappings: list[DocumentMapping],
-                 documents: list[dict]) -> tuple[list[ClaimResult], list[str]]:
-    """입력 구성요소를 기준으로 결과를 정렬합니다. 라벨이 맞지 않으면 순서로 보정합니다."""
-    raw_list = [item for item in (raw_claims or []) if isinstance(item, dict)]
-    by_label = {}
-    for item in raw_list:
-        label = str(item.get("label", "")).strip().strip("()").upper()
-        if label and label not in by_label:
-            by_label[label] = item
-    warnings: list[str] = []
-    results: list[ClaimResult] = []
-    # 라벨이 하나라도 오면 라벨로만 맞춥니다. 위치로 폴백하면 (A)가 (B)의 분석을 가져가
-    # 이후 구성요소가 통째로 밀리기 때문입니다. 라벨이 전혀 없을 때만 순서로 대응시킵니다.
-    positional = not by_label
-    if positional and raw_list:
-        warnings.append("응답에 구성요소 라벨이 없어 입력 순서로 대응시켰습니다.")
-    for index, claim in enumerate(claims):
-        item = by_label.get(claim["label"])
-        if item is None:
-            item = raw_list[index] if positional and index < len(raw_list) else {}
-            if not positional:
-                warnings.append(f"({claim['label']}) 구성에 대한 응답이 없어 미개시로 처리했습니다.")
-        similarity = _as_similarity(item.get("similarity"))
-        grade, emoji = grade_for(similarity)
-        difference = str(item.get("difference") or "").strip()
-        narrative = re.sub(r"\s+", " ", str(item.get("narrative") or "")).strip()
-        if not narrative and similarity is None:
-            narrative = f"({claim['label']}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
-        results.append(ClaimResult(
-            label=claim["label"],
-            claim=claim["text"],  # 구성 원문은 입력을 그대로 씁니다. 모델이 고쳐 쓴 문장을 신뢰하지 않습니다.
-            similarity=similarity,
-            grade=str(item.get("grade") or grade).strip() if similarity is not None else grade,
-            emoji=str(item.get("emoji") or emoji).strip() or emoji,
-            narrative=narrative,
-            difference=difference or None,
-            combination=bool(item.get("combination")),
-            references=[str(ref) for ref in item.get("references") or [] if str(ref).strip()],
-            evidence=_build_evidence(item.get("evidence"), mappings, documents),
-            status=str(item.get("status") or ("미개시" if similarity is None else "")).strip(),
-            note=str(item.get("note") or "").strip(),
-        ))
-    if len(raw_list) != len(claims):
-        warnings.append(f"입력 구성요소는 {len(claims)}개인데 응답은 {len(raw_list)}개라 입력 기준으로 정렬했습니다.")
-    return results, warnings
-
-
-def analyze(job_id: str, claims_text: str, documents: list[dict], effort: str,
-            analysis_prompt: str | None = None) -> AnalysisResult:
-    preamble, claims = split_claims(claims_text)
-    guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or DEFAULT_ANALYSIS_PROMPT
-    raw = run_agy(build_prompt(guideline, preamble, claims, documents), effort)
-    mappings, warnings = resolve_mapping(raw.get("document_mapping"), documents)
-    claim_results, claim_warnings = build_claims(raw.get("claims"), claims, mappings, documents)
-    validation = [str(item) for item in raw.get("validation") or []] + warnings + claim_warnings
-    return AnalysisResult(job_id=job_id, claim_mapping=mappings, claims=claim_results, preamble=preamble,
-                          summary=str(raw.get("summary", "")), summary_similarity=str(raw.get("summary_similarity", "")),
-                          summary_difference=str(raw.get("summary_difference", "")), validation=validation)
-
-
-def to_markdown(result: AnalysisResult) -> str:
-    lines = ["# 구성대비 분석", "", "## 문헌 매핑 테이블", "",
-             "| 인용발명 | 문헌번호 | 파일명 | 문서 유형 |", "|---|---|---|---|"]
-    lines += [f"| 인용발명 {m.reference_number}{' (주 인용발명)' if m.reference_number == 1 else ''} "
-              f"| {m.document_number or '-'} | {m.filename} | {m.document_type} |" for m in result.claim_mapping]
-    if result.preamble:
-        lines += ["", f"> {result.preamble}"]
-    for claim in result.claims:
-        lines += ["", f"## ({claim.label}) {claim.claim}", ""]
-        if claim.similarity is None:
-            lines.append(claim.narrative or f"({claim.label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요")
-            continue
-        lines += [f"유사도: {claim.similarity}% {claim.emoji} {claim.grade}", "", claim.narrative]
-        if claim.difference:
-            lines.append(f"→ 차이점: {claim.difference}")
-    lines += ["", "## 종합 분석 요약", ""]
-    if result.summary_similarity:
-        lines.append(f"- 유사점: {result.summary_similarity}")
-    if result.summary_difference:
-        lines.append(f"- 차이점: {result.summary_difference}")
-    if result.summary:
-        lines += ["", result.summary]
-    if result.validation:
-        lines += ["", "## 검증 참고", ""] + [f"- {item}" for item in result.validation]
-    return "\n".join(lines) + "\n"

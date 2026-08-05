@@ -1,29 +1,739 @@
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import './styles.css';
 
-const API='http://localhost:8330/api';
-type Result={job_id:string,claim_mapping:any[],claims:any[],preamble:string,summary:string,summary_similarity:string,summary_difference:string,validation:string[]};
-function App(){
- const [tab,setTab]=useState('analysis'),[claims,setClaims]=useState(''),[files,setFiles]=useState<File[]>([]),[effort,setEffort]=useState('medium'),[result,setResult]=useState<Result|null>(null),[history,setHistory]=useState<any[]>([]),[busy,setBusy]=useState(false),[message,setMessage]=useState(''),[settings,setSettings]=useState({provider:'agy',command:'agy',model:'gemini-3.6-flash-medium',prompt:''}),[models,setModels]=useState<string[]>([]);
- useEffect(()=>{fetch(API+'/history').then(r=>r.json()).then(setHistory).catch(()=>{});fetch(API+'/settings').then(r=>r.json()).then(s=>{setSettings(s);loadModels(s)}).catch(()=>{})},[]);
- async function loadModels(next:any,refresh=false){try{const q=new URLSearchParams({provider:next.provider,command:next.command,...(refresh?{refresh:'true'}:{})});const r=await fetch(API+'/settings/models?'+q);const data=await r.json();setModels(r.ok&&Array.isArray(data.models)?data.models:[]);if(refresh)setMessage(data.models?.length?`모델 ${data.models.length}개를 불러왔습니다.`:'모델 목록을 불러오지 못했습니다. 모델명을 직접 입력하세요.')}catch{setModels([])}}
- function changeProvider(provider:string){const next={...settings,provider,command:provider};setSettings(next);loadModels(next)}
- async function saveSettings(next=settings){const r=await fetch(API+'/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(next)});const data=await r.json();if(r.ok)setSettings(data);setMessage(r.ok?'설정을 저장했습니다.':'저장 실패: '+(data.detail||''))}
- async function resetPrompt(){await saveSettings({...settings,prompt:''});setMessage('분석 지시 프롬프트를 기본값으로 되돌렸습니다.')}
- async function testSettings(){const r=await fetch(API+'/settings/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)});const data=await r.json();setMessage(data.message)}
- async function run(){if(!claims.trim()||!files.length){setMessage('청구항과 PDF를 모두 입력해 주세요.');return} setBusy(true);setMessage('문서 추출과 비교 분석을 진행 중입니다…');const form=new FormData();form.append('claims',claims);form.append('agy_reasoning_effort',effort);form.append('analysis_prompt',settings.prompt||'');files.forEach(f=>form.append('pdf_files',f));try{const r=await fetch(API+'/jobs',{method:'POST',body:form});const job=await r.json();if(!r.ok)throw new Error(job.detail);setResult(await (await fetch(API+'/jobs/'+job.job_id+'/result')).json());setTab('result');setMessage('분석이 완료되었습니다.')}catch(e:any){setMessage(e.message||'분석에 실패했습니다.')}finally{setBusy(false)}}
- async function removeHistory(id:string){if(!confirm('이 분석 기록과 작업 로그를 삭제합니다. 되돌릴 수 없습니다. 계속할까요?'))return;const r=await fetch(API+'/history/'+id,{method:'DELETE'});if(!r.ok){setMessage('삭제에 실패했습니다.');return}setHistory(history.filter(h=>h.job_id!==id));setMessage('분석 기록을 삭제했습니다.')}
- async function clearHistory(){if(!history.length)return;if(!confirm(`저장된 분석 기록 ${history.length}건과 모든 작업 로그를 삭제합니다. 되돌릴 수 없습니다. 계속할까요?`))return;const r=await fetch(API+'/history',{method:'DELETE'});const data=await r.json();if(!r.ok){setMessage('삭제에 실패했습니다.');return}setHistory([]);setMessage(`분석 기록 ${data.removed}건과 작업 로그를 모두 삭제했습니다.`)}
- async function load(id:string){const r=await fetch(API+'/history/'+id);const data=await r.json();if(!r.ok||!data.result){setMessage('이 분석의 상세 결과가 저장되어 있지 않습니다. 리포트 다운로드만 가능합니다.');return}setResult(data.result);setMessage('');setTab('result')}
- const source=(e:any)=>[e.reference_number?`인용발명 ${e.reference_number}`:e.filename,e.document_number&&`(${e.document_number})`,e.paragraph?`단락 [${e.paragraph}]`:e.page&&`p.${e.page}`].filter(Boolean).join(' ');
- return <div className="app"><header><div className="brand"><span className="mark" aria-hidden="true"><i/><b>F</b></span><div><b>Evidence Forge</b><small>특허 · 기술 문헌 분석</small></div></div><nav aria-label="주요 메뉴">{[['analysis','분석'],['history','히스토리'],['logs','로그'],['settings','설정']].map(([id,label],index)=><button key={id} className={tab===id?'active':''} onClick={()=>setTab(id)}><span>0{index+1}</span>{label}</button>)}</nav><span className="status"><i/> SYSTEM READY</span></header>
- {tab==='analysis'&&<main><section className="hero"><div className="hero-copy"><p className="eyebrow"><span>NEW</span> AI-POWERED PRIOR ART REVIEW</p><h1>복잡한 문헌 비교를<br/><em>명확한 근거</em>로 바꿉니다.</h1><p className="sub">청구항과 PDF를 업로드하면 문서 유형을 분류하고, 구성요소별 선행기술 근거를 찾아 비교 리포트를 생성합니다.</p></div><div className="hero-stamp" aria-hidden="true"><span>EVIDENCE</span><b>→</b><span>FORGED</span><small>EST. 2026 / SEOUL</small></div></section><section className="grid"><div className="card input-card"><span className="card-index">01 / CLAIM</span><label>분석할 청구항</label><textarea value={claims} onChange={e=>setClaims(e.target.value)} placeholder="예: (A) 메모리 컨트롤러가 쓰기 요청을 순차 처리하는 단계..."/><div className="row"><span className="hint">구성요소를 (A), (B), (C)로 구분하면 그 라벨 그대로 대비합니다.</span><span>{claims.length}자</span></div></div><div className="card upload-card"><span className="card-index">02 / SOURCE</span><label>참조 문헌 <span className="muted">PDF · 최대 7개</span></label><label className="drop"><input type="file" accept="application/pdf" multiple onChange={e=>setFiles(Array.from(e.target.files||[]).slice(0,7))}/><span className="drop-icon">↳</span><strong>파일을 여기에 놓거나 클릭하세요</strong><small>PDF만 지원 · 파일당 최대 25MB</small></label>{files.map((f,i)=><div key={f.name+f.size+f.lastModified} className="file"><span>PDF</span>{f.name}<button onClick={()=>setFiles(files.filter((_,x)=>x!==i))}>×</button></div>)}</div></section>
- <details className="card prompt-card"><summary>분석 지시 프롬프트 <span className="muted">이 지시문이 그대로 LLM에 전달됩니다</span></summary><textarea value={settings.prompt} onChange={e=>setSettings({...settings,prompt:e.target.value})}/><div className="row"><span className="hint">저장하지 않아도 이번 분석에는 위 내용이 사용됩니다.</span><span>{(settings.prompt||'').length}자</span></div><div className="prompt-actions"><button onClick={resetPrompt}>기본값 복원</button><button onClick={()=>saveSettings()}>프롬프트 저장</button></div></details>
- <div className="action"><div><b>분석 설정</b><select value={effort} onChange={e=>setEffort(e.target.value)}><option value="low">low · 빠른 분석</option><option value="medium">medium · 권장</option><option value="high">high · 정밀 분석</option></select></div><button className="primary" disabled={busy} onClick={run}>{busy?'분석 중…':'분석 시작  →'}</button></div>{message&&<div className="notice">{message}</div>}</main>}
- {tab==='result'&&<main><div className="topline"><div><p className="eyebrow">ANALYSIS RESULT</p><h2>구성대비 결과</h2></div>{result&&<div><a className="download" href={`${API}/jobs/${result.job_id}/download?format=md`}>Markdown 다운로드</a></div>}</div>{result&&<><div className="mapping card"><h3>문헌 매핑 테이블</h3>{result.claim_mapping.map(m=><div key={m.document_id} className="mapping-row"><b>인용발명 {m.reference_number}</b><span>{m.filename}</span><small>{[m.document_number,m.role||m.document_type].filter(Boolean).join(' · ')}</small></div>)}</div>{result.preamble&&<p className="sub">{result.preamble}</p>}<div className="results">{result.claims.map((c,i)=><article key={c.label||i} className="card claim"><div className="claim-head"><span className="badge">({c.label||String.fromCharCode(65+i)})</span><strong>{c.similarity==null?'—':c.similarity+'%'}</strong><span className="quality">{c.emoji} {c.grade||c.status}</span>{c.combination&&<span className="quality">결합</span>}</div><p>{c.claim}</p>{(c.narrative||c.note)&&<div className="narrative">{c.narrative||c.note}</div>}{c.difference&&<div className="diff">→ 차이점: {c.difference}</div>}{c.narrative&&c.note&&<small>{c.note}</small>}{c.evidence.map((e:any,j:number)=><blockquote key={j}><b>{e.quality} · {source(e)}</b><br/>{e.excerpt}{e.original_excerpt&&<><br/><i>{e.original_excerpt}</i></>}</blockquote>)}</article>)}</div><div className="summary"><h3>종합 분석 요약</h3>{result.summary_similarity&&<p>- 유사점: {result.summary_similarity}</p>}{result.summary_difference&&<p>- 차이점: {result.summary_difference}</p>}{result.summary&&<p>{result.summary}</p>}</div>{!!result.validation?.length&&<div className="card"><h3>검증 참고</h3>{result.validation.map((v,i)=><small key={i} style={{display:'block'}}>· {v}</small>)}</div>}</>}</main>}
- {tab==='history'&&<main><div className="topline"><div><p className="eyebrow">ARCHIVE</p><h2>분석 히스토리</h2></div><button className="danger" disabled={!history.length} onClick={clearHistory}>전체 삭제</button></div><div className="card list">{history.length?history.map(h=><div key={h.job_id} className="list-row"><button onClick={()=>load(h.job_id)}><b>{h.created_at.slice(0,16).replace('T',' ')}</b><span>{h.documents?.join(', ')}</span><small>결과 보기 →</small></button><button className="row-del" title="이 기록 삭제" onClick={()=>removeHistory(h.job_id)}>×</button></div>):<p className="empty">저장된 분석이 없습니다.</p>}</div><p className="sub">분석 결과·리포트는 <code>backend/data/history</code>, 작업 로그는 <code>backend/data/logs</code>에 저장됩니다. 삭제하면 두 곳에서 함께 지워집니다.</p>{message&&<div className="notice">{message}</div>}</main>}
- {tab==='settings'&&<main><p className="eyebrow">CONFIGURATION</p><h2>설정</h2><div className="card settings"><label>연동 CLI<select value={settings.provider} onChange={e=>changeProvider(e.target.value)}><option value="agy">agy</option><option value="claude">claude -p</option><option value="gpt">gpt -p</option></select></label><label>실행 명령어<input value={settings.command} onChange={e=>setSettings({...settings,command:e.target.value})} onBlur={()=>loadModels(settings)} placeholder="agy 또는 C:\\경로\\agy.cmd"/></label><label>모델<select value={models.includes(settings.model)?settings.model:'__custom__'} onChange={e=>setSettings({...settings,model:e.target.value==='__custom__'?'':e.target.value})}>{models.map(m=><option key={m} value={m}>{m}</option>)}<option value="__custom__">직접 입력…</option></select><button className="ghost" onClick={()=>loadModels(settings,true)}>모델 목록 새로고침</button></label>{!models.includes(settings.model)&&<label>모델명 직접 입력<input value={settings.model} onChange={e=>setSettings({...settings,model:e.target.value})} placeholder="예: gemini-3.6-flash-medium"/></label>}<p className="hint">agy 모델명은 <code>-low/-medium/-high</code> 접미사로 reasoning effort를 포함하므로, 아래 effort를 바꾸면 접미사를 자동으로 교체해 호출합니다.</p><label>reasoning effort<select value={effort} onChange={e=>setEffort(e.target.value)}><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label><label>분석 지시 프롬프트<textarea className="prompt-input" value={settings.prompt} onChange={e=>setSettings({...settings,prompt:e.target.value})}/></label><div className="action"><button onClick={testSettings}>연결 테스트</button><button onClick={resetPrompt}>프롬프트 기본값 복원</button><button className="primary" onClick={()=>saveSettings()}>설정 저장</button></div><p>백엔드가 실행되는 환경에서 CLI가 설치되어 있어야 합니다.</p>{message&&<div className="notice">{message}</div>}</div></main>}
- {tab==='logs'&&<main><p className="eyebrow">OBSERVABILITY</p><h2>작업 로그</h2><div className="card list"><p>로그는 작업별로 backend/data/logs에 저장되며 API에서 조회·수정할 수 있습니다.</p></div></main>}
- </div>}
-createRoot(document.getElementById('root')!).render(<App/>);
+const API = 'http://localhost:8330/api';
+
+type Result = {
+  job_id: string;
+  claim_mapping: any[];
+  reports: any[];
+  preamble: string;
+  validation: string[];
+  prior_art: any[];
+  cached_claims: number[];
+};
+
+type Tab = 'analysis' | 'result' | 'history' | 'logs' | 'settings';
+type Settings = {provider: string; model: string; prompt: string};
+type LogItem = {job_id: string; size: number; updated_at?: string};
+
+const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
+const formatLogDate = (value?: string) => {
+  if (!value) return '수정 시각 없음';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '수정 시각 없음' : date.toLocaleString('ko-KR');
+};
+
+function App() {
+  const [tab, setTab] = useState<Tab>('analysis');
+  const [claims, setClaims] = useState('');
+  const [dependentClaims, setDependentClaims] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
+  const [result, setResult] = useState<Result | null>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  const [logs, setLogs] = useState<LogItem[]>([]);
+  const [selectedLog, setSelectedLog] = useState('');
+  const [logContent, setLogContent] = useState('');
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [stage, setStage] = useState('입력 대기');
+  const [message, setMessage] = useState('');
+  const [settings, setSettings] = useState<Settings>({
+    provider: 'agy',
+    model: 'gemini-3.6-flash-medium',
+    prompt: '',
+  });
+  const [models, setModels] = useState<string[]>([]);
+  const activeJob = useRef<string | null>(null);
+  const uploadController = useRef<AbortController | null>(null);
+  const cancelRequested = useRef(false);
+
+  const busy = generating || actionBusy;
+
+  useEffect(() => {
+    refreshHistory();
+    fetch(API + '/settings')
+      .then(response => response.json())
+      .then(next => {
+        setSettings(next);
+        loadModels(next);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  async function refreshHistory() {
+    try {
+      const response = await fetch(API + '/history');
+      setHistory(response.ok ? await response.json() : []);
+    } catch {
+      setHistory([]);
+    }
+  }
+
+  async function loadLog(jobId: string) {
+    setSelectedLog(jobId);
+    setLogsLoading(true);
+    try {
+      const response = await fetch(`${API}/logs/${jobId}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || '로그를 불러오지 못했습니다.');
+      setLogContent(data.content || '');
+    } catch (error: any) {
+      setLogContent(error.message || '로그를 불러오지 못했습니다.');
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
+  async function refreshLogs(preferredId = selectedLog) {
+    setLogsLoading(true);
+    try {
+      const response = await fetch(API + '/logs');
+      const items: LogItem[] = response.ok ? await response.json() : [];
+      setLogs(items);
+      const nextId = items.some(item => item.job_id === preferredId)
+        ? preferredId
+        : items[0]?.job_id || '';
+      if (nextId) {
+        await loadLog(nextId);
+      } else {
+        setSelectedLog('');
+        setLogContent('');
+      }
+    } catch {
+      setLogs([]);
+      setSelectedLog('');
+      setLogContent('');
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
+  function navigate(next: Tab, scroll = true) {
+    if (next === 'result' && !result) return;
+    if (next === 'logs') void refreshLogs();
+    const change = () => setTab(next);
+    const viewTransition = (document as Document & {
+      startViewTransition?: (callback: () => void) => {finished: Promise<void>};
+    }).startViewTransition;
+    if (viewTransition) {
+      const transition = viewTransition.call(document, change);
+      if (scroll) transition.finished.then(() => window.scrollTo({top: 0, behavior: 'smooth'}));
+    } else {
+      change();
+      if (scroll) requestAnimationFrame(() => window.scrollTo({top: 0, behavior: 'smooth'}));
+    }
+  }
+
+  function openResult(next: Result) {
+    setResult(next);
+    requestAnimationFrame(() => {
+      const change = () => setTab('result');
+      const start = (document as Document & {
+        startViewTransition?: (callback: () => void) => {finished: Promise<void>};
+      }).startViewTransition;
+      if (start) {
+        start.call(document, change).finished.then(() =>
+          window.scrollTo({top: 0, behavior: 'smooth'}),
+        );
+      } else {
+        change();
+        window.scrollTo({top: 0, behavior: 'smooth'});
+      }
+    });
+  }
+
+  async function loadModels(next: Settings, refresh = false) {
+    try {
+      const query = new URLSearchParams({
+        provider: next.provider,
+        ...(refresh ? {refresh: 'true'} : {}),
+      });
+      const response = await fetch(API + '/settings/models?' + query);
+      const data = await response.json();
+      setModels(response.ok && Array.isArray(data.models) ? data.models : []);
+      if (refresh) {
+        setMessage(data.models?.length
+          ? `모델 ${data.models.length}개를 불러왔습니다.`
+          : '모델 목록을 불러오지 못했습니다. 모델명을 직접 입력하세요.');
+      }
+    } catch {
+      setModels([]);
+    }
+  }
+
+  function changeProvider(provider: string) {
+    const next = {...settings, provider};
+    setSettings(next);
+    loadModels(next);
+  }
+
+  async function saveSettings(next = settings) {
+    const response = await fetch(API + '/settings', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(next),
+    });
+    const data = await response.json();
+    if (response.ok) setSettings(data);
+    setMessage(response.ok ? '설정을 저장했습니다.' : `저장 실패: ${data.detail || ''}`);
+  }
+
+  async function resetPrompt() {
+    await saveSettings({...settings, prompt: ''});
+    setMessage('분석 지침 프롬프트를 기본값으로 되돌렸습니다.');
+  }
+
+  async function testSettings() {
+    const response = await fetch(API + '/settings/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(settings),
+    });
+    setMessage((await response.json()).message);
+  }
+
+  async function run() {
+    if (!claims.trim() || !files.length) {
+      setMessage('청구항과 PDF를 모두 입력해 주세요.');
+      return;
+    }
+
+    setGenerating(true);
+    setMessage('');
+    setStage('작업 준비 중');
+    cancelRequested.current = false;
+
+    try {
+      const preparedResponse = await fetch(API + '/jobs/prepare', {method: 'POST'});
+      const prepared = await preparedResponse.json();
+      if (!preparedResponse.ok) throw new Error(prepared.detail || '작업을 준비하지 못했습니다.');
+      activeJob.current = prepared.job_id;
+
+      if (cancelRequested.current) {
+        await fetch(`${API}/jobs/${prepared.job_id}`, {method: 'DELETE'});
+        return;
+      }
+
+      setStage('문서 업로드 중');
+      const form = new FormData();
+      form.append('claims', claims);
+      form.append('analysis_prompt', settings.prompt || '');
+      files.forEach(file => form.append('pdf_files', file));
+      uploadController.current = new AbortController();
+      const startResponse = await fetch(`${API}/jobs/${prepared.job_id}/start`, {
+        method: 'POST',
+        body: form,
+        signal: uploadController.current.signal,
+      });
+      const started = await startResponse.json();
+      if (!startResponse.ok) throw new Error(started.detail || '보고서 생성을 시작하지 못했습니다.');
+
+      while (!cancelRequested.current) {
+        await sleep(650);
+        const statusResponse = await fetch(`${API}/jobs/${prepared.job_id}`);
+        const job = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(job.detail || '작업 상태를 확인하지 못했습니다.');
+        setStage(job.stage || '분석 중');
+        if (job.status === 'failed') throw new Error(job.error || '분석에 실패했습니다.');
+        if (job.status === 'cancelled') return;
+        if (job.status !== 'completed') continue;
+
+        const resultResponse = await fetch(`${API}/jobs/${prepared.job_id}/result`);
+        const nextResult = await resultResponse.json();
+        if (!resultResponse.ok) throw new Error(nextResult.detail || '결과를 불러오지 못했습니다.');
+        setStage('완료');
+        setMessage('보고서가 생성되었습니다.');
+        await refreshHistory();
+        openResult(nextResult);
+        return;
+      }
+    } catch (error: any) {
+      if (error?.name !== 'AbortError' && !cancelRequested.current) {
+        setMessage(error?.message || '분석에 실패했습니다.');
+      }
+    } finally {
+      uploadController.current = null;
+      activeJob.current = null;
+      setGenerating(false);
+    }
+  }
+
+  async function cancelGeneration() {
+    if (!generating) return;
+    cancelRequested.current = true;
+    setStage('취소 중');
+    uploadController.current?.abort();
+    const jobId = activeJob.current;
+    if (jobId) {
+      try {
+        await fetch(`${API}/jobs/${jobId}`, {method: 'DELETE'});
+      } catch {
+        // The local abort still prevents result retrieval; backend cancellation can be retried.
+      }
+    }
+    setStage('취소됨');
+    setMessage('보고서 생성을 취소했습니다. 실행 중인 분석 프로세스도 종료했습니다.');
+    setGenerating(false);
+  }
+
+  async function removeHistory(id: string) {
+    if (!confirm('이 분석 히스토리를 삭제할까요?')) return;
+    const response = await fetch(API + '/history/' + id, {method: 'DELETE'});
+    if (!response.ok) {
+      setMessage('삭제에 실패했습니다.');
+      return;
+    }
+    setHistory(current => current.filter(item => item.job_id !== id));
+    setMessage('분석 히스토리를 삭제했습니다.');
+  }
+
+  async function clearHistory() {
+    if (!history.length || !confirm(`저장된 분석 히스토리 ${history.length}건을 모두 삭제할까요?`)) return;
+    const response = await fetch(API + '/history', {method: 'DELETE'});
+    const data = await response.json();
+    if (!response.ok) {
+      setMessage('삭제에 실패했습니다.');
+      return;
+    }
+    setHistory([]);
+    setMessage(`분석 히스토리 ${data.removed}건을 삭제했습니다.`);
+  }
+
+  async function clearLogs() {
+    if (!logs.length || !confirm(`저장된 로그 ${logs.length}건을 모두 삭제할까요?`)) return;
+    const response = await fetch(API + '/logs', {method: 'DELETE'});
+    const data = await response.json();
+    if (!response.ok) {
+      setMessage('로그 삭제에 실패했습니다.');
+      return;
+    }
+    setLogs([]);
+    setSelectedLog('');
+    setLogContent('');
+    setMessage(`로그 ${data.removed}건을 삭제했습니다.`);
+  }
+
+  async function load(id: string) {
+    const response = await fetch(API + '/history/' + id);
+    const data = await response.json();
+    if (!response.ok || !data.result) {
+      setMessage('화면에 표시할 결과가 없습니다.');
+      return;
+    }
+    setMessage('');
+    openResult(data.result);
+  }
+
+  const refName = (id: string, response: Result) => {
+    const mapping = response.claim_mapping.find(item => item.document_id === id);
+    return mapping
+      ? `인용발명 ${mapping.reference_number}${mapping.document_number ? ` (${mapping.document_number})` : ''}`
+      : `문헌 ${id}`;
+  };
+
+  const chainText = (report: any, response: Result) => {
+    const ids = [report.chain.primary, ...report.chain.secondaries].filter(Boolean);
+    return ids.length ? ids.map((id: string) => refName(id, response)).join(' + ') : '채택 인용발명 없음';
+  };
+
+  async function searchPriorArt() {
+    if (!result) return;
+    setActionBusy(true);
+    setMessage('미커버 구성의 선행기술을 검색 중입니다…');
+    try {
+      const response = await fetch(`${API}/jobs/${result.job_id}/prior-art`, {method: 'POST'});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail);
+      const next = await (await fetch(`${API}/jobs/${result.job_id}/result`)).json();
+      setResult(next);
+      setMessage(data.message || `선행기술 ${data.hits.length}건을 찾았습니다.`);
+    } catch (error: any) {
+      setMessage(error.message || '선행기술 검색에 실패했습니다.');
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function addDependentClaims() {
+    if (!result || !dependentClaims.trim()) return;
+    setActionBusy(true);
+    setMessage('종속항을 일괄 구성대비 중입니다…');
+    try {
+      const response = await fetch(`${API}/jobs/${result.job_id}/dependent-claims`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({claims: dependentClaims}),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail);
+      setResult(data.result);
+      setDependentClaims('');
+      setMessage(`청구항 ${data.added_claims.join(', ')}을 보고서에 추가했습니다.`);
+    } catch (error: any) {
+      setMessage(error.message || '종속항 분석에 실패했습니다.');
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  const navItems: Array<[Tab, string]> = [
+    ['analysis', '분석'],
+    ['result', '구성대비'],
+    ['history', '히스토리'],
+    ['logs', '로그'],
+    ['settings', '설정'],
+  ];
+
+  return (
+    <div className="app">
+      <header>
+        <button className="brand" onClick={() => navigate('analysis')} aria-label="Evidence Forge 홈">
+          <span className="mark"><img src="/forge-emblem.svg" alt="" /></span>
+          <b>Evidence Forge</b>
+        </button>
+        <nav aria-label="주요 메뉴">
+          {navItems.map(([id, label]) => (
+            <button
+              key={id}
+              className={tab === id ? 'active' : ''}
+              disabled={id === 'result' && !result}
+              onClick={() => navigate(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        <span className={`status ${generating ? 'working' : ''}`}>
+          <i /> {generating ? stage : 'READY'}
+        </span>
+      </header>
+
+      {tab === 'analysis' && (
+        <main className="panel analysis-main">
+          <section className="page-heading compact-heading">
+            <div>
+              <p className="eyebrow">NEW REPORT</p>
+              <h1>분석</h1>
+            </div>
+            <span className="input-count">{files.length}/7 PDF</span>
+          </section>
+
+          <section className="grid" aria-label="분석 자료 입력">
+            <div className="card input-card">
+              <div className="card-heading">
+                <label htmlFor="claim-input">청구항</label>
+                <span>{claims.length}자</span>
+              </div>
+              <textarea
+                id="claim-input"
+                value={claims}
+                disabled={generating}
+                onChange={event => setClaims(event.target.value)}
+                placeholder="(A), (B), (C)로 구성요소를 구분해 입력하세요."
+              />
+            </div>
+
+            <div className="card upload-card">
+              <div className="card-heading">
+                <label>인용발명·참조 문헌</label>
+                <span>PDF · 최대 7개</span>
+              </div>
+              <label className="drop">
+                <input
+                  aria-label="참조 문헌 PDF 선택"
+                  type="file"
+                  accept="application/pdf"
+                  multiple
+                  disabled={generating}
+                  onChange={event => setFiles(Array.from(event.target.files || []).slice(0, 7))}
+                />
+                <span className="drop-icon" aria-hidden="true">+</span>
+                <strong>PDF 선택</strong>
+                <small>파일당 최대 25MB</small>
+                </label>
+              <div className="file-list">
+                {files.map((file, index) => (
+                  <div key={file.name + file.size + file.lastModified} className="file">
+                    <span>PDF</span>
+                    <span className="file-name">{file.name}</span>
+                    <button
+                      type="button"
+                      aria-label={`${file.name} 제거`}
+                      disabled={generating}
+                      onClick={() => setFiles(files.filter((_, itemIndex) => itemIndex !== index))}
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          <section className={`run-dock ${generating ? 'is-running' : ''}`} aria-live="polite">
+            <div className="run-status">
+              <span className="run-dot" />
+              <div>
+                <strong>{generating ? stage : '보고서 준비'}</strong>
+                <small>{generating ? '분석 프로세스가 실행 중입니다.' : '입력한 청구항과 문헌으로 구성대비합니다.'}</small>
+              </div>
+            </div>
+            <div className="run-actions">
+              {generating && (
+                <button type="button" className="cancel" onClick={cancelGeneration}>취소</button>
+              )}
+              <button
+                type="button"
+                className="primary generate"
+                disabled={generating || !claims.trim() || !files.length}
+                onClick={run}
+              >
+                {generating ? '생성 중' : '보고서 생성'} <span aria-hidden="true">→</span>
+              </button>
+            </div>
+          </section>
+          {message && <div className="notice" role="status">{message}</div>}
+        </main>
+      )}
+
+      {tab === 'result' && (
+        <main className="panel result-main">
+          <section className="page-heading result-heading">
+            <div>
+              <p className="eyebrow">COMPARISON</p>
+              <h1>구성대비</h1>
+            </div>
+            {result && (
+              <div className="result-actions">
+                <button className="ghost" disabled={busy} onClick={searchPriorArt}>부족한 구성 검색</button>
+                <a className="download" href={`${API}/jobs/${result.job_id}/download?format=md`}>내려받기</a>
+              </div>
+            )}
+          </section>
+
+          {result && (
+            <>
+              <section className="result-overview" aria-label="보고서 요약">
+                <div><strong>{result.reports?.length || 0}</strong><span>청구항</span></div>
+                <div><strong>{result.claim_mapping?.length || 0}</strong><span>인용발명</span></div>
+                <div><strong>{result.cached_claims?.length || 0}</strong><span>캐시 재사용</span></div>
+              </section>
+
+              <section className="mapping card">
+                <h2>문헌</h2>
+                {result.claim_mapping.map(mapping => (
+                  <div key={mapping.document_id} className="mapping-row">
+                    <b>인용발명 {mapping.reference_number}</b>
+                    <span>{mapping.filename}</span>
+                    <small>{[
+                      mapping.document_number,
+                      (mapping.publication_date || mapping.filing_date) && `공개·제출일 ${mapping.publication_date || mapping.filing_date}`,
+                      mapping.role || mapping.document_type,
+                    ].filter(Boolean).join(' · ')}</small>
+                    {mapping.source_file && (
+                      <a href={`${API}/jobs/${result.job_id}/sources/${mapping.document_id}`} target="_blank" rel="noreferrer">원문</a>
+                    )}
+                  </div>
+                ))}
+              </section>
+
+              {!result.reports && (
+                <div className="notice">이전 형식의 히스토리입니다. 내려받기로 확인하세요.</div>
+              )}
+
+              {(result.reports || []).map(report => (
+                <section key={report.claim_number} className="claim-report">
+                  <div className="claim-title">
+                    <div>
+                      <p className="claim-kicker">
+                        <span className="claim-label">청구항 {report.claim_number}</span>
+                        {report.depends_on && <span className="claim-dependency">{report.depends_on}항 종속</span>}
+                      </p>
+                      <h2>{report.rejection_basis}</h2>
+                      {/* 판정을 받지 못한 청구항에 0%를 찍으면 "유사하지 않다"로 읽힌다. */}
+                      <small>{report.track === 'analysis_incomplete'
+                        ? '구성대비 미완료 — 판정을 받지 못해 결론을 만들지 않았습니다'
+                        : `${chainText(report, result)} · 구성대비 ${report.chain.combined_similarity}%`}</small>
+                    </div>
+                  </div>
+
+                  <div className="results">
+                    {report.claims.map((claim: any, index: number) => (
+                      <article key={claim.label || index} className="card claim">
+                        <div className="claim-head">
+                          <span className="badge">{claim.is_preamble ? '전제부'
+                            : (claim.label || String.fromCharCode(65 + index))}</span>
+                          <strong>{claim.similarity == null ? '—' : `${claim.similarity}%`}</strong>
+                          <span className="quality">{claim.emoji} {claim.grade || claim.status}</span>
+                          {claim.adopted_reference && <span className="reference-chip">인용발명 {claim.adopted_reference}</span>}
+                        </div>
+                        <p>{claim.claim}</p>
+                        {claim.difference && <div className="diff"><b>차이</b> {claim.difference}</div>}
+                        {(claim.narrative || claim.reference_note || claim.residual_difference) && (
+                          <section className="reasoning" aria-label="판단 근거">
+                            <h4>판단 근거</h4>
+                            {claim.narrative && <div className="narrative">{claim.narrative}</div>}
+                            {(claim.reference_note || claim.residual_difference) && (
+                              <div className="roles">
+                                {claim.residual_difference && <small>남는 차이: {claim.residual_difference}</small>}
+                                {claim.reference_note && <small>참고: {claim.reference_note}</small>}
+                              </div>
+                            )}
+                          </section>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+
+                  <div className="summary">
+                    <h3>요약</h3>
+                    {report.summary_similarity && <p>{report.summary_similarity}</p>}
+                    {report.summary_difference && <p>{report.summary_difference}</p>}
+                    {report.summary && <p>{report.summary}</p>}
+                  </div>
+                </section>
+              ))}
+
+              <section className="card dependent-add">
+                <h2>종속항 추가</h2>
+                <textarea
+                  value={dependentClaims}
+                  onChange={event => setDependentClaims(event.target.value)}
+                  placeholder={'【청구항 2】\n제1항에 있어서, (A) 추가 한정…'}
+                />
+                <div className="action">
+                  <span className="hint">기존 문헌을 그대로 사용합니다.</span>
+                  <button className="primary" disabled={busy || !dependentClaims.trim()} onClick={addDependentClaims}>
+                    {actionBusy ? '비교 중' : '일괄 추가'}
+                  </button>
+                </div>
+              </section>
+
+              {!!result.prior_art?.length && (
+                <section className="card prior-art">
+                  <h2>추가 선행기술</h2>
+                  {result.prior_art.map((hit: any, index: number) => (
+                    <div key={index} className="mapping-row">
+                      <b>{hit.claim_number ? `청구항 ${hit.claim_number} ` : ''}({hit.label})</b>
+                      <span>{hit.document_number || hit.title}</span>
+                      <small>{hit.correspondence}</small>
+                      {hit.url && <a href={hit.url} target="_blank" rel="noreferrer">열기</a>}
+                    </div>
+                  ))}
+                </section>
+              )}
+
+              {!!result.validation?.length && (
+                <details className="validation">
+                  <summary>검증 참고 {result.validation.length}건</summary>
+                  {result.validation.map((item, index) => <p key={index}>{item}</p>)}
+                </details>
+              )}
+            </>
+          )}
+          {message && <div className="notice" role="status">{message}</div>}
+        </main>
+      )}
+
+      {tab === 'history' && (
+        <main className="panel">
+          <section className="page-heading">
+            <div><p className="eyebrow">ARCHIVE</p><h1>히스토리</h1></div>
+            <button className="danger" disabled={!history.length} onClick={clearHistory}>전체 삭제</button>
+          </section>
+          <div className="card list">
+            {history.length ? history.map(item => (
+              <div key={item.job_id} className="list-row">
+                <button onClick={() => load(item.job_id)}>
+                  <b>{item.created_at.slice(0, 16).replace('T', ' ')}</b>
+                  <span>{item.documents?.join(', ')}</span>
+                  <small>보기 →</small>
+                </button>
+                <button className="row-del" title="히스토리 삭제" onClick={() => removeHistory(item.job_id)}>×</button>
+              </div>
+            )) : <p className="empty">저장된 분석이 없습니다.</p>}
+          </div>
+          {message && <div className="notice">{message}</div>}
+        </main>
+      )}
+
+      {tab === 'settings' && (
+        <main className="panel">
+          <section className="page-heading"><div><p className="eyebrow">CONFIGURATION</p><h1>설정</h1></div></section>
+          <div className="card settings">
+            <label>연동 CLI
+              <select value={settings.provider} onChange={event => changeProvider(event.target.value)}>
+                <option value="agy">agy</option>
+                <option value="claude">Claude</option>
+                <option value="gpt">Codex</option>
+              </select>
+            </label>
+            <label>모델
+              <select
+                value={models.includes(settings.model) ? settings.model : '__custom__'}
+                onChange={event => setSettings({...settings, model: event.target.value === '__custom__' ? '' : event.target.value})}
+              >
+                {models.map(model => <option key={model} value={model}>{model}</option>)}
+                <option value="__custom__">직접 입력</option>
+              </select>
+              <button className="ghost" onClick={() => loadModels(settings, true)}>새로고침</button>
+            </label>
+            {!models.includes(settings.model) && (
+              <label>모델명
+                <input value={settings.model} onChange={event => setSettings({...settings, model: event.target.value})} />
+              </label>
+            )}
+            <label>분석 지침
+              <textarea className="prompt-input" value={settings.prompt} onChange={event => setSettings({...settings, prompt: event.target.value})} />
+            </label>
+            <div className="action">
+              <button onClick={testSettings}>연결 테스트</button>
+              <button onClick={resetPrompt}>기본값</button>
+              <button className="primary" onClick={() => saveSettings()}>저장</button>
+            </div>
+            {message && <div className="notice">{message}</div>}
+          </div>
+        </main>
+      )}
+
+      {tab === 'logs' && (
+        <main className="panel">
+          <section className="page-heading">
+            <div><p className="eyebrow">OBSERVABILITY</p><h1>로그</h1></div>
+            <button className="danger" disabled={!logs.length} onClick={clearLogs}>전체 삭제</button>
+          </section>
+          <section className="card log-viewer">
+            <aside className="log-list" aria-label="저장된 로그">
+              {logs.length ? logs.map(item => (
+                <button
+                  key={item.job_id}
+                  className={selectedLog === item.job_id ? 'active' : ''}
+                  onClick={() => loadLog(item.job_id)}
+                >
+                  <b>{item.job_id.slice(0, 8)}</b>
+                  <span>{formatLogDate(item.updated_at)}</span>
+                  <small>{item.size.toLocaleString()} bytes</small>
+                </button>
+              )) : <p className="empty">저장된 로그가 없습니다.</p>}
+            </aside>
+            <div className="log-content">
+              <div className="log-toolbar">
+                <b>{selectedLog || '로그를 선택하세요'}</b>
+                <button className="ghost" disabled={logsLoading} onClick={() => refreshLogs()}>
+                  {logsLoading ? '불러오는 중' : '새로고침'}
+                </button>
+              </div>
+              <pre>{logContent || (logsLoading ? '로그를 불러오는 중입니다…' : '표시할 로그가 없습니다.')}</pre>
+            </div>
+          </section>
+          {message && <div className="notice">{message}</div>}
+        </main>
+      )}
+
+      <footer>All rights reserved by Aidan</footer>
+    </div>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(<App />);

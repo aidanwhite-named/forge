@@ -2,22 +2,15 @@ import json
 import pytest
 from app import agy
 
-SETTINGS = {"provider": "agy", "command": "agy", "model": "gemini-3.6-flash-medium"}
+SETTINGS = {"provider": "agy", "model": "gemini-3.6-flash-medium"}
 
 
 def test_prompt_is_the_last_argument(monkeypatch):
     """-p는 값을 받는 플래그라 프롬프트 뒤에 다른 플래그가 오면 프롬프트로 흡수된다."""
     monkeypatch.setattr(agy, "_resolve_command", lambda command: ["agy.exe"])
-    command = agy._build_command("PROMPT", "low", SETTINGS)
+    command = agy._build_command("PROMPT", SETTINGS)
     assert command[-2:] == ["-p", "PROMPT"]
-    assert command[command.index("--model") + 1] == "gemini-3.6-flash-low"
-    assert "--effort" not in command  # 모델명이 이미 effort를 포함한다
-
-
-def test_effort_flag_used_when_model_has_no_suffix(monkeypatch):
-    monkeypatch.setattr(agy, "_resolve_command", lambda command: ["agy.exe"])
-    command = agy._build_command("PROMPT", "high", {**SETTINGS, "model": "claude-sonnet-4-6"})
-    assert command[command.index("--effort") + 1] == "high"
+    assert command[command.index("--model") + 1] == "gemini-3.6-flash-medium"
 
 
 def test_long_prompt_moves_to_a_workspace_file():
@@ -64,3 +57,77 @@ def test_command_line_too_long_is_not_reported_as_missing_cli():
     exc.winerror = 206
     assert "길이 제한" in str(agy._launch_error(exc, SETTINGS))
     assert "찾을 수 없습니다" in str(agy._launch_error(FileNotFoundError(2, "nope"), SETTINGS))
+
+
+def test_cancel_job_kills_only_its_registered_process(monkeypatch):
+    class Process:
+        def poll(self):
+            return None
+
+    process = Process()
+    killed = []
+    agy.register_job("job-a")
+    agy.register_job("job-b")
+    agy._active_processes["job-a"] = process
+    monkeypatch.setattr(agy, "_kill_process_tree", lambda target: killed.append(target))
+
+    assert agy.cancel_job("job-a") is True
+    assert agy.is_cancelled("job-a") is True
+    assert agy.is_cancelled("job-b") is False
+    assert killed == [process]
+
+    agy.finish_job("job-a")
+    agy.finish_job("job-b")
+
+
+# --- 비신뢰 입력을 다루는 CLI의 실행 조건 --------------------------------------
+
+def test_no_provider_bypasses_permissions_by_default(monkeypatch):
+    """프롬프트에는 사용자가 올린 PDF 본문이 그대로 들어간다.
+
+    권한을 우회한 코딩 에이전트에 비신뢰 텍스트를 넘기면, 문헌에 심긴 지시가
+    그대로 실행 권한을 얻는다. 이 단계는 텍스트 in / JSON out만 필요하다.
+    """
+    monkeypatch.setattr(agy, "_resolve_command", lambda command: ["cli.exe"])
+    monkeypatch.setattr(agy, "ALLOW_TOOL_BYPASS", False)
+    for provider in ("agy", "claude", "gpt"):
+        command = agy._build_command("PROMPT", {**SETTINGS, "provider": provider})
+        assert "--dangerously-skip-permissions" not in command
+        assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
+def test_claude_disables_all_tools_and_takes_the_prompt_on_stdin(monkeypatch):
+    monkeypatch.setattr(agy, "_resolve_command", lambda command: ["claude.exe"])
+    monkeypatch.setattr(agy, "ALLOW_TOOL_BYPASS", False)
+    command = agy._build_command("PROMPT", {**SETTINGS, "provider": "claude"})
+    assert command[command.index("--tools") + 1] == ""      # 내장 도구 전면 비활성화
+    assert command[-1] == "-p" and "PROMPT" not in command  # 프롬프트는 stdin으로
+    assert agy._accepts_stdin("claude") and not agy._accepts_stdin("agy")
+
+
+def test_cli_runs_in_a_throwaway_directory_not_the_repository(monkeypatch):
+    """CLI가 서버 작업 디렉터리를 보고 있으면 인젝션의 첫 사정권이 이 저장소가 된다."""
+    captured: dict = {}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return json.dumps({"claims": []}), ""
+
+        def poll(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr(agy, "load_runtime_settings", lambda: SETTINGS)
+    monkeypatch.setattr(agy, "_resolve_command", lambda command: ["agy.exe"])
+    monkeypatch.setattr(agy.subprocess, "Popen", fake_popen)
+
+    agy.run_cli("짧은 프롬프트", expect="claims")
+
+    cwd = captured["cwd"]
+    assert cwd and "forge-cli-" in cwd
+    assert "Forge" not in cwd.replace("forge-cli-", "")

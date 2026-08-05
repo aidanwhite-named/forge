@@ -30,6 +30,8 @@ frontend/dist-ssr/
 
 # Data & Logs
 backend/data/
+/history/
+/logs/
 *.log
 
 
