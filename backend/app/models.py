@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # 판정 어휘. 이 6개 라벨 외에는 파이프라인 어디에서도 쓰지 않습니다.
 Judgment = Literal["동일", "실질적 동일", "일부 차이", "일부 유사", "차이", "대응 없음"]
@@ -39,13 +39,42 @@ class Document(BaseModel):
     ocr_required: bool = False
 
 
+class Limitation(BaseModel):
+    """구성요소를 이루는 원자적 한정 하나.
+
+    kind가 판정 등급을 가릅니다. core는 그 구성이 실제로 무엇을 하는가(입력·처리·출력·구조)이고,
+    qualifier는 그 동작을 한정하는 조건·기준·파라미터·수치입니다. 동작이 개시되어 있고 한정만
+    다르면 심사 실무의 "기술 사상은 같고 세부 구현이 다름"이며, 동작 자체가 없으면 대응이
+    아닙니다. 둘을 구분하지 않으면 한정 문구가 섞인 모든 조각이 함께 실패해, 대응 문단을
+    정확히 찾아 놓고도 구성 전체가 "대응 없음"으로 떨어집니다.
+    """
+    text: str
+    kind: Literal["core", "qualifier"] = "core"
+    # 선택적 한정("A, B 또는 C 중 적어도 하나")의 묶음 이름. 같은 이름을 가진 항목은
+    # 서로 대안이므로 **하나만 개시되면 그 묶음 전체가 충족**되고, 나머지는 차이가 아닙니다.
+    # 빈 값은 단독으로 충족되어야 하는 한정입니다. 이를 구분하지 않으면 선택지를 넉넉히
+    # 나열한 청구항일수록 차이점이 길어져, 실제로는 문언을 충족하는 문헌이 감점됩니다.
+    alternative_group: str = ""
+
+
 class ClaimElement(BaseModel):
     label: str                                # (A), (B) … 라벨 원문 유지
     text: str
     importance: int = 3                       # 1~5. LLM 파싱 단계에서 1회만 받습니다.
     is_sub: bool = False                      # 하위 제한(수치·조건) 여부
     is_preamble: bool = False                 # "…에 있어서" 전제부에서 세운 구성
-    limitations: list[str] = []               # 독립적으로 입증해야 하는 원자적 하위 제한
+    limitations: list[Limitation] = []        # 독립적으로 입증해야 하는 원자적 하위 제한
+    # 이 구성의 대응 기재를 문헌에서 찾기 위한 검색어(원어·번역어). 분해 단계에서 함께 받습니다.
+    # 기술분야별 동의어 사전을 코드에 심는 대신 청구항마다 새로 받으므로 분야에 매이지 않습니다.
+    search_terms: list[str] = []
+
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def _accept_plain_limitations(cls, value):
+        """문자열 목록으로 저장된 예전 기록도 그대로 읽습니다. 기본 kind는 core입니다."""
+        if not isinstance(value, list):
+            return value
+        return [{"text": item, "kind": "core"} if isinstance(item, str) else item for item in value]
 
 
 class Claim(BaseModel):
@@ -67,6 +96,8 @@ class LimitationCheck(BaseModel):
     """구성요소의 하위 제한 1개에 대한 직접 근거 점검."""
     index: int
     limitation: str = ""
+    kind: Literal["core", "qualifier"] = "core"
+    alternative_group: str = ""               # 같은 값끼리 대안. 하나만 개시되면 묶음 충족
     # 구성이 하위 제한으로 분해되지 않아 구성 원문 한 줄을 그대로 점검한 경우.
     # 이때 실패는 '누락된 하위 한정'이 아니라 구성 자체의 미개시이므로,
     # missing_limitations에 넣으면 구성 원문이 누락 한정으로 보고서에 찍히고 누락 수도 이중으로 셉니다.
@@ -76,6 +107,30 @@ class LimitationCheck(BaseModel):
     quote: str = ""
     quote_translation: str = ""
     verify: VerifyStatus = "empty"
+
+
+def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
+    """점검 결과에서 실제로 누락된 한정만 추립니다.
+
+    대안 묶음은 하나만 개시되면 충족이므로 나머지 대안은 누락이 아닙니다. 구성 원문 한 줄을
+    통째로 점검한 경우(whole_element)의 실패는 누락 '한정'이 아니라 구성 자체의 미개시라서
+    목록에 올리지 않습니다.
+
+    비교 단계와 검증 단계가 각자 이 목록을 만들면 규칙이 갈라집니다. 실제로 검증 단계가
+    미개시 항목을 그대로 다시 채워 넣어, 비교 단계에서 걸러 낸 대안이 보고서의 차이점으로
+    되살아났습니다. 검증은 check.disclosed를 뒤집을 수 있으므로 두 단계 모두 이 함수를
+    같은 입력에 대해 다시 호출합니다.
+    """
+    satisfied = {check.alternative_group for check in checks
+                 if check.disclosed and check.alternative_group}
+    missing: list[str] = []
+    for check in checks:
+        if check.disclosed or check.whole_element or not check.limitation:
+            continue
+        if check.alternative_group in satisfied or check.limitation in missing:
+            continue
+        missing.append(check.limitation)
+    return missing
 
 
 class ElementMatch(BaseModel):
@@ -129,7 +184,7 @@ class SupplementCandidate(BaseModel):
 
 
 class ElementCoverage(BaseModel):
-    """구성 1개의 문헌별 대응 전수 분석. 문헌 수 제한을 적용하기 **전**의 결과입니다."""
+    """구성 1개의 문헌별 대응 전수 분석. 결합 대상으로 고르기 **전**의 결과입니다."""
     label: str
     importance: int = 3
     supplement_needed: bool = False           # 다른 문헌의 더 나은 대응을 검토해야 하는지
@@ -141,30 +196,7 @@ class ElementCoverage(BaseModel):
     adopted_judgment: str = "대응 없음"
     adopted_role: str = "미대응"              # 주 인용발명 / 보조 인용발명 / 미대응
     residual_difference: list[str] = []       # 보완 후에도 남는 차이
-    reference_document: str | None = None     # 미채택 문헌 중 더 강한 대응이 있는 경우
-    reference_judgment: str = "대응 없음"
     candidates: list[SupplementCandidate] = []
-
-
-class DroppedSupplement(BaseModel):
-    """문헌 수 제한 때문에 결합하지 못한 보완 대응. 정보 자체는 버리지 않습니다."""
-    document_id: str
-    labels: list[str] = []
-    reason: str = ""
-
-
-class ConventionalNote(BaseModel):
-    """주지관용으로 분리한 구성 1개의 근거 상태.
-
-    분류 자체는 중요도만 보고 결정되므로, 무엇이 입증되지 않은 채 남았는지 보고서가
-    그대로 드러내야 합니다. 이 기록이 없으면 요약에서 구성이 통째로 사라집니다.
-    """
-    label: str
-    importance: int = 3
-    judgment: str = "대응 없음"               # 결합 후 최종 판정
-    partial_support: bool = False             # 검증된 부분 대응 근거가 있는지
-    missing: list[str] = []                   # 개시가 확인되지 않은 하위 한정
-    note: str = ""                            # 무엇을 더 입증해야 하는지
 
 
 class ChainInfo(BaseModel):
@@ -181,14 +213,10 @@ class ChainInfo(BaseModel):
     secondaries: list[str] = []
     inherited: list[str] = []                 # 종속항이 부모항에서 상속한 문헌
     added: str | None = None                  # 종속항이 새로 추가한 문헌(최대 1개)
-    uncovered: list[str] = []                 # 결합 후에도 커버 기준에 못 미친 라벨
-    conventional: list[str] = []              # 주지관용 검토로 분리한 라벨(근거는 별도 입증 대상)
-    conventional_notes: list[ConventionalNote] = []
+    uncovered: list[str] = []                 # 결합 후에도 대응 기재를 찾지 못한 라벨
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
-    reference_only: list[str] = []            # 미채택 문헌에 더 강한 대응이 있는 라벨
     element_coverage: list[ElementCoverage] = []
-    dropped_supplements: list[DroppedSupplement] = []
     combined_similarity: float = 0.0
     rationale: str = ""
     candidates: list[DocumentScore] = []
@@ -225,22 +253,17 @@ class ClaimResult(BaseModel):
     label: str = ""
     is_preamble: bool = False                 # 전제부에서 세운 구성인지
     claim: str
-    similarity: int | None = None             # 판정 라벨의 고정 대표값
+    # 판정 라벨이 정한 등급 밴드 안에서 근거 품질로 위치를 정한 값. 대응이 없으면 None입니다.
+    similarity: int | None = None
     grade: str = ""
     emoji: str = ""
-    narrative: str = ""                       # 결정론적으로 조립한 구성대비 서술
+    narrative: str = ""                       # 결정론적으로 조립한 구성대비 서술 한 문장
     difference: str | None = None
-    combination: bool = False
-    references: list[str] = []
+    combination: bool = False                 # 두 건 이상의 인용발명을 결합해 대응시켰는지
     evidence: list[Evidence] = []
     status: str = ""
-    note: str = ""
     adopted_document: str = ""                # 이 구성의 근거로 최종 채택된 문헌
     adopted_reference: int | None = None      # 그 문헌의 인용발명 번호
-    primary_disclosure: str = ""              # 주 인용발명이 개시한 부분
-    supplement_disclosure: str = ""           # 보완 인용발명이 개시한 부분
-    residual_difference: str = ""             # 결합 후에도 남는 차이
-    reference_note: str = ""                  # 미채택 문헌 중 더 강한 대응이 있을 때의 참고
 
 
 class ClaimReport(BaseModel):
@@ -248,12 +271,10 @@ class ClaimReport(BaseModel):
     depends_on: int | None = None
     preamble: str = ""
     track: str = ""
-    rejection_basis: str = ""                 # 거절 이유 유형 라벨
     chain: ChainInfo
     claims: list[ClaimResult] = []
-    summary: str = ""
-    summary_similarity: str = ""
-    summary_difference: str = ""
+    summary_similarity: str = ""              # 종합 분석 요약의 유사점 한 줄
+    summary_difference: str = ""              # 종합 분석 요약의 차이점 한 줄
 
 
 class PriorArtHit(BaseModel):
@@ -272,6 +293,9 @@ class AnalysisResult(BaseModel):
     claim_mapping: list[DocumentMapping]
     reports: list[ClaimReport] = []
     preamble: str = ""
-    validation: list[str] = []
+    validation: list[str] = []                # 보고서에 함께 내보내는 사용자용 단서
+    # 발췌 검증 과정 기록(인용 위치 자동 복구, 판정 강등). 판정을 되짚을 때만 쓰는
+    # 내부 정보라 보고서 본문에는 넣지 않고 감사 데이터로만 남깁니다.
+    verify_notes: list[str] = []
     prior_art: list[PriorArtHit] = []
     cached_claims: list[int] = []             # 판정 캐시를 재사용한 청구항 번호

@@ -1,7 +1,7 @@
-"""커버리지 계산. LLM 없이 판정 라벨과 근거만으로 문헌 적합도를 산출합니다.
+"""커버리지 계산. LLM 없이 판정 라벨과 근거만으로 문헌 적합도와 표출 유사도를 산출합니다.
 
-여기서 나오는 값은 보고서에 찍히는 유사도 퍼센트가 아니라 문헌 선정용 내부 지표입니다.
-보고서 퍼센트는 판정 라벨의 고정 대표값(REPORT_PERCENT)을 씁니다.
+문헌 선정에 쓰는 내부 지표(score_document)와 보고서에 찍히는 유사도(report_similarity)는
+서로 다른 값입니다. 후자는 판정 라벨이 정한 등급 밴드 안에서 근거 품질로 위치를 정합니다.
 """
 from .models import Claim, ClaimElement, ElementMatch
 
@@ -14,31 +14,19 @@ JUDGMENT_SIMILARITY = {
     "차이": 0.15,
     "대응 없음": 0.00,
 }
-# 보고서 표출용 고정 대표값. 연속 계산값이 아닙니다.
-REPORT_PERCENT = {
-    "동일": 97,
-    "실질적 동일": 92,
-    "일부 차이": 87,
-    "일부 유사": 82,
-    "차이": 70,
-    "대응 없음": None,
+# 보고서 표출 등급. 유사도 구간과 등급명이 1:1로 대응합니다.
+# "차이"·"대응 없음"은 대응 구간(80% 이상)에 들지 못하므로 유사도를 표기하지 않습니다.
+REPORT_BANDS = {
+    "동일": (95, 99, "동일", "🔵"),
+    "실질적 동일": (90, 94, "실질적 동일", "🟢"),
+    "일부 차이": (85, 89, "기술 사상 동일, 세부 구현 방식의 단순 변경", "🟠"),
+    "일부 유사": (80, 84, "핵심 기능 유사하나 목적/효과에 일부 차이", "🟡"),
 }
-REPORT_GRADE = {
-    "동일": ("동일", "🔵"),
-    "실질적 동일": ("실질적 동일", "🟢"),
-    # 구성대비 등급은 개시 범위만 말합니다. 여기서 "단순 변경"이라고 쓰면 뒤의
-    # 진보성 판단을 선취하므로, 용이 도출 여부와 무관한 중립 표현을 사용합니다.
-    "일부 차이": ("기술 사상 일부 대응, 하위 한정 차이", "🟠"),
-    "일부 유사": ("핵심 기능 유사하나 목적/효과에 일부 차이", "🟡"),
-    "차이": ("차이", "⚪"),
-    "대응 없음": ("대응 안됨", "⚪"),
-}
+UNCORRESPONDED_GRADE = ("대응 안됨", "⚪")
 
 CORE_IMPORTANCE_THRESHOLD = 4     # 이 이상이면 차별적 핵심 구성
-COVER_THRESHOLD = 0.55            # "일부 차이" 이상이면 (최종) 커버된 것으로 봅니다
 DIRECT_STRONG = 0.55              # 직접 근거가 이 이상이면 유효한 직접 개시
 CRITICAL_GAP = 0.35               # 이 미만이면 핵심 공백
-SINGLE_SUFFICIENT = 95.0          # 주 인용발명 단독으로 충분하다고 보는 결합 유사도
 PRIMARY_CANDIDATE_MARGIN = 0.20   # 최고 문헌 대비 이만큼 못 미치면 주 인용발명 후보 제외
 
 # --- 대응의 우열 -------------------------------------------------------------
@@ -68,8 +56,21 @@ def atomic_coverage(match: ElementMatch) -> float | None:
     """
     if not match.limitation_checks:
         return None
-    disclosed = sum(1 for check in match.limitation_checks if check.disclosed)
-    return disclosed / len(match.limitation_checks)
+    # 대안 묶음은 통째로 한 항목처럼 셉니다. 개별 대안을 각각 세면 선택지가 많은 청구항일수록
+    # 분모만 커져, 문언을 충족했는데도 커버율이 낮게 나옵니다.
+    satisfied = {check.alternative_group for check in match.limitation_checks
+                 if check.disclosed and check.alternative_group}
+    counted = [check for check in match.limitation_checks
+               if not check.alternative_group or not _is_redundant_alternative(check, satisfied)]
+    if not counted:
+        return None
+    disclosed = sum(1 for check in counted if check.disclosed or check.alternative_group in satisfied)
+    return disclosed / len(counted)
+
+
+def _is_redundant_alternative(check, satisfied: set[str]) -> bool:
+    """충족된 묶음에서 개시되지 않은 대안. 분모에서 뺍니다."""
+    return check.alternative_group in satisfied and not check.disclosed
 
 
 def item_similarity(match: ElementMatch | None) -> float:
@@ -171,16 +172,30 @@ def score_document(claim: Claim, matches: dict[str, ElementMatch]) -> tuple[floa
     return round(main_score * 100, 2), detail
 
 
-def uncovered_labels(claim: Claim, matches: dict[str, ElementMatch]) -> list[str]:
-    """내부 강도가 커버 기준에 못 미친 구성.
+def report_similarity(match: ElementMatch | None) -> int | None:
+    """보고서에 찍는 유사도. 판정 라벨이 등급 밴드를 정하고 근거 품질이 그 안의 위치를 정합니다.
 
-    **거절 가부를 여기서 정하지 마십시오.** item_similarity는 판정 라벨에 직접성과 누락
-    한정을 곱하므로 '일부 차이'는 direct·누락 0인 한 점에서만 기준을 넘습니다. 즉 이 목록은
-    "차이가 남아 있다"는 뜻이지 "대응 기재가 없다"는 뜻이 아닙니다. 대응 자체의 유무는
-    no_correspondence_labels가 판단하며, 거절 이유 구성 가부는 그쪽을 기준으로 합니다.
+    라벨마다 고정 대표값 하나만 쓰면, 하위 한정을 모두 입증한 '일부 차이'와 절반만 입증한
+    '일부 차이'가 같은 숫자로 나옵니다. 밴드 안에서만 움직이므로 등급과 숫자가 어긋나는 일은
+    없고, 같은 판정 자료에서는 항상 같은 값이 나옵니다.
     """
-    return [element.label for element in claim.elements
-            if item_similarity(matches.get(element.label)) < COVER_THRESHOLD]
+    band = REPORT_BANDS.get(match.judgment) if match else None
+    if band is None:
+        return None
+    low, high = band[0], band[1]
+    signals = [
+        {"direct": 1.0, "inferred": 0.5}.get(match.directness, 0.0),
+        {"verified": 1.0, "partial": 0.5}.get(match.verify, 0.0),
+    ]
+    atomic = atomic_coverage(match)
+    if atomic is not None:
+        signals.append(atomic)
+    return low + round((high - low) * (sum(signals) / len(signals)))
+
+
+def report_grade(match: ElementMatch | None) -> tuple[str, str]:
+    band = REPORT_BANDS.get(match.judgment) if match else None
+    return (band[2], band[3]) if band else UNCORRESPONDED_GRADE
 
 
 def has_correspondence(match: ElementMatch | None) -> bool:

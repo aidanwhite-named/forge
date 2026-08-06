@@ -3,13 +3,13 @@ import json
 
 import pytest
 
-from app import cache, claims as claims_module, compare, pipeline, priorart
-from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimResult, Document,
-                        DocumentMapping, ElementMatch, EvidenceSpan, LimitationCheck)
-from app.pdf import classify, extract_document_number
+from app import agy, cache, claims as claims_module, compare, pipeline, priorart
+from app.models import (ChainInfo, Chunk, ClaimResult, Document, DocumentMapping,
+                        ElementMatch, EvidenceSpan)
+from app.pdf import classify, detect_paragraph_pattern, extract_document_number
 from app.report import to_markdown
-from app.report import (_narrative, _reason_sentence, _summary, _summary_similarity,
-                        _supporting_passages, refresh_mappings)
+from app.report import (_closest_related, _difference, _narrative, _reason_clause,
+                        _summary_difference, refresh_mappings)
 
 CLAIMS = "전자장치에 있어서, (A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러; (B) 상태 변경 시 알림을 전송하는 통신부"
 QUOTE_A = "메모리 컨트롤러는 데이터 쓰기 요청을 큐에 저장한 후 순차적으로 처리한다."
@@ -87,8 +87,8 @@ def test_pipeline_combines_two_documents_and_calls_the_cli_once_per_cell(stub_cl
     assert report.track == "inventive_step_combination"
     assert report.chain.primary == "1" and report.chain.secondaries == ["2"]
     assert [item.label for item in report.claims] == ["P0", "A", "B"]
-    assert element(report, "A").similarity == 92 and element(report, "A").emoji == "🟢"
-    assert element(report, "B").similarity == 97                # 보조 문헌의 동일 판정이 채택됨
+    assert element(report, "A").similarity == 94 and element(report, "A").emoji == "🟢"
+    assert element(report, "B").similarity == 99                # 보조 문헌의 동일 판정이 채택됨
 
 
 def test_an_undisclosed_preamble_is_reported_without_deciding_the_conclusion(stub_cli):
@@ -102,9 +102,9 @@ def test_an_undisclosed_preamble_is_reported_without_deciding_the_conclusion(stu
     assert report.chain.uncovered == ["P0"]
     assert report.chain.preamble_undisclosed == ["P0"]
     assert report.track == "inventive_step_combination"          # 결론을 막지는 않는다
-    assert "전제부 대응 미확인" in report.rejection_basis
-    assert "전제부" in report.summary_difference
     assert element(report, "P0").is_preamble is True
+    assert element(report, "P0").similarity is None
+    assert "추가 검색 필요" in element(report, "P0").narrative
 
 
 def test_reference_numbers_follow_the_selected_role_not_upload_order(stub_cli):
@@ -121,39 +121,67 @@ def test_evidence_carries_the_verified_quote_and_its_location(stub_cli):
     assert evidence.chunk_id == "D2-P-0012"
 
 
-def test_narrative_maps_each_atomic_limitation_to_its_own_quote():
-    """대표 발췌 하나가 서로 다른 하위 한정의 근거인 것처럼 표시되면 안 된다."""
-    from app.report import _narrative
-
-    storage_quote = "저장소에 보관된 콘텐츠 조각을 재생 요청에 따라 검색한다."
-    token_quote = "서버는 생성된 세션에 대응하는 세션 토큰을 사용자에게 발급한다."
+def test_narrative_is_one_sentence_with_excerpt_location_and_reason():
+    """구성대비는 발췌·인용 위치·판단 이유를 한 문장에 담는다. 판단 이유는 생략할 수 없다."""
+    original = "The edge device initiates a virtual encryption session before content arrives."
+    translation = "에지 장치는 콘텐츠 도착 전에 가상 암호화 세션을 개시한다."
     document = Document(id="1", filename="prior.pdf", chunks=[
-        Chunk(document_id="1", chunk_id="storage", page=4, text=storage_quote),
-        Chunk(document_id="1", chunk_id="token", page=5, text=token_quote),
+        Chunk(document_id="1", chunk_id="D1-P-0037", page=5, paragraph="0037", text=original),
     ])
     match = ElementMatch(
-        claim_number=1, label="D", document_id="1", judgment="일부 차이",
-        directness="inferred", quote=storage_quote, chunk_id="storage", verify="verified",
-        missing_limitations=["가상 세션을 생성함"],
-        limitation_checks=[
-            LimitationCheck(index=0, limitation="콘텐츠를 검색함", disclosed=True,
-                            quote=storage_quote, chunk_id="storage", verify="verified"),
-            LimitationCheck(index=1, limitation="세션 토큰을 발급함", disclosed=True,
-                            quote=token_quote, chunk_id="token", verify="verified"),
-        ],
+        claim_number=1, label="D", document_id="1", judgment="일부 차이", directness="direct",
+        quote=original, quote_translation=translation, chunk_id="D1-P-0037", verify="verified",
+        reason="콘텐츠와 분리된 세션을 미리 만들어 두고 있음",
     )
     narrative = _narrative(
-        "콘텐츠를 검색하고 가상 세션을 생성하여 세션 토큰을 발급함", match,
-        ChainInfo(claim_number=1, primary="1"), {"1": {"D": match}},
-        [DocumentMapping(reference_number=1, filename="prior.pdf", document_id="1")],
+        "D", "가상 세션을 생성하고 세션 토큰을 발급함", match, match, False,
+        [DocumentMapping(reference_number=1, filename="prior.pdf",
+                         document_id="1", document_number="US 2023/0362144 A1")],
         {"1": document},
     )
 
-    assert narrative.count(storage_quote) == 1
-    assert narrative.count(token_quote) == 1
-    assert "콘텐츠를 검색함" in narrative and "세션 토큰을 발급함" in narrative
-    assert "4 페이지" in narrative and "5 페이지" in narrative
-    assert "가상 세션을 생성함 기재는 확인되지 않았습니다" in narrative
+    assert narrative == (
+        '인용발명 1 (US 2023/0362144 A1)에는 "에지 장치는 콘텐츠 도착 전에 가상 암호화 세션을 개시한다." '
+        '(단락 [0037])("The edge device initiates a virtual encryption session before content arrives.")'
+        '는 구성이 기재되어 있으며, 콘텐츠와 분리된 세션을 미리 만들어 두고 있으므로 '
+        '청구항의 "가상 세션을 생성하고 세션 토큰을 발급함" 구성과 대응됩니다.'
+    )
+    assert "\n" not in narrative
+
+
+def test_an_element_with_no_correspondence_is_flagged_for_further_search():
+    """대응 문헌이 없으면 유사도를 붙이지 않고 추가 검색 대상으로 표시한다."""
+    match = ElementMatch(claim_number=1, label="B", document_id="1", judgment="대응 없음",
+                         directness="absent")
+    narrative = _narrative("B", "유효 수요 지표를 산출함", match, match, False, [], {})
+
+    assert narrative == "(B) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
+
+
+def test_the_closest_verified_passage_survives_a_no_correspondence_verdict():
+    """대응으로 인정하지 않더라도 원문 대조를 통과한 인접 기재는 버리지 않는다.
+
+    감추면 심사관이 이미 확인된 문단을 처음부터 다시 찾게 되고, 어디까지 검토된 상태인지도
+    알 수 없게 된다. 등급을 올리지 않고 위치만 함께 남긴다.
+    """
+    quote = "The request is invalidated after the time-to-live expires."
+    documents = {"1": Document(id="1", filename="d1.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0617", page=24, paragraph="0617", text=quote)])}
+    match = ElementMatch(
+        claim_number=1, label="H", document_id="1", judgment="차이", directness="absent",
+        evidence=[EvidenceSpan(chunk_id="D1-P-0617", quote=quote,
+                               quote_translation="TTL이 만료되면 요청이 무효화된다.", verify="verified")])
+    mappings = [DocumentMapping(reference_number=3, filename="d1.pdf", document_id="1",
+                                document_number="US 2003/0097564 A1")]
+
+    related = _closest_related("H", {"1": {"H": match}}, mappings, documents)
+    narrative = _narrative("H", "세션 토큰을 파기함", match, match, False, mappings, documents, related)
+
+    assert narrative.splitlines() == [
+        "(H) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요",
+        '(가장 가까운 기재: 인용발명 3 (US 2003/0097564 A1) "TTL이 만료되면 요청이 무효화된다." '
+        "(단락 [0617]) — 청구항 한정 전체를 개시하는 근거는 아님)",
+    ]
 
 
 def test_hallucinated_quote_is_downgraded_before_selection(monkeypatch, stub_cli):
@@ -164,8 +192,11 @@ def test_hallucinated_quote_is_downgraded_before_selection(monkeypatch, stub_cli
     monkeypatch.setitem(RESPONSES, "1", fabricated["1"])
     result = pipeline.analyze("job", CLAIMS, DOCUMENTS)
     item = element(result.reports[0], "A")
-    assert item.similarity is not None and item.similarity < 97
-    assert any("→" in note or "낮췄" in note for note in [item.note] + result.validation)
+    # 검증에 실패한 발췌는 '차이' 이하로 내려가고, '차이'는 대응 구간(80% 이상)에 들지 못한다.
+    # 지어낸 문장 위에 유사도 퍼센트를 얹지 않는 것이 이 게이트의 목적이다.
+    assert item.similarity is None and item.status == "미개시"
+    assert "추가 검색 필요" in item.narrative
+    assert any("→" in note or "낮췄" in note for note in result.verify_notes)
     monkeypatch.setitem(RESPONSES, "1", RESPONSES["1"])
 
 
@@ -218,8 +249,113 @@ def test_multiple_dependent_claims_use_one_batch_comparison_and_stay_separate(mo
     assert [report.claim_number for report in result.reports] == [1, 2, 3]
     assert result.reports[1].depends_on == 1 and result.reports[2].depends_on == 1
     assert result.reports[1].claims[0].claim != result.reports[2].claims[0].claim
-    assert "큐가 우선순위를 가짐" in result.reports[1].claims[0].narrative
-    assert "큐가 순환형임" in result.reports[2].claims[0].narrative
+    assert "큐가 우선순위를 갖는 전자장치" in result.reports[1].claims[0].narrative
+    assert "큐가 순환형인 전자장치" in result.reports[2].claims[0].narrative
+
+
+def test_an_incomplete_batch_response_only_re_asks_the_cells_that_were_missing(monkeypatch, stub_cli):
+    """일괄 응답에서 한 칸이 빠졌다고 나머지 온전한 칸까지 다시 물어보면 안 된다.
+
+    한 응답에 (종속항 × 문헌) 수십 칸과 하위 제한 점검 수백 줄을 담아야 하므로 어딘가
+    빠지는 일은 드물지 않다. 그때마다 전 칸을 단건으로 다시 받으면 일괄 호출은 늘 헛돈이
+    되고 소요 시간은 칸 수에 그대로 비례한다.
+    """
+    existing = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    calls: list[str] = []
+    single_cells: list[str] = []
+
+    def cell(claim_number: int, document_id: str) -> dict:
+        return {"claim_number": claim_number, "document_id": document_id, "label": "A",
+                "judgment": "동일", "directness": "direct", "reason": "큐 구성을 개시함",
+                "quote": QUOTE_A if document_id == "1" else QUOTE_B,
+                "chunk_id": f"D{document_id}-P-{'0021' if document_id == '1' else '0012'}",
+                "limitation_checks": checks(True, QUOTE_A if document_id == "1" else QUOTE_B,
+                                            f"D{document_id}-P-{'0021' if document_id == '1' else '0012'}")}
+
+    def partial_batch(prompt: str, expect: str = "claims"):
+        calls.append(expect)
+        if expect == "elements":
+            return {"elements": [{"claim_number": 2, "label": "A", "importance": 4},
+                                 {"claim_number": 3, "label": "A", "importance": 5}]}
+        if '"claims"' in prompt:
+            # 4칸 중 (청구항 3 × 문헌 2) 한 칸만 빠뜨린 응답.
+            return {"matches": [cell(2, "1"), cell(2, "2"), cell(3, "1")]}
+        single_cells.append(prompt)
+        return {"matches": [{"label": "A", "judgment": "동일", "directness": "direct",
+                             "reason": "순환형 큐를 개시함", "quote": QUOTE_B,
+                             "chunk_id": "D2-P-0012",
+                             "limitation_checks": checks(True, QUOTE_B, "D2-P-0012")}]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", partial_batch)
+    combined = (f"【청구항 1】\n{CLAIMS}\n"
+                "【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치\n"
+                "【청구항 3】\n제1항에 있어서, (A) 큐가 순환형인 전자장치")
+    result = pipeline.extend_with_dependent_claims(existing, combined, {2, 3}, DOCUMENTS)
+
+    # 일괄 1회 + 빠진 한 칸만 단건 1회. 예전에는 여기서 네 칸을 전부 다시 물어봤다.
+    assert calls == ["elements", "matches", "matches"]
+    assert len(single_cells) == 1 and '"claim_number": 3' in single_cells[0]
+    assert [report.claim_number for report in result.reports] == [1, 2, 3]
+    assert all(report.track != "analysis_incomplete" for report in result.reports)
+
+
+def test_dependent_cells_do_not_resend_the_whole_document(monkeypatch, stub_cli):
+    """종속항 행렬에는 "에 있어서" 뒤의 추가 한정만 들어 있다.
+
+    한 줄짜리 한정을 판정하려고 문헌 전문을 실으면 같은 문헌을 종속항 수만큼 다시 읽히게
+    된다. 이번 실측에서는 문헌 3건(14.5만 자)이 종속항 7개에 걸쳐 101만 자로 불어났다.
+    """
+    budgets: list[int | None] = []
+    real_select = compare.select_chunks
+
+    def record(claim, document, budget=None):
+        budgets.append(budget)
+        return real_select(claim, document, budget)
+
+    monkeypatch.setattr(compare, "select_chunks", record)
+    existing = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    assert budgets == [None, None]                   # 독립항은 문헌 전문을 그대로 쓴다
+
+    budgets.clear()
+    monkeypatch.setattr(compare, "compare_claims_documents",
+                        lambda claims, documents, guideline="": ({}, ["일괄 실패"]))
+    combined = f"【청구항 1】\n{CLAIMS}\n【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치"
+    pipeline.extend_with_dependent_claims(existing, combined, {2}, DOCUMENTS)
+    assert budgets == [compare.DEPENDENT_DOCUMENT_BUDGET_CHARS] * 2
+
+
+def test_a_failed_batch_call_falls_back_to_per_cell_comparison(monkeypatch, stub_cli):
+    """일괄 호출 한 번의 실패로 종속항 **전부**가 판정을 잃어서는 안 된다.
+
+    일괄 프롬프트는 모든 종속항과 모든 문헌을 함께 싣기 때문에 길이 초과 한 번이
+    보고서 전체를 '판정 불가'로 만든다. 속도를 위한 최적화가 결과를 못 내는 쪽으로
+    기울면 안 되므로, 실패하면 셀 단위로 다시 물어본다.
+    """
+    existing = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    calls: list[str] = []
+
+    def failing_batch(prompt: str, expect: str = "claims"):
+        calls.append(expect)
+        if expect == "elements":
+            return {"elements": [{"claim_number": 2, "label": "A", "importance": 4}]}
+        if '"claims"' in prompt:                       # 일괄 경로만 실패시킨다
+            raise RuntimeError("agy CLI의 response 필드가 JSON이 아닙니다")
+        return {"matches": [
+            {"label": "A", "judgment": "동일", "directness": "direct", "reason": "우선순위 큐를 개시함",
+             "quote": QUOTE_A, "chunk_id": "D1-P-0021",
+             "limitation_checks": checks(True, QUOTE_A, "D1-P-0021")}]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", failing_batch)
+    combined = (f"【청구항 1】\n{CLAIMS}\n"
+                "【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치")
+    result = pipeline.extend_with_dependent_claims(existing, combined, {2}, DOCUMENTS)
+
+    report = result.reports[1]
+    assert calls == ["elements", "matches", "matches", "matches"]  # 일괄 1회 실패 + 셀 2회
+    assert report.track != "analysis_incomplete"
+    assert report.claims[0].similarity == 99
 
 
 def test_changing_the_guideline_invalidates_the_cache(stub_cli):
@@ -229,104 +365,66 @@ def test_changing_the_guideline_invalidates_the_cache(stub_cli):
     assert stub_cli.count("matches") == 2
 
 
-def test_markdown_reports_the_chain_and_the_deterministic_grades(stub_cli):
-    result = pipeline.analyze("job", CLAIMS, DOCUMENTS)
-    markdown = to_markdown(result)
-    assert "| 인용발명 1 | 10-2020-0001 | 1.pdf | - | patent |" in markdown
-    # 조문은 검토 트랙의 근거로만 인용하고, 이 파이프라인이 평가하지 않은 항목을 함께 적는다.
-    assert "**검토 트랙**: 진보성 검토 후보 (제29조제2항) — 인용발명 2건 결합" in markdown
-    assert "결합 동기·용이성 미평가" in markdown
-    assert "선행기술 적격성" in markdown
+def test_markdown_carries_only_the_comparison_itself(stub_cli):
+    """보고서에는 구성대비만 남는다. 내부 선정 지표와 도구 동작 로그는 감사 JSON으로 간다."""
+    markdown = to_markdown(pipeline.analyze("job", CLAIMS, DOCUMENTS))
+    assert "| 인용발명 1 | 10-2020-0001 | 1.pdf | - | 주 인용발명 |" in markdown
     assert "**인용발명 조합**: 인용발명 1 (10-2020-0001) + 인용발명 2 (10-2020-0002)" in markdown
     assert "### (A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러" in markdown
-    assert "판정 대표값: 92% 🟢 실질적 동일" in markdown
+    assert "유사도: 94% 🟢 실질적 동일" in markdown
     assert "단락 [0021]" in markdown
-    assert "심사 판단" not in markdown
+    for noise in ("판정 대표값", "검토 트랙", "결합 후 구성대비 지표", "주지관용",
+                  "결합에 채택하지 않은 대응", "주 인용발명 개시:", "결합 후 남는 차이:",
+                  "단독 적합도"):
+        assert noise not in markdown
 
 
-def test_summary_describes_overall_similarity_in_one_line(stub_cli):
-    """구성별 유사 문장을 반복하지 않고 전체 공통 내용을 한 문장으로 적는다."""
+def test_summary_states_the_common_ground_and_the_sharpest_difference(stub_cli):
     report = pipeline.analyze("job", CLAIMS, DOCUMENTS).reports[0]
-    assert report.summary_similarity == (
-        "청구항과 인용발명 1 및 인용발명 2는 쓰기 요청을 큐에 저장하는 메모리 컨트롤러 및 "
-        "상태 변경 시 알림을 전송하는 통신부에 관한 기술 내용이 전체적으로 유사합니다."
-    )
+    assert report.summary_similarity.startswith("청구항과 인용발명 1, 인용발명 2는 ")
+    assert report.summary_similarity.endswith("기술적 목적과 핵심 메커니즘이 공통됩니다.")
     assert "\n" not in report.summary_similarity
-    assert report.summary_similarity.count("유사합니다") == 1
-    assert "나머지 구성 B은 인용발명 2 (10-2020-0002)에서 확인됩니다" in report.summary
     assert element(report, "B").adopted_reference == 2
-    assert "인용발명 2" in element(report, "B").supplement_disclosure
-
-    markdown = to_markdown(pipeline.analyze("job-summary", CLAIMS, DOCUMENTS))
-    assert "인용발명 선정 근거(구성대비 단계)" not in markdown
-    assert "- 최종 판단:" not in markdown
 
 
-def test_partial_correspondence_is_not_summarized_as_disclosed():
-    target = Claim(number=1, elements=[
-        ClaimElement(label="A", text="재생 요청을 수신함"),
-        ClaimElement(label="D", text="가상 세션을 생성하고 세션 토큰을 발급함"),
-    ])
-    chain = ChainInfo(claim_number=1, primary="1", track="inventive_step_combination")
+def test_a_gap_that_no_document_fills_is_named_in_the_summary_difference():
     results = [
-        ClaimResult(label="A", claim=target.elements[0].text, status="개시됨", adopted_reference=1),
-        ClaimResult(label="D", claim=target.elements[1].text, status="부분 개시", adopted_reference=1),
+        ClaimResult(label="A", claim="재생 요청을 수신함", similarity=94, status="개시됨",
+                    adopted_reference=1),
+        ClaimResult(label="B", claim="유효 수요 지표를 산출함", similarity=None, status="미개시"),
     ]
-    merged = {
-        "A": ElementMatch(claim_number=1, label="A", document_id="1", judgment="동일"),
-        "D": ElementMatch(claim_number=1, label="D", document_id="1", judgment="일부 차이"),
-    }
-    mappings = [DocumentMapping(reference_number=1, filename="d1.pdf", document_id="1")]
+    difference = _summary_difference(ChainInfo(claim_number=1, primary="1",
+                                               track="inventive_step_combination"), results)
 
-    summary = _summary(target, chain, results, merged, mappings)
-    similarity = _summary_similarity(results)
-
-    assert "구성 A이 개시되어 있고" in summary
-    assert "구성 D에는 일부 대응 기재만" in summary
-    assert "구성 A, D이 개시" not in summary
-    assert "구성 D에는 일부 대응 기재만" in similarity
+    assert "구성 B" in difference and "추가 검색" in difference
 
 
-def test_supplement_narrative_is_ordered_without_repeating_the_quote(stub_cli):
-    """주 문헌의 한계 다음에 보완 근거와 판단을 쓰고, 문장마다 줄을 바꾼다."""
-    narrative = element(pipeline.analyze("job", CLAIMS, DOCUMENTS).reports[0], "B").narrative
-    lines = narrative.splitlines()
+def test_supplement_is_written_as_one_combined_sentence():
+    """주 인용발명에 없는 부분을 보완 인용발명이 채우면, 두 문헌을 한 문장에 이어서 적는다."""
+    primary_quote = "제어부는 센서 온도를 기준값과 비교하여 냉각팬 구동 여부를 결정한다."
+    documents = {"1": document("1", primary_quote, "0034"), "2": document("2", QUOTE_B, "0012")}
+    primary = ElementMatch(claim_number=1, label="B", document_id="1", judgment="일부 차이",
+                           directness="direct", quote=primary_quote, chunk_id="D1-P-0034",
+                           verify="verified", missing_limitations=["알림 전송"])
+    adopted = ElementMatch(claim_number=1, label="B", document_id="2", judgment="동일",
+                           directness="direct", quote=QUOTE_B, chunk_id="D2-P-0012",
+                           verify="verified", reason="상태 변경 시 알림을 보내고 있음")
+    mappings = [DocumentMapping(reference_number=1, filename="1.pdf", document_id="1",
+                                document_number="10-2020-0001"),
+                DocumentMapping(reference_number=2, filename="2.pdf", document_id="2",
+                                document_number="10-2020-0002")]
 
-    assert len(lines) == 5
-    assert lines[0].startswith("인용발명 1 (10-2020-0001)만으로는")
-    assert lines[1] == "누락된 한정은 알림 전송입니다."
-    assert lines[2] == "인용발명 2 (10-2020-0002)에서 다음 대응 기재를 확인했습니다."
-    assert lines[3].endswith(f'"{QUOTE_B}" (단락 [0012])')
-    assert lines[4].startswith('따라서 청구항의 "상태 변경 시 알림을 전송하는 통신부"')
-    assert narrative.count(QUOTE_B) == 1
+    narrative = _narrative("B", "냉각팬 구동 여부 결정 및 알림 전송", adopted, primary, True,
+                           mappings, documents)
+    difference = _difference(adopted, primary, True, mappings, documents)
 
-    markdown = to_markdown(pipeline.analyze("job-2", CLAIMS, DOCUMENTS))
-    assert "보기 어렵습니다.  \n누락된 한정은" in markdown
-
-
-def test_verified_related_evidence_is_shown_without_calling_it_full_disclosure():
-    match = ElementMatch(
-        claim_number=1, label="C", document_id="1", judgment="대응 없음", directness="absent",
-        missing_limitations=["수요 지표의 임계값에 따라 저장 위치를 정함"],
-        evidence=[EvidenceSpan(chunk_id="D1-P-0021", quote=QUOTE_A,
-                               quote_translation="관련 저장 처리", verify="verified")],
+    assert narrative == (
+        f'인용발명 1 (10-2020-0001)에는 "{primary_quote}" (단락 [0034])는 구성이 기재되어 있으나 '
+        f'알림 전송에 대한 기재는 없고, 인용발명 2 (10-2020-0002)에는 "{QUOTE_B}" (단락 [0012])는 '
+        '구성이 기재되어 있어 이를 결합하면 청구항의 "냉각팬 구동 여부 결정 및 알림 전송" 구성과 대응됩니다.'
     )
-    passages = _supporting_passages(match, {"1": DOCUMENTS[0]})
-
-    assert passages == [
-        (["관련 기재(청구항 한정 전체를 개시하는 근거는 아님)"],
-         "관련 저장 처리", QUOTE_A, "단락 [0021]")
-    ]
-
-    narrative = _narrative(
-        "수요 지표에 따라 저장 위치를 변경함", match,
-        ChainInfo(claim_number=1, primary="1"), {"1": {"C": match}},
-        [DocumentMapping(reference_number=1, filename="1.pdf", document_id="1")],
-        {"1": DOCUMENTS[0]},
-    )
-    assert "관련 기재(청구항 한정 전체를 개시하는 근거는 아님)" in narrative
-    assert QUOTE_A in narrative
-    assert narrative.endswith("관련 기재가 있으나 청구항 한정 전체에 대응하는 개시로 보기 어렵습니다.")
+    assert difference == ("인용발명 1 (10-2020-0001)은 알림 전송에 대한 기재가 없으나 "
+                          "인용발명 2 (10-2020-0002) (단락 [0012])의 결합으로 해소됨")
 
 
 def test_uncovered_elements_are_offered_for_prior_art_search(monkeypatch, stub_cli):
@@ -392,7 +490,8 @@ def test_prior_art_hit_keeps_the_claim_number(monkeypatch):
 
 
 def test_document_classification_and_number_extraction():
-    assert classify("[0001] 어떤 기재 [0002] 다른 기재 [0003] 또 다른 기재") == "patent"
+    numbered = "\n".join(f"[{index:04d}] 이 단락은 발명의 구성을 설명한다." for index in range(1, 12))
+    assert classify(numbered, detect_paragraph_pattern(numbered)) == "patent"
     assert classify("Abstract Introduction References DOI 10.1000/x") == "paper"
     assert extract_document_number("United States Patent US 11,456,887 B1") == "US 11,456,887 B1"
     assert extract_document_number("공개특허 10-2020-0012345 공보") == "10-2020-0012345"
@@ -428,10 +527,17 @@ def test_cache_reuses_entries_that_contain_the_removed_similarity_field():
     assert not hasattr(loaded[0], "similarity_point")
 
 
-def test_reason_sentence_removes_temporary_reference_number():
-    assert _reason_sentence("인용발명 1에는 동기화 기술이 개시됨") == "이는 동기화 기술이 개시된다는 점을 보여 줍니다."
-    assert _reason_sentence("인용발명 4는 XR 표시를 개시함") == "이는 XR 표시를 개시한다는 점을 보여 줍니다."
-    assert _reason_sentence("인용문헌 2에는 병합 단계만 개시됨") == "이는 병합 단계만 개시된다는 점을 보여 줍니다."
+def test_reason_clause_drops_temporary_numbers_and_connects_to_the_conclusion():
+    """모델이 쓴 임시 문헌 번호는 확정 매핑 번호와 충돌하므로 지운다.
+
+    이유는 "…므로 청구항의 … 구성과 대응됩니다"에 이어 붙으므로 어미도 함께 맞춘다.
+    """
+    assert _reason_clause("인용발명 1에는 동기화 기술이 개시됨") == "동기화 기술이 개시되므로"
+    assert _reason_clause("인용문헌 2에는 병합 단계만 개시된다") == "병합 단계만 개시되므로"
+    assert _reason_clause("큐에 저장해 순차 처리하고 있으므로") == "큐에 저장해 순차 처리하고 있으므로"
+    assert _reason_clause("토큰을 검증합니다") == "토큰을 검증하므로"
+    # 이유는 생략할 수 없는 항목이므로, 비어 있을 때도 문장이 끊기지 않게 중립 문구로 잇는다.
+    assert _reason_clause("").endswith("므로")
 
 
 def test_refresh_mappings_keeps_numbers_and_updates_newly_adopted_role():
@@ -447,3 +553,174 @@ def test_refresh_mappings_keeps_numbers_and_updates_newly_adopted_role():
 
     assert [mapping.reference_number for mapping in refreshed] == [1, 2]
     assert refreshed[1].role == "보조 인용발명"
+
+
+# --- 종속항 대비의 속도와 중단 안전성 -------------------------------------------
+
+def test_missing_cells_are_compared_in_parallel_but_reassembled_in_order(monkeypatch, stub_cli):
+    """셀은 서로를 참조하지 않고 시간의 거의 전부가 CLI 응답 대기다.
+
+    직렬로 돌면 (종속항 × 문헌) 수만큼 그대로 곱해진다. 실측 로그에서 21셀이 셀당 22초로
+    7분 반이 걸렸다. 다만 병렬로 돌리더라도 매트릭스는 제출 순서대로 다시 모아야, 완료
+    순서가 실행마다 달라져도 같은 보고서가 나온다.
+    """
+    import threading
+
+    existing = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(2, timeout=5)
+
+    def slow_cell(prompt: str, expect: str = "claims"):
+        nonlocal running, peak
+        if expect == "elements":
+            return {"elements": [{"claim_number": 2, "label": "A", "importance": 4}]}
+        if '"claims"' in prompt:
+            return {"matches": []}                     # 일괄은 한 칸도 채우지 못한다
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        barrier.wait()                                 # 두 셀이 실제로 동시에 떠야 통과한다
+        with lock:
+            running -= 1
+        quote = QUOTE_A if '"id": "1"' in prompt else QUOTE_B
+        chunk = "D1-P-0021" if '"id": "1"' in prompt else "D2-P-0012"
+        return {"matches": [{"label": "A", "judgment": "동일", "directness": "direct",
+                             "reason": "큐 구성을 개시함", "quote": quote, "chunk_id": chunk,
+                             "limitation_checks": checks(True, quote, chunk)}]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", slow_cell)
+    combined = f"【청구항 1】\n{CLAIMS}\n【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치"
+    result = pipeline.extend_with_dependent_claims(existing, combined, {2}, DOCUMENTS)
+
+    assert peak == 2
+    report = result.reports[1]
+    assert report.claim_number == 2 and report.track != "analysis_incomplete"
+    # 매트릭스는 제출 순서(문헌 1 → 2)대로 모인다.
+    assert [item.document_id for item in report.chain.candidates] == ["1", "2"]
+
+
+def test_a_stored_decomposition_keeps_the_comparison_cache_valid(monkeypatch, stub_cli):
+    """분해를 저장해 두지 않으면 취소 후 재시도가 처음부터 다시 돈다.
+
+    같은 청구항을 다시 분해하면 문장이 조금 달라지고, 그 문장이 캐시 키에 들어 있으므로
+    이미 받아 둔 셀 판정이 전부 미스가 된다. 실제 캐시 디렉터리에 같은 (청구항 1, 문헌 1)
+    항목이 31개 쌓여 있었던 이유다.
+    """
+    import copy
+
+    base = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    drift = iter(["큐에 저장함", "큐에다 저장함", "큐에 담아 둠"])
+    cells: list[str] = []
+
+    def drifting(prompt: str, expect: str = "claims"):
+        if expect == "elements":
+            return {"elements": [{"claim_number": 2, "label": "A", "importance": 4,
+                                  "limitations": [{"text": next(drift), "kind": "core"}]}]}
+        if '"claims"' in prompt:
+            return {"matches": []}
+        cells.append(prompt)
+        quote = QUOTE_A if '"id": "1"' in prompt else QUOTE_B
+        chunk = "D1-P-0021" if '"id": "1"' in prompt else "D2-P-0012"
+        return {"matches": [{"label": "A", "judgment": "동일", "directness": "direct",
+                             "reason": "큐 구성을 개시함", "quote": quote, "chunk_id": chunk,
+                             "limitation_checks": checks(True, quote, chunk)}]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", drifting)
+    combined = f"【청구항 1】\n{CLAIMS}\n【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치"
+
+    store: dict = {}
+    pipeline.extend_with_dependent_claims(copy.deepcopy(base), combined, {2}, DOCUMENTS,
+                                          decomposition=store)
+    assert len(cells) == 2                                        # 문헌 2건을 처음 판정
+
+    # 같은 분해를 물려주면 캐시가 그대로 맞아 셀을 한 번도 다시 부르지 않는다.
+    pipeline.extend_with_dependent_claims(copy.deepcopy(base), combined, {2}, DOCUMENTS,
+                                          decomposition=store)
+    assert len(cells) == 2
+
+    # 분해를 물려주지 않으면 같은 청구항인데도 키가 달라져 전부 다시 판정한다.
+    pipeline.extend_with_dependent_claims(copy.deepcopy(base), combined, {2}, DOCUMENTS)
+    assert len(cells) == 4
+
+
+def test_a_cancelled_extension_keeps_the_claims_it_already_judged(monkeypatch, stub_cli):
+    """취소했다고 몇 분치 판정을 통째로 버리면, 다시 눌렀을 때 같은 항을 또 대비한다.
+
+    판정이 모두 모인 항만 보고서에 올린다. 절반만 대비된 항을 넣으면 아직 읽지도 않은
+    문헌을 그 항에 대해 "대응 없음"으로 단정하게 된다.
+    """
+    existing = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    saved: list[list[int]] = []
+
+    def cancel_on_claim_three(prompt: str, expect: str = "claims"):
+        if expect == "elements":
+            return {"elements": [{"claim_number": 2, "label": "A", "importance": 4},
+                                 {"claim_number": 3, "label": "A", "importance": 5}]}
+        if '"claims"' in prompt:
+            return {"matches": []}
+        if '"claim_number": 3' in prompt:
+            raise agy.AnalysisCancelled("보고서 생성을 취소했습니다.")
+        quote = QUOTE_A if '"id": "1"' in prompt else QUOTE_B
+        chunk = "D1-P-0021" if '"id": "1"' in prompt else "D2-P-0012"
+        return {"matches": [{"label": "A", "judgment": "동일", "directness": "direct",
+                             "reason": "큐 구성을 개시함", "quote": quote, "chunk_id": chunk,
+                             "limitation_checks": checks(True, quote, chunk)}]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", cancel_on_claim_three)
+    combined = (f"【청구항 1】\n{CLAIMS}\n"
+                "【청구항 2】\n제1항에 있어서, (A) 큐가 우선순위를 갖는 전자장치\n"
+                "【청구항 3】\n제1항에 있어서, (A) 큐가 순환형인 전자장치")
+
+    with pytest.raises(agy.AnalysisCancelled):
+        pipeline.extend_with_dependent_claims(
+            existing, combined, {2, 3}, DOCUMENTS,
+            checkpoint=lambda partial: saved.append([r.claim_number for r in partial.reports]))
+
+    assert saved == [[1, 2]]                    # 판정이 끝난 2항까지 저장하고 3항은 남기지 않는다
+    assert [report.claim_number for report in existing.reports] == [1, 2]
+
+
+def test_the_initial_analysis_compares_documents_in_parallel_without_extra_calls(monkeypatch, stub_cli):
+    """문헌마다 소요 시간의 거의 전부가 CLI 응답 대기라, 직렬로 돌면 문헌 수만큼 곱해진다.
+
+    병렬화는 **호출 횟수도 프롬프트도 바꾸지 않는다.** 셀당 1회 그대로이므로 토큰 비용은
+    같고 대기 시간만 줄어든다. 대신 완료 순서가 실행마다 달라지므로, 매트릭스는 반드시
+    (청구항, 문헌) 순서로 다시 모아야 같은 보고서가 나온다.
+    """
+    import threading
+    import time
+
+    baseline = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    assert stub_cli.count("matches") == 2
+    cache.clear()
+
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+    sequential = compare.run_cli
+
+    def out_of_order(prompt: str, expect: str = "claims"):
+        nonlocal running, peak
+        if expect == "elements":
+            return sequential(prompt, expect)
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        # 먼저 제출한 문헌 1을 늦게 끝내 제출 순서와 완료 순서를 뒤집는다.
+        time.sleep(0.20 if '"id": "1"' in prompt else 0.02)
+        with lock:
+            running -= 1
+        return sequential(prompt, expect)
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", out_of_order)
+    shuffled = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+
+    assert peak == 2                                    # 두 문헌이 실제로 동시에 떴다
+    assert stub_cli.count("matches") == 4               # 셀당 1회 그대로. 호출이 늘지 않는다
+    assert shuffled.model_dump() == baseline.model_dump()

@@ -1,4 +1,6 @@
-from app.claims import ancestry, input_quality_warnings, parse_claims
+from app import claims as claims_module
+from app.claims import (ancestry, assign_importance, input_quality_warnings,
+                        parse_claims)
 
 
 def test_multiline_element_stays_one_component_and_keeps_its_label():
@@ -68,8 +70,73 @@ def test_unlabeled_claims_fall_back_to_sequential_labels():
     assert [element.label for element in claims[0].elements] == ["A", "B"]
 
 
-def test_a_likely_claim_typo_is_reported_without_silently_correcting_it():
-    claims = parse_claims("(A) 각 영사의 포즈를 추정하는 프로세서")
-    warnings = input_quality_warnings(claims)
-    assert any("각 영상의 포즈" in warning and "오탈자" in warning for warning in warnings)
-    assert "각 영사의 포즈" in claims[0].elements[0].text
+def test_unbalanced_parentheses_are_reported_without_touching_the_text():
+    """구성 분해를 어긋나게 할 수 있는 입력 이상만 알린다.
+
+    특정 오탈자 목록을 코드에 심지 않는다. 사건마다 달라 유지될 수 없고, 심사관이 이미
+    읽고 있는 원문을 도구가 대신 판단하는 일이 된다.
+    """
+    claims = parse_claims("(A) 포즈를 추정(하는 프로세서")
+    assert any("괄호" in warning for warning in input_quality_warnings(claims))
+    assert "추정(하는" in claims[0].elements[0].text
+
+
+# --- 구성분해 결과의 저장·재사용 ------------------------------------------------
+
+def test_a_stored_decomposition_is_reused_without_calling_the_cli(monkeypatch):
+    """같은 청구항을 다시 분해하면 판정 캐시가 통째로 무효가 된다.
+
+    분해 결과(limitations, search_terms)가 비교 캐시 키에 그대로 들어가므로, 같은 뜻의
+    문장이 한두 글자 다르게 나오는 것만으로 이전 판정이 전부 미스가 된다. 실제로 같은
+    청구항 1·같은 문헌·같은 지침으로 두 번 돌린 결과가 "…를 기반으로 이미지를 생성함"과
+    "…를 입력으로 받아서 이미지를 생성함"으로 갈렸고, 셀 판정을 처음부터 다시 받았다.
+    """
+    calls: list[str] = []
+
+    def fake(prompt, expect="claims"):
+        calls.append(expect)
+        return {"elements": [{"claim_number": 1, "label": "A", "importance": 5,
+                              "search_terms": ["큐", "queue"],
+                              "limitations": [{"text": "쓰기 요청을 큐에 저장함", "kind": "core"}]}]}
+
+    monkeypatch.setattr(claims_module, "run_cli", fake)
+    store: dict = {}
+    first = parse_claims("(A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러")
+    assert assign_importance(first, store) == []
+    assert calls == ["elements"]
+
+    second = parse_claims("(A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러")
+    assert assign_importance(second, store) == []
+    assert calls == ["elements"]                                  # 두 번째는 CLI를 부르지 않는다
+    assert [item.model_dump() for item in second[0].elements[0].limitations] == \
+           [item.model_dump() for item in first[0].elements[0].limitations]
+    assert second[0].elements[0].search_terms == first[0].elements[0].search_terms
+    assert second[0].elements[0].importance == 5
+
+
+def test_an_edited_claim_is_decomposed_again(monkeypatch):
+    """라벨만 보고 예전 분해를 씌우면 보고서에는 새 문언이, 판정에는 옛 한정이 실린다."""
+    calls: list[str] = []
+
+    def fake(prompt, expect="claims"):
+        calls.append(expect)
+        return {"elements": [{"claim_number": 1, "label": "A", "importance": 3,
+                              "limitations": [{"text": "저장함", "kind": "core"}]}]}
+
+    monkeypatch.setattr(claims_module, "run_cli", fake)
+    store: dict = {}
+    assign_importance(parse_claims("(A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러"), store)
+    assign_importance(parse_claims("(A) 읽기 요청을 스택에 저장하는 메모리 컨트롤러"), store)
+    assert calls == ["elements", "elements"]
+
+
+def test_a_failed_decomposition_is_not_stored(monkeypatch):
+    """분해를 못 받아 기본값으로 진행한 결과를 저장하면 그 빈 분해가 계속 재사용된다."""
+    def failing(prompt, expect="claims"):
+        raise RuntimeError("CLI 실행에 실패했습니다")
+
+    monkeypatch.setattr(claims_module, "run_cli", failing)
+    store: dict = {}
+    warnings = assign_importance(parse_claims("(A) 쓰기 요청을 큐에 저장하는 것"), store)
+    assert warnings and "기본값" in warnings[0]
+    assert store == {}

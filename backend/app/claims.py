@@ -1,13 +1,13 @@
 """청구항 분해. 라벨·번호·종속 관계는 전부 정규식으로 확정하고,
 구성요소 중요도만 LLM에 1회 물어봅니다.
 
-글자 수나 한국어 키워드로 "이건 주지관용 구성"을 추정하는 휴리스틱은 두지 않습니다.
+글자 수나 특정 어휘로 구성의 성격을 추정하는 휴리스틱은 두지 않습니다.
 그런 판정은 사건마다 달라져 코드로 고정하면 설명할 수 없는 결과가 나옵니다.
 """
 import re
 
 from .agy import run_cli
-from .models import Claim, ClaimElement
+from .models import Claim, ClaimElement, Limitation
 
 _CLAIM_HEADER = re.compile(
     r"(?:^|\n)\s*(?:(?:\d+)\s*[.)]\s*)?"
@@ -37,13 +37,49 @@ is_sub는 앞선 구성에 붙는 하위 제한(수치·조건·재질 한정)�
 
 limitations에는 해당 구성에서 독립적으로 입증해야 하는 구조·기능·조건·입력·처리·출력·결합관계를
 빠짐없이 원자적 문장으로 나누어 적으십시오. 단순한 문법 조각으로 쪼개지 말고, 각 항목만 읽어도
-무엇을 입증해야 하는지 알 수 있게 적으십시오. 특히 "~에 따라", "~을 이용하여", "~와 결합하여",
-"동적으로" 같은 조건은 생략하지 마십시오.
+무엇을 입증해야 하는지 알 수 있게 적으십시오.
+
+각 항목의 kind는 다음 둘 중 하나입니다. **이 구분이 이후 판정 등급을 가릅니다.**
+- core: 그 구성이 실제로 무엇을 하는가. 동작·구조·데이터 흐름 자체(무엇을 입력받아 무엇을
+  처리하고 무엇을 내보내는가, 어떤 구성요소와 어떻게 연결되는가).
+- qualifier: 그 동작을 한정하는 기준·조건·파라미터·수치·명칭(무엇을 기준으로, 얼마 이상일 때,
+  어떤 이름의 처리부가).
+
+**core 항목에 qualifier 문구를 섞어 쓰지 마십시오.** 예를 들어 "수요 지표가 임계값 미만이면
+콘텐츠를 외부 저장소로 이전한다"는 구성은 core "콘텐츠를 내부 저장소에서 외부 저장소로
+이전하여 보관함"과 qualifier "이전 여부를 수요 지표와 임계값의 비교로 결정함"으로 나눕니다.
+한 항목에 둘을 섞으면 조건 하나가 달라졌을 뿐인데 동작까지 미개시로 처리됩니다.
+"~에 따라", "~을 이용하여", "~와 결합하여", "동적으로" 같은 조건은 생략하지 말고 qualifier로
+적으십시오.
+
+**반대 방향의 잘못이 더 위험합니다.** 그 구성의 변별점 자체가 조건에 있다면 그것은
+qualifier가 아니라 core입니다. 분류한 뒤 core 항목만 이어 읽어 보십시오. 그 분야의 어떤
+장치·방법이든 만족하는 문장이 된다면 분류가 잘못된 것이며, 변별점을 담은 항목을 core로
+옮겨야 합니다. 예를 들어 "조회수·체류 시간·완주율 중 적어도 하나를 포함하는 지표를
+산출함"에서 지표의 종류를 qualifier로 빼면 core가 "지표를 산출함"만 남아, 아무 통계나
+기록하는 문헌이 전부 대응하게 됩니다. 이때는 지표의 종류까지 core입니다.
+
+**선택적 한정은 alternative_group으로 묶으십시오.** "A, B 또는 C 중 적어도 하나", "~중 어느
+하나", "또는"으로 열거된 항목은 서로 대안이므로 **하나만 개시되면 그 묶음 전체가 충족**됩니다.
+각 항목을 따로 적되 같은 묶음 이름(예: "지표종류", "토큰속성")을 부여하십시오. 묶지 않으면
+선택지를 넉넉히 나열한 청구항일수록 차이점이 길어져, 문언을 충족하는 문헌이 오히려 감점됩니다.
+반대로 "A와 B를 모두" 또는 "A하고 B하는"처럼 병렬로 요구되는 항목은 묶지 말고 빈 값으로
+두십시오. 확실하지 않으면 묶지 마십시오.
+
+search_terms에는 이 구성의 대응 기재를 문헌 본문에서 찾기 위한 검색어를 5~12개 적으십시오.
+청구항이 한국어라도 인용발명은 영어·일본어·중국어 공보일 수 있으므로, 그 기술 개념을 해당
+분야에서 실제로 쓰는 **영어 표현**을 반드시 함께 넣으십시오. 청구항에 쓰인 표현뿐 아니라
+같은 개념의 통용 표현(상위어·업계 관용어)도 넣어야 표현이 다른 문헌을 놓치지 않습니다.
 
 [출력]
 JSON 객체 하나만 출력하십시오.
 {"elements": [{"claim_number": 1, "label": "A", "importance": 5, "is_sub": false,
-  "limitations": ["입력 데이터를 공통 좌표계로 변환함", "변환된 데이터를 전역 장면과 결합함"]}]}
+  "limitations": [{"text": "입력 데이터를 공통 좌표계로 변환함", "kind": "core"},
+                  {"text": "변환된 데이터를 전역 장면과 결합함", "kind": "core"},
+                  {"text": "깊이 센서로 입력을 취득함", "kind": "core", "alternative_group": "입력수단"},
+                  {"text": "스테레오 카메라로 입력을 취득함", "kind": "core", "alternative_group": "입력수단"},
+                  {"text": "변환 대상을 프레임별 신뢰도로 선별함", "kind": "qualifier"}],
+  "search_terms": ["공통 좌표계", "common coordinate system", "world coordinate", "registration"]}]}
 
 [구성요소]
 """
@@ -174,8 +210,84 @@ def ancestry(claims: list[Claim], number: int) -> list[int]:
     return chain
 
 
-def assign_importance(claims: list[Claim]) -> list[str]:
-    """구성요소 중요도를 LLM에 1회만 물어봅니다. 실패해도 기본값 3으로 진행합니다."""
+# 저장된 분해 결과의 형식 버전. 필드 구성을 바꾸면 올려서 과거 기록을 무시합니다.
+DECOMPOSITION_VERSION = 1
+
+
+def assign_importance(claims: list[Claim], decomposition: dict | None = None) -> list[str]:
+    """구성요소 중요도·하위 한정·검색어를 받습니다. 실패해도 기본값 3으로 진행합니다.
+
+    decomposition은 이 분해 결과를 읽고 쓰는 저장소입니다. 이미 분해된 청구항은 그대로
+    되살리고 남은 것만 LLM에 물어봅니다.
+
+    저장하는 이유는 호출 한 번을 아끼는 데 있지 않습니다. 이 분해 결과(limitations,
+    search_terms)가 비교 캐시 키에 그대로 들어가는데(cache.cache_key), 같은 청구항을 다시
+    분해하면 같은 뜻의 문장이 한두 글자 다르게 나오고 그것만으로 이전 판정 캐시가 전부
+    무효가 됩니다. 그러면 취소 후 재시도가 처음부터 다시 돌고, "같은 입력이면 같은 결과"도
+    성립하지 않습니다. 분해를 고정해야 캐시가 실제로 동작합니다.
+    """
+    restored = {claim.number for claim in claims if _restore_elements(claim, decomposition)}
+    pending = [claim for claim in claims if claim.number not in restored]
+    warnings = _request_importance(pending) if pending else []
+    if decomposition is not None:
+        # 분해를 받지 못한 청구항(기본값으로 진행)은 저장하지 않습니다. 저장하면 그 빈
+        # 분해가 고정되어 다음 실행에서도 계속 재사용됩니다.
+        keep = claims if not warnings else [claim for claim in claims if claim.number in restored]
+        if keep:
+            decomposition.update(dump_decomposition(keep, decomposition))
+    return warnings
+
+
+def dump_decomposition(claims: list[Claim], existing: dict | None = None) -> dict:
+    """분해 결과를 저장 가능한 형태로 옮깁니다. 기존 기록은 유지하고 덮어씁니다."""
+    stored = dict((existing or {}).get("claims") or {})
+    for claim in claims:
+        stored[str(claim.number)] = [
+            {"label": element.label, "text": element.text, "importance": element.importance,
+             "is_sub": element.is_sub, "search_terms": list(element.search_terms),
+             "limitations": [limitation.model_dump() for limitation in element.limitations]}
+            for element in claim.elements
+        ]
+    return {"version": DECOMPOSITION_VERSION, "claims": stored}
+
+
+def _restore_elements(claim: Claim, decomposition: dict | None) -> bool:
+    """저장된 분해를 청구항에 되씌웁니다. 하나라도 어긋나면 아무것도 바꾸지 않습니다.
+
+    구성 원문까지 대조합니다. 청구항 문언이 바뀌었는데 라벨만 보고 예전 분해를 씌우면,
+    보고서에는 새 문언이 실리고 판정은 옛 한정을 기준으로 내려집니다.
+    """
+    if not decomposition or decomposition.get("version") != DECOMPOSITION_VERSION:
+        return False
+    stored = (decomposition.get("claims") or {}).get(str(claim.number))
+    if not isinstance(stored, list) or len(stored) != len(claim.elements) or not claim.elements:
+        return False
+    by_label = {str(item.get("label", "")).strip().upper(): item
+                for item in stored if isinstance(item, dict)}
+    payloads = []
+    for element in claim.elements:
+        item = by_label.get(element.label.upper())
+        if item is None or str(item.get("text", "")) != element.text:
+            return False
+        payloads.append(item)
+    try:
+        restored = [[Limitation.model_validate(value) for value in item.get("limitations") or []]
+                    for item in payloads]
+    except (TypeError, ValueError):
+        return False
+    for element, item, limitations in zip(claim.elements, payloads, restored):
+        try:
+            element.importance = max(1, min(5, int(item.get("importance", 3))))
+        except (TypeError, ValueError):
+            element.importance = 3
+        element.is_sub = bool(item.get("is_sub"))
+        element.search_terms = _unique_strings(item.get("search_terms"))[:16]
+        element.limitations = limitations[:12]
+    return True
+
+
+def _request_importance(claims: list[Claim]) -> list[str]:
+    """구성요소 중요도를 LLM에 1회만 물어봅니다."""
     payload = [
         {"claim_number": claim.number, "label": element.label, "text": element.text}
         for claim in claims for element in claim.elements
@@ -189,6 +301,7 @@ def assign_importance(claims: list[Claim]) -> list[str]:
         for claim in claims:
             for element in claim.elements:
                 element.limitations = []
+                element.search_terms = []
         return [f"구성요소 중요도를 받지 못해 전부 기본값(3)으로 진행했습니다: {exc}"]
     by_key = {}
     for item in raw.get("elements") or []:
@@ -202,11 +315,8 @@ def assign_importance(claims: list[Claim]) -> list[str]:
             except (TypeError, ValueError):
                 element.importance = 3
             element.is_sub = bool(item.get("is_sub"))
-            limitations = []
-            for value in item.get("limitations") or []:
-                limitation = re.sub(r"\s+", " ", str(value or "")).strip().rstrip(";,")
-                if limitation and limitation not in limitations:
-                    limitations.append(limitation)
+            element.search_terms = _unique_strings(item.get("search_terms"))[:16]
+            limitations = _build_limitations(item.get("limitations"))
             # 분해 응답이 누락되면 비워 둡니다. 검증을 건너뛰는 것이 아니라, 구성 원문 한 줄을
             # 점검하는 폴백을 compare에서 한 번만 적용하기 위해서입니다. 여기서 원문을 채워
             # 넣으면 그것이 실제 분해 결과와 구분되지 않아, 구성 원문이 '누락된 하위 한정'으로
@@ -215,16 +325,57 @@ def assign_importance(claims: list[Claim]) -> list[str]:
     return []
 
 
+def _build_limitations(values) -> list[Limitation]:
+    """분해 응답을 core/qualifier가 붙은 한정 목록으로 만듭니다.
+
+    kind가 없거나 알 수 없는 값이면 core로 둡니다. qualifier로 잘못 넣으면 실제 동작이
+    빠졌는데도 "조건만 다르다"로 완화되므로, 불확실할 때는 엄격한 쪽을 택합니다.
+    """
+    limitations: list[Limitation] = []
+    seen: set[str] = set()
+    for value in values or []:
+        raw = value if isinstance(value, dict) else {"text": value}
+        text = re.sub(r"\s+", " ", str(raw.get("text") or "")).strip().rstrip(";,")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        kind = str(raw.get("kind") or "").strip().lower()
+        limitations.append(Limitation(
+            text=text, kind="qualifier" if kind == "qualifier" else "core",
+            alternative_group=re.sub(r"\s+", " ", str(raw.get("alternative_group") or "")).strip()))
+    return _drop_lone_groups(limitations)
+
+
+def _drop_lone_groups(limitations: list[Limitation]) -> list[Limitation]:
+    """혼자뿐인 대안 묶음은 묶음 표시를 지웁니다.
+
+    항목이 하나면 그것은 대안이 아니라 단독 필수 한정입니다. 표시를 남겨 두면 그 한정이
+    미개시일 때도 "묶음이 충족되지 않았을 뿐"으로 읽혀 누락 판정이 흐려집니다.
+    """
+    counts: dict[str, int] = {}
+    for limitation in limitations:
+        if limitation.alternative_group:
+            counts[limitation.alternative_group] = counts.get(limitation.alternative_group, 0) + 1
+    for limitation in limitations:
+        if counts.get(limitation.alternative_group, 0) < 2:
+            limitation.alternative_group = ""
+    return limitations
+
+
+def _unique_strings(values) -> list[str]:
+    cleaned: list[str] = []
+    for value in values or []:
+        text = re.sub(r"\s+", " ", str(value or "")).strip().rstrip(";,")
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
 def input_quality_warnings(claims: list[Claim]) -> list[str]:
-    """판정을 바꾸지 않고, 법적 의미를 흔들 수 있는 명백한 입력 이상만 경고합니다."""
-    warnings: list[str] = []
-    for claim in claims:
-        for element in claim.elements:
-            if re.search(r"각\s*영사(?:의|가)\s*포즈", element.text):
-                warnings.append(
-                    f"청구항 {claim.number} ({element.label})의 '각 영사의 포즈'는 "
-                    "'각 영상의 포즈' 오탈자일 수 있습니다. 원문을 확인해 주세요."
-                )
-        if claim.raw.count("(") != claim.raw.count(")"):
-            warnings.append(f"청구항 {claim.number}의 괄호 짝이 맞지 않습니다. 구성 분해 결과를 확인해 주세요.")
-    return warnings
+    """판정을 바꾸지 않고, 구성 분해를 어긋나게 할 수 있는 입력 이상만 경고합니다.
+
+    특정 오탈자 목록을 코드에 심지 않습니다. 사건마다 달라 유지될 수 없고, 심사관이
+    이미 읽고 있는 원문을 대신 판단하는 일이 됩니다.
+    """
+    return [f"청구항 {claim.number}의 괄호 짝이 맞지 않습니다. 구성 분해 결과를 확인해 주세요."
+            for claim in claims if claim.raw.count("(") != claim.raw.count(")")]

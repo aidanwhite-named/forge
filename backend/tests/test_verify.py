@@ -118,3 +118,46 @@ def test_a_paraphrased_atomic_quote_is_recovered_from_its_cited_chunk():
     assert checked.limitation_checks[0].quote == CORPUS
     assert checked.directness == "inferred"
     assert notes == []
+
+
+def test_verification_does_not_resurrect_a_satisfied_alternative():
+    """검증 단계가 누락 목록을 다시 채울 때도 대안 묶음 규칙을 지켜야 한다.
+
+    비교 단계와 검증 단계가 각자 목록을 만들면 규칙이 갈라진다. 실제로 검증 단계가
+    미개시 대안을 그대로 다시 넣어, 비교 단계에서 걸러 낸 항목이 보고서의 차이점으로
+    되살아났다.
+    """
+    quote = "The one-way hash value contains a time-to-live value."
+    document = Document(id="1", filename="prior.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0612", page=24, paragraph="0612", text=quote)])
+    match = ElementMatch(
+        claim_number=4, label="A", document_id="1", judgment="동일", directness="direct",
+        quote=quote, chunk_id="D1-P-0612", limitation_checks=[
+            LimitationCheck(index=0, limitation="토큰이 시간 제한을 가짐", alternative_group="토큰속성",
+                            disclosed=True, quote=quote, chunk_id="D1-P-0612"),
+            LimitationCheck(index=1, limitation="토큰이 회수 기능을 가짐", alternative_group="토큰속성"),
+        ])
+
+    verify_matches([match], {"1": document})
+
+    assert match.missing_limitations == []
+    assert match.judgment == "동일"
+
+
+def test_verification_restores_a_limitation_whose_quote_fails():
+    """반대로 개시로 적힌 근거가 원문 대조에 실패하면 그 한정은 누락으로 되돌아간다."""
+    real = "The one-way hash value contains a time-to-live value."
+    document = Document(id="1", filename="prior.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0612", page=24, paragraph="0612", text=real)])
+    match = ElementMatch(
+        claim_number=4, label="A", document_id="1", judgment="동일", directness="direct",
+        quote=real, chunk_id="D1-P-0612", limitation_checks=[
+            LimitationCheck(index=0, limitation="토큰이 시간 제한을 가짐", alternative_group="토큰속성",
+                            disclosed=True, quote="The token is revoked on playback end.",
+                            chunk_id="D1-P-0612"),
+            LimitationCheck(index=1, limitation="토큰이 회수 기능을 가짐", alternative_group="토큰속성"),
+        ])
+
+    verify_matches([match], {"1": document})
+
+    assert match.missing_limitations == ["토큰이 시간 제한을 가짐", "토큰이 회수 기능을 가짐"]

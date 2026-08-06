@@ -417,20 +417,13 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 .quality { background: var(--surface-soft); }
 .reference-chip { color: #fff; background: var(--green); }
 .claim > p { margin: 18px 0 0; font-size: 14px; font-weight: 750; line-height: 1.72; }
-.narrative { margin-top: 12px; color: #4c5651; white-space: pre-line; font-size: 14px; line-height: 1.78; }
+.narrative { color: #4c5651; font-size: 14px; line-height: 1.78; }
 .diff { margin-top: 13px; padding: 12px 14px; border-radius: 10px; color: #7f4038; background: #fff4f1; font-size: 12px; line-height: 1.7; }
 .diff b { margin-right: 8px; }
-.roles { display: grid; gap: 5px; margin-top: 12px; color: #5f6863; font-size: 13px; line-height: 1.65; }
 
 details > summary { list-style: none; cursor: pointer; }
 details > summary::-webkit-details-marker { display: none; }
 .reasoning { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
-.reasoning h4 {
-  margin: 0;
-  color: var(--green-bright);
-  font-size: 12px;
-  font-weight: 800;
-}
 .validation > summary {
   width: fit-content;
   color: var(--green-bright);

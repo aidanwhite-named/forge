@@ -262,7 +262,7 @@ function App() {
   }
 
   async function cancelGeneration() {
-    if (!generating) return;
+    if (!generating && !actionBusy) return;
     cancelRequested.current = true;
     setStage('취소 중');
     uploadController.current?.abort();
@@ -277,6 +277,35 @@ function App() {
     setStage('취소됨');
     setMessage('보고서 생성을 취소했습니다. 실행 중인 분석 프로세스도 종료했습니다.');
     setGenerating(false);
+  }
+
+  async function cancelDependentClaims() {
+    if (!actionBusy || !activeJob.current) return;
+    const jobId = activeJob.current;
+    cancelRequested.current = true;
+    setStage('취소 중');
+    try {
+      await fetch(`${API}/jobs/${jobId}`, {method: 'DELETE'});
+    } catch {
+      // 서버가 취소를 받지 못했어도 폴링은 멈춥니다. 취소는 다시 누를 수 있습니다.
+    }
+    // 판정이 끝난 항은 서버가 저장해 두므로, 취소가 확정될 때까지 기다렸다 결과를 받습니다.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await sleep(650);
+      const statusResponse = await fetch(`${API}/jobs/${jobId}`);
+      if (!statusResponse.ok) break;
+      const job = await statusResponse.json();
+      setStage(job.stage || '취소 중');
+      if (job.status === 'running' || job.status === 'cancelling') continue;
+      const resultResponse = await fetch(`${API}/jobs/${jobId}/result`);
+      if (resultResponse.ok) setResult(await resultResponse.json());
+      break;
+    }
+    await refreshHistory();
+    setStage('취소됨');
+    setMessage('종속항 대비를 취소했습니다. 판정이 끝난 항은 보고서에 남아 있습니다.');
+    setActionBusy(false);
+    activeJob.current = null;
   }
 
   async function removeHistory(id: string) {
@@ -359,22 +388,55 @@ function App() {
 
   async function addDependentClaims() {
     if (!result || !dependentClaims.trim()) return;
+    const jobId = result.job_id;
     setActionBusy(true);
-    setMessage('종속항을 일괄 구성대비 중입니다…');
+    setMessage('');
+    setStage('종속항 구성대비 준비 중');
+    cancelRequested.current = false;
+    activeJob.current = jobId;
     try {
-      const response = await fetch(`${API}/jobs/${result.job_id}/dependent-claims`, {
+      const response = await fetch(`${API}/jobs/${jobId}/dependent-claims`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({claims: dependentClaims}),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail);
-      setResult(data.result);
       setDependentClaims('');
-      setMessage(`청구항 ${data.added_claims.join(', ')}을 보고서에 추가했습니다.`);
+
+      // 종속항 대비도 수 분이 걸립니다. 초기 분석과 같은 폴링으로 진행률을 보여 주고,
+      // 취소되더라도 그때까지 확정된 항은 서버가 저장해 두므로 결과를 그대로 불러옵니다.
+      while (!cancelRequested.current) {
+        await sleep(650);
+        const statusResponse = await fetch(`${API}/jobs/${jobId}`);
+        const job = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(job.detail || '작업 상태를 확인하지 못했습니다.');
+        setStage(job.stage || '구성대비 중');
+        if (job.status === 'failed') throw new Error(job.error || '종속항 분석에 실패했습니다.');
+        if (job.status !== 'completed' && job.status !== 'cancelled') continue;
+
+        const resultResponse = await fetch(`${API}/jobs/${jobId}/result`);
+        const nextResult = await resultResponse.json();
+        if (!resultResponse.ok) throw new Error(nextResult.detail || '결과를 불러오지 못했습니다.');
+        const added = (nextResult.reports || [])
+          .map((report: any) => report.claim_number)
+          .filter((number: number) => data.added_claims.includes(number));
+        setResult(nextResult);
+        await refreshHistory();
+        if (job.status === 'cancelled') {
+          setMessage(added.length
+            ? `취소했습니다. 판정이 끝난 청구항 ${added.join(', ')}은 보고서에 남겼습니다.`
+            : '취소했습니다. 판정이 끝난 종속항이 없어 보고서는 그대로입니다.');
+        } else {
+          setMessage(`청구항 ${added.join(', ')}을 보고서에 추가했습니다.`);
+        }
+        setStage(job.status === 'cancelled' ? '취소됨' : '완료');
+        return;
+      }
     } catch (error: any) {
-      setMessage(error.message || '종속항 분석에 실패했습니다.');
+      if (!cancelRequested.current) setMessage(error.message || '종속항 분석에 실패했습니다.');
     } finally {
+      activeJob.current = null;
       setActionBusy(false);
     }
   }
@@ -550,11 +612,12 @@ function App() {
                         <span className="claim-label">청구항 {report.claim_number}</span>
                         {report.depends_on && <span className="claim-dependency">{report.depends_on}항 종속</span>}
                       </p>
-                      <h2>{report.rejection_basis}</h2>
-                      {/* 판정을 받지 못한 청구항에 0%를 찍으면 "유사하지 않다"로 읽힌다. */}
+                      <h2>{report.track === 'analysis_incomplete'
+                        ? '구성대비 미완료'
+                        : chainText(report, result)}</h2>
                       <small>{report.track === 'analysis_incomplete'
-                        ? '구성대비 미완료 — 판정을 받지 못해 결론을 만들지 않았습니다'
-                        : `${chainText(report, result)} · 구성대비 ${report.chain.combined_similarity}%`}</small>
+                        ? '판정을 받지 못해 결론을 만들지 않았습니다'
+                        : report.summary_similarity}</small>
                     </div>
                   </div>
 
@@ -567,30 +630,23 @@ function App() {
                           <strong>{claim.similarity == null ? '—' : `${claim.similarity}%`}</strong>
                           <span className="quality">{claim.emoji} {claim.grade || claim.status}</span>
                           {claim.adopted_reference && <span className="reference-chip">인용발명 {claim.adopted_reference}</span>}
+                          {claim.combination && <span className="reference-chip">결합</span>}
                         </div>
                         <p>{claim.claim}</p>
-                        {claim.difference && <div className="diff"><b>차이</b> {claim.difference}</div>}
-                        {(claim.narrative || claim.reference_note || claim.residual_difference) && (
-                          <section className="reasoning" aria-label="판단 근거">
-                            <h4>판단 근거</h4>
-                            {claim.narrative && <div className="narrative">{claim.narrative}</div>}
-                            {(claim.reference_note || claim.residual_difference) && (
-                              <div className="roles">
-                                {claim.residual_difference && <small>남는 차이: {claim.residual_difference}</small>}
-                                {claim.reference_note && <small>참고: {claim.reference_note}</small>}
-                              </div>
-                            )}
+                        {claim.narrative && (
+                          <section className="reasoning" aria-label="구성대비">
+                            <div className="narrative">{claim.narrative}</div>
                           </section>
                         )}
+                        {claim.difference && <div className="diff"><b>차이점</b> {claim.difference}</div>}
                       </article>
                     ))}
                   </div>
 
                   <div className="summary">
-                    <h3>요약</h3>
-                    {report.summary_similarity && <p>{report.summary_similarity}</p>}
-                    {report.summary_difference && <p>{report.summary_difference}</p>}
-                    {report.summary && <p>{report.summary}</p>}
+                    <h3>종합 분석 요약</h3>
+                    {report.summary_similarity && <p><b>유사점</b> {report.summary_similarity}</p>}
+                    {report.summary_difference && <p><b>차이점</b> {report.summary_difference}</p>}
                   </div>
                 </section>
               ))}
@@ -603,7 +659,12 @@ function App() {
                   placeholder={'【청구항 2】\n제1항에 있어서, (A) 추가 한정…'}
                 />
                 <div className="action">
-                  <span className="hint">기존 문헌을 그대로 사용합니다.</span>
+                  <span className="hint">
+                    {actionBusy ? stage : '기존 문헌을 그대로 사용합니다.'}
+                  </span>
+                  {actionBusy && (
+                    <button type="button" className="cancel" onClick={cancelDependentClaims}>취소</button>
+                  )}
                   <button className="primary" disabled={busy || !dependentClaims.trim()} onClick={addDependentClaims}>
                     {actionBusy ? '비교 중' : '일괄 추가'}
                   </button>

@@ -14,7 +14,8 @@ from .agy import _build_command, available_models
 from .claims import ancestry, parse_claims
 from .models import AnalysisResult, DependentClaimsAdd, Document
 from .pdf import extract_pdf
-from .pipeline import analyze, extend_with_dependent_claims, summarize_matrix, to_markdown, uncovered_elements
+from .pipeline import analyze, extend_with_dependent_claims, summarize_matrix, uncovered_elements
+from .report import to_markdown
 
 app = FastAPI(title="Patent Evidence Analyzer")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5374"], allow_methods=["*"], allow_headers=["*"])
@@ -30,64 +31,6 @@ def write_log(job_id: str, message: str):
 
 @app.get("/api/health")
 def health(): return {"status": "ok", "llm": "agy-cli", "model": AGY_MODEL}
-
-@app.post("/api/jobs")
-async def create_job(claims: str = Form(...), pdf_files: list[UploadFile] = File(...), analysis_prompt: str = Form("")):
-    if not claims.strip(): raise HTTPException(400, "청구항을 입력하세요.")
-    if not 1 <= len(pdf_files) <= 7: raise HTTPException(400, "PDF는 1~7개만 업로드할 수 있습니다.")
-    job_id = str(uuid.uuid4()); work = Path(tempfile.mkdtemp(prefix=f"patent-{job_id}-"))
-    documents = []; total = 0
-    jobs[job_id] = {"job_id": job_id, "status": "running", "claims": claims, "documents": documents, "stage": "문서 추출 중"}
-    write_log(job_id, "analysis started")
-    try:
-        for index, upload in enumerate(pdf_files, 1):
-            filename = Path(upload.filename or f"document-{index}.pdf").name
-            if not filename.lower().endswith(".pdf"): raise HTTPException(400, "PDF 파일만 업로드할 수 있습니다.")
-            target = work / f"{index}.pdf"; content = await upload.read(); total += len(content)
-            if len(content) > MAX_PDF_SIZE_MB * 1024 * 1024: raise HTTPException(413, "개별 PDF 크기 제한을 초과했습니다.")
-            if total > MAX_TOTAL_UPLOAD_SIZE_MB * 1024 * 1024: raise HTTPException(413, "전체 업로드 크기 제한을 초과했습니다.")
-            target.write_bytes(content)
-            document = extract_pdf(target, str(index)); document.filename = filename
-            document.source_file = f"sources/{index}-{filename}"
-            documents.append(document)
-
-        def progress(stage: str):
-            jobs[job_id]["stage"] = stage
-            write_log(job_id, stage)
-
-        effective_prompt = analysis_prompt.strip() or load_runtime_settings().get("prompt") or ""
-        result = analyze(job_id, claims, documents, effective_prompt, progress)
-        jobs[job_id]["result"] = result.model_dump()
-        jobs[job_id]["claims_text"] = claims
-        history = HISTORY_DIR / job_id; history.mkdir(exist_ok=True)
-        source_dir = history / "sources"; source_dir.mkdir(exist_ok=True)
-        for index, document in enumerate(documents, 1):
-            shutil.copy2(work / f"{index}.pdf", history / document.source_file)
-        (history / "result.json").write_text(json.dumps(jobs[job_id]["result"], ensure_ascii=False), encoding="utf-8")
-        (history / "report.md").write_text(to_markdown(result), encoding="utf-8")
-        (history / "report.txt").write_text(to_markdown(result), encoding="utf-8")
-        # 판정 추적 데이터. 별도 감사 리포트는 만들지 않고 이 JSON으로만 남깁니다.
-        (history / "judgment.json").write_text(json.dumps(summarize_matrix(result), ensure_ascii=False), encoding="utf-8")
-        # 후속 종속항은 PDF 재업로드·재추출 없이 최초 인용발명을 그대로 사용합니다.
-        (history / "documents.json").write_text(
-            json.dumps([document.model_dump() for document in documents], ensure_ascii=False), encoding="utf-8")
-        (history / "meta.json").write_text(json.dumps({"job_id": job_id, "created_at": datetime.now(timezone.utc).isoformat(), "claims_summary": claims[:200], "claims": claims, "documents": [d.filename for d in documents],
-                                                   "analysis_prompt": effective_prompt}, ensure_ascii=False), encoding="utf-8")
-        jobs[job_id]["status"] = "completed"; jobs[job_id]["stage"] = "완료"
-        write_log(job_id, "analysis completed")
-        return {"job_id": job_id, "status": "completed"}
-    except HTTPException as exc:
-        jobs[job_id].update(status="failed", error=str(exc.detail))
-        write_log(job_id, f"analysis failed: {exc.status_code}: {exc.detail}")
-        raise
-    except Exception as exc:
-        jobs[job_id].update(status="failed", error=str(exc))
-        write_log(job_id, f"analysis failed: {type(exc).__name__}: {exc}")
-        # CLI 실패 원인이 500 본문에 묻히지 않도록 detail로 내려보낸다.
-        raise HTTPException(502, str(exc)) from exc
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
 
 @app.post("/api/jobs/prepare", status_code=201)
 def prepare_job():
@@ -192,9 +135,11 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
                 jobs[job_id]["stage"] = stage
             write_log(job_id, stage)
 
-        result = analyze(job_id, claims, documents, analysis_prompt, progress)
+        decomposition: dict = {}
+        result = analyze(job_id, claims, documents, analysis_prompt, progress, decomposition)
         agy.raise_if_cancelled(job_id)
-        _persist_initial_analysis(job_id, result, claims, documents, analysis_prompt, work)
+        _persist_initial_analysis(job_id, result, claims, documents, analysis_prompt, work,
+                                  decomposition)
         # A cancellation that lands during persistence must not leave a searchable report.
         if agy.is_cancelled(job_id):
             shutil.rmtree(HISTORY_DIR / job_id, ignore_errors=True)
@@ -222,10 +167,11 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
 
 def _persist_initial_analysis(job_id: str, result: AnalysisResult, claims: str,
                               documents: list[Document], analysis_prompt: str,
-                              work: Path) -> None:
+                              work: Path, decomposition: dict | None = None) -> None:
     dumped = result.model_dump()
     history = HISTORY_DIR / job_id
     history.mkdir(exist_ok=True)
+    _save_decomposition(job_id, decomposition)
     source_dir = history / "sources"
     source_dir.mkdir(exist_ok=True)
     for index, document in enumerate(documents, 1):
@@ -280,9 +226,9 @@ def get_result(job_id: str):
     return jobs[job_id]["result"]
 
 
-@app.post("/api/jobs/{job_id}/dependent-claims")
+@app.post("/api/jobs/{job_id}/dependent-claims", status_code=202)
 def add_dependent_claims(job_id: str, payload: DependentClaimsAdd):
-    """완료된 보고서에 복수 종속항을 한 번의 구성대비 호출로 추가합니다."""
+    """완료된 보고서에 복수 종속항을 추가합니다. 대비는 취소 가능한 워커에서 돕니다."""
     job_id = safe_job_id(job_id)
     loaded = _load_analysis_context(job_id)
     if loaded is None:
@@ -314,26 +260,105 @@ def add_dependent_claims(job_id: str, payload: DependentClaimsAdd):
         joined = ", ".join(str(number) for number in invalid)
         raise HTTPException(400, f"청구항 1에 종속되지 않은 항이 있습니다: {joined}")
 
+    record = jobs.setdefault(job_id, {"job_id": job_id,
+                                      "created_at": datetime.now(timezone.utc).isoformat()})
+    if record.get("status") in {"preparing", "running", "cancelling"}:
+        raise HTTPException(409, "이 작업은 아직 실행 중입니다.")
+
+    # 종속항 대비도 초기 분석과 같은 길이의 작업입니다. 요청 스레드에서 끝까지 돌리면
+    # 진행률도 보이지 않고 취소도 닿지 않으며, 중간에 멈추면 그때까지의 판정이 통째로
+    # 사라집니다. 초기 분석과 같은 워커 + 폴링 구조로 맞춥니다.
+    agy.register_job(job_id)
+    record.update(status="running", stage="종속항 구성대비 준비 중")
     write_log(job_id, f"dependent claims batch started: {incoming_numbers}")
+    worker = threading.Thread(
+        target=_run_dependent_claims,
+        args=(job_id, result, combined_text, documents, analysis_prompt, incoming_numbers),
+        name=f"forge-dep-{job_id[:8]}", daemon=True,
+    )
+    record["_worker"] = worker
+    worker.start()
+    return {"job_id": job_id, "status": "running", "added_claims": incoming_numbers}
+
+
+def _run_dependent_claims(job_id: str, result: AnalysisResult, combined_text: str,
+                          documents: list[Document], analysis_prompt: str,
+                          numbers: list[int]) -> None:
+    """종속항 대비를 취소 가능한 워커에서 돌리고, 확정된 항은 그때그때 저장합니다."""
+    agy.bind_job(job_id)
+    # 저장된 분해를 먼저 읽습니다. 같은 분해를 다시 쓰면 취소 후 재시도에서 이미 끝난
+    # 셀의 판정 캐시가 그대로 맞습니다(cache.cache_key가 분해 결과를 키에 포함합니다).
+    decomposition = _load_decomposition(job_id)
     try:
         def progress(stage: str):
+            agy.raise_if_cancelled(job_id)
             if job_id in jobs:
                 jobs[job_id]["stage"] = stage
             write_log(job_id, stage)
 
-        result = extend_with_dependent_claims(result, combined_text, set(incoming_numbers),
-                                               documents, analysis_prompt, progress)
-        _persist_analysis(job_id, result, combined_text, documents, analysis_prompt)
+        def checkpoint(partial: AnalysisResult):
+            claims_text = _claims_text_for(combined_text, partial.reports)
+            _persist_analysis(job_id, partial, claims_text, documents, analysis_prompt)
+            if job_id in jobs:
+                jobs[job_id].update(result=partial.model_dump(), claims_text=claims_text,
+                                    documents=documents)
+            added = sorted({report.claim_number for report in partial.reports} & set(numbers))
+            write_log(job_id, f"dependent claims saved: {added}")
+
+        extend_with_dependent_claims(result, combined_text, set(numbers), documents,
+                                     analysis_prompt, progress, decomposition, checkpoint)
         if job_id in jobs:
-            jobs[job_id].update(result=result.model_dump(), claims_text=combined_text,
-                                documents=documents, status="completed", stage="완료")
-        write_log(job_id, f"dependent claims batch completed: {incoming_numbers}")
-        return {"job_id": job_id, "added_claims": incoming_numbers, "result": result.model_dump()}
-    except HTTPException:
-        raise
+            jobs[job_id].update(status="completed", stage="완료")
+        write_log(job_id, f"dependent claims batch completed: {numbers}")
+    except agy.AnalysisCancelled:
+        # checkpoint가 이미 확정된 항까지 저장했습니다. 여기서 히스토리를 지우면
+        # 그 판정이 사라져 다시 눌렀을 때 같은 항을 또 대비하게 됩니다.
+        if job_id in jobs:
+            jobs[job_id].update(status="cancelled", stage="취소됨")
+        write_log(job_id, "dependent claims cancelled; completed claims kept")
     except Exception as exc:
+        if job_id in jobs:
+            jobs[job_id].update(status="failed", stage="실패", error=str(exc))
         write_log(job_id, f"dependent claims batch failed: {type(exc).__name__}: {exc}")
-        raise HTTPException(502, str(exc)) from exc
+    finally:
+        # 분해는 판정보다 먼저 끝나므로, 취소·실패로 끝나도 남겨 둡니다. 다음 실행이 같은
+        # 분해를 재사용해야 이미 받아 둔 셀 판정이 캐시에서 그대로 살아납니다.
+        _save_decomposition(job_id, decomposition)
+        agy.finish_job(job_id)
+
+
+def _claims_text_for(combined_text: str, reports: list) -> str:
+    """보고서에 실제로 올라간 항만 남긴 청구항 원문.
+
+    취소로 일부만 추가된 경우에도 전체 입력을 메타데이터에 적으면, 남은 항을 다시
+    추가하려 할 때 "이미 존재하는 청구항 번호"로 거부됩니다.
+    """
+    numbers = {report.claim_number for report in reports}
+    kept = [claim for claim in parse_claims(combined_text) if claim.number in numbers]
+    return "\n".join(f"【청구항 {claim.number}】\n{claim.raw.strip()}" for claim in kept)
+
+
+def _load_decomposition(job_id: str) -> dict:
+    path = HISTORY_DIR / job_id / "claim_elements.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _save_decomposition(job_id: str, decomposition: dict | None) -> None:
+    if not decomposition:
+        return
+    history = HISTORY_DIR / job_id
+    history.mkdir(parents=True, exist_ok=True)
+    try:
+        (history / "claim_elements.json").write_text(
+            json.dumps(decomposition, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # 저장 실패로 분석을 멈추지 않습니다. 다음 실행에서 다시 분해합니다.
 
 @app.post("/api/jobs/{job_id}/prior-art")
 def search_prior_art(job_id: str, payload: dict | None = None):

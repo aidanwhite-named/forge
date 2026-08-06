@@ -7,7 +7,7 @@
 import re
 from functools import lru_cache
 
-from .models import Document, ElementMatch
+from .models import Document, ElementMatch, missing_limitations
 from .pdf import chunk_text, document_corpus
 
 MIN_QUOTE_LEN = 15
@@ -85,9 +85,6 @@ def verify_matches(matches: list[ElementMatch], documents: dict[str, Document]) 
         failed_limitations: list[str] = []
         for check in match.limitation_checks:
             if not check.disclosed:
-                if (check.limitation and not check.whole_element
-                        and check.limitation not in match.missing_limitations):
-                    match.missing_limitations.append(check.limitation)
                 continue
             check.verify = _status(check.quote, corpus)
             cited_check = chunk_text(document, check.chunk_id) if check.chunk_id else ""
@@ -106,9 +103,10 @@ def verify_matches(matches: list[ElementMatch], documents: dict[str, Document]) 
                     continue
                 check.disclosed = False
                 failed_limitations.append(check.limitation)
-                if (check.limitation and not check.whole_element
-                        and check.limitation not in match.missing_limitations):
-                    match.missing_limitations.append(check.limitation)
+        # 검증이 check.disclosed를 뒤집으므로 누락 목록은 여기서 다시 계산합니다. 점검 결과가
+        # 없는 셀은 모델이 적어 준 목록뿐이라 그대로 둡니다.
+        if match.limitation_checks:
+            match.missing_limitations = missing_limitations(match.limitation_checks)
         if failed_limitations:
             _cap(match, notes, f"하위 제한 근거 미검증 {len(failed_limitations)}건", document.filename)
 

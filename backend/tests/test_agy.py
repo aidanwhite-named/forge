@@ -59,16 +59,17 @@ def test_command_line_too_long_is_not_reported_as_missing_cli():
     assert "찾을 수 없습니다" in str(agy._launch_error(FileNotFoundError(2, "nope"), SETTINGS))
 
 
-def test_cancel_job_kills_only_its_registered_process(monkeypatch):
-    class Process:
-        def poll(self):
-            return None
+class _Process:
+    def poll(self):
+        return None
 
-    process = Process()
+
+def test_cancel_job_kills_only_its_registered_process(monkeypatch):
+    process = _Process()
     killed = []
     agy.register_job("job-a")
     agy.register_job("job-b")
-    agy._active_processes["job-a"] = process
+    agy._active_processes["job-a"] = {process}
     monkeypatch.setattr(agy, "_kill_process_tree", lambda target: killed.append(target))
 
     assert agy.cancel_job("job-a") is True
@@ -78,6 +79,24 @@ def test_cancel_job_kills_only_its_registered_process(monkeypatch):
 
     agy.finish_job("job-a")
     agy.finish_job("job-b")
+
+
+def test_cancel_job_kills_every_process_the_job_started(monkeypatch):
+    """구성대비 셀은 동시에 여러 개 돌아간다. 하나만 죽이면 나머지가 계속 돈다.
+
+    사용자는 취소 버튼을 눌러 멈춘 줄 알지만, 살아남은 CLI가 끝까지 돌면서 요금과
+    시간을 계속 쓴다. 작업이 띄운 프로세스는 전부 함께 정리해야 한다.
+    """
+    processes = {_Process() for _ in range(3)}
+    killed = []
+    agy.register_job("job-parallel")
+    agy._active_processes["job-parallel"] = set(processes)
+    monkeypatch.setattr(agy, "_kill_process_tree", lambda target: killed.append(target))
+
+    assert agy.cancel_job("job-parallel") is True
+    assert set(killed) == processes
+
+    agy.finish_job("job-parallel")
 
 
 # --- 비신뢰 입력을 다루는 CLI의 실행 조건 --------------------------------------

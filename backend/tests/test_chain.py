@@ -1,5 +1,5 @@
 """인용발명 선정 알고리즘. 비교 매트릭스가 같으면 항상 같은 조합이 나와야 한다."""
-from app.chain import build_chain, matrix_for, rejection_basis
+from app.chain import build_chain, matrix_for
 from app.coverage import score_document
 from app.models import Claim, ClaimElement, ElementMatch
 
@@ -37,10 +37,6 @@ def test_single_document_full_disclosure_stops_before_any_combination():
     chain = build(claim(), matches)
     assert chain.track == "novelty_single"
     assert chain.primary == "1" and chain.secondaries == []
-    basis = rejection_basis(chain, claim())
-    assert "제29조제1항제2호" in basis
-    # 조문만 적고 적격성 미확인을 빼면 기술적 구성대비가 법적 결론으로 읽힌다.
-    assert "검토 후보" in basis and "선행기술 적격성" in basis
 
 
 def test_a_missing_limitation_blocks_the_novelty_gate():
@@ -66,7 +62,7 @@ def test_secondary_is_chosen_by_increment_not_absolute_strength():
     assert chain.primary == "1"
     assert chain.secondaries == ["3"]          # 2가 아니라 공백 C를 메우는 3
     assert chain.uncovered == []
-    assert "제29조제2항" in rejection_basis(chain, claim())
+    assert chain.track == "inventive_step_combination"
 
 
 def test_core_gap_that_no_document_fills_makes_the_rejection_impossible():
@@ -77,7 +73,6 @@ def test_core_gap_that_no_document_fills_makes_the_rejection_impossible():
     assert chain.track == "rejection_impossible"
     assert chain.uncovered == ["B"]
     assert chain.secondaries == []
-    assert "곤란" in rejection_basis(chain, claim())
 
 
 def test_a_weak_but_real_correspondence_is_a_difference_not_a_gap():
@@ -95,25 +90,17 @@ def test_a_weak_but_real_correspondence_is_a_difference_not_a_gap():
     assert chain.track == "inventive_step_combination"
 
 
-def test_low_importance_gap_goes_to_the_conventional_bucket():
-    """저중요도 구성도 주지관용 근거가 없으면 미개시 상태로 남는다."""
+def test_a_low_importance_gap_is_still_reported_as_a_gap():
+    """중요도가 낮다는 이유만으로 미개시 구성을 결론에서 빼내지 않는다.
+
+    종전에는 중요도 2 이하를 '주지관용 검토'로 분리했다. 분리 기준이 중요도 하나뿐이라
+    실제로 인정된 것은 아무것도 없는데, 보고서에는 별도 절이 생겨 미개시 사실이 흐려졌다.
+    """
     target = claim(importances=(5, 5, 2))
     matches = [cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음")]
     chain = build(target, matches, all_claims=[target])
     assert chain.track == "rejection_impossible"
-    assert chain.conventional == ["C"] and chain.uncovered == ["C"]
-    assert "대응 기재" in rejection_basis(chain, target)
-
-
-def test_the_conventional_bucket_admits_that_it_proved_nothing():
-    """중요도만 보고 분리한 것이므로 근거를 확인했다고 쓰면 안 된다."""
-    target = claim(importances=(5, 5, 2))
-    matches = [cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음")]
-    chain = build(target, matches, all_claims=[target])
-    note = next(item for item in chain.conventional_notes if item.label == "C")
-    assert note.partial_support is False and note.importance == 2
-    assert "근거" in note.note
-    assert "대응 기재" in rejection_basis(chain, target)
+    assert chain.uncovered == ["C"]
 
 
 def test_dependent_claim_does_not_pass_novelty_on_its_added_limitation_alone():
@@ -221,7 +208,7 @@ def test_a_document_with_fewer_missing_limitations_wins_at_the_same_judgment():
     assert chain.primary == "1"
     assert coverage_of(chain, "B").adopted_document == "2"
     assert coverage_of(chain, "B").primary_missing == ["온도 범위", "주기 조건"]
-    assert "2" in chain.secondaries or coverage_of(chain, "B").reference_document == "2"
+    assert "2" in chain.secondaries
 
 
 def test_a_weaker_judgment_is_never_adopted_as_a_supplement():
@@ -231,7 +218,6 @@ def test_a_weaker_judgment_is_never_adopted_as_a_supplement():
     chain = build(claim(), matches)
     assert chain.secondaries == []
     assert coverage_of(chain, "B").adopted_document == "1"
-    assert coverage_of(chain, "B").reference_document is None
 
 
 def test_an_unverified_supplement_is_rejected_but_its_reason_is_recorded():
@@ -272,8 +258,13 @@ def test_an_unsupported_difference_does_not_displace_the_current_gap():
     assert best_match([current, unsupported]).document_id == "1"
 
 
-def test_two_documents_each_filling_a_different_gap_are_both_analyzed():
-    """사례 5. 결합 한도로 한 문헌이 빠져도 대응 정보와 탈락 사유는 보존한다."""
+def test_documents_filling_different_gaps_are_all_combined():
+    """사례 5. 서로 다른 공백의 유일한 근거를 가진 문헌은 개수와 무관하게 모두 결합한다.
+
+    결합 문헌 수를 2건으로 묶어 두면, 세 번째 문헌이 어떤 구성의 **유일한** 검증 근거를
+    가지고 있어도 통째로 버려지고 그 구성이 "어느 인용발명에도 대응이 없다"로 보고된다.
+    업로드된 문헌에 기재가 있는데 그렇게 적는 것은 사실과 다르다.
+    """
     target = claim(importances=(5, 5, 4, 4))
     matches = (
         [cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음"), cell("1", "D", "대응 없음")]
@@ -281,33 +272,16 @@ def test_two_documents_each_filling_a_different_gap_are_both_analyzed():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1"
-    assert len(chain.secondaries) == 1                     # 결합 한도는 최종 조합에만 적용된다
-    dropped = chain.secondaries[0] == "2" and "3" or "2"
-    assert coverage_of(chain, "D" if dropped == "3" else "C").reference_document == dropped
-    assert [item.document_id for item in chain.dropped_supplements] == [dropped]
-    assert chain.dropped_supplements[0].labels == ["D" if dropped == "3" else "C"]
-    assert "결합 문헌 수 제한" in chain.dropped_supplements[0].reason
-    # 모든 문헌의 구성별 대응은 문헌 수 제한과 무관하게 전부 분석된다.
+    assert chain.primary == "1" and sorted(chain.secondaries) == ["2", "3"]
+    assert chain.uncovered == []
+    assert coverage_of(chain, "C").adopted_document == "2"
+    assert coverage_of(chain, "D").adopted_document == "3"
+    # 모든 문헌의 구성별 대응은 채택 여부와 무관하게 전부 분석된다.
     assert {candidate.document_id for candidate in coverage_of(chain, "D").candidates} == {"1", "2", "3"}
 
 
-def test_a_third_document_is_allowed_for_non_core_gaps_with_verified_support():
-    """예외적 3문헌 결합. 잔여 공백이 차별적 핵심(4~5)이 아니고 검증된 직접 근거가 있을 때만."""
-    target = claim(importances=(5, 5, 3, 3))
-    matches = (
-        [cell("1", "A", "동일"), cell("1", "B", "동일")] + [cell("1", label, "대응 없음") for label in "CD"]
-        + [cell("2", label, "대응 없음") for label in "ABD"] + [cell("2", "C", "동일")]
-        + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
-    )
-    chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and chain.secondaries == ["2", "3"]
-    assert chain.uncovered == [] and chain.dropped_supplements == []
-    assert "인용발명 3건 결합" in rejection_basis(chain, target)
-
-
-def test_a_third_document_is_still_blocked_for_a_core_gap():
-    """세 번째 문헌이 메워야 할 잔여 공백이 차별적 핵심(4 이상)이면 결합하지 않는다."""
+def test_a_core_gap_is_filled_by_a_third_document_too():
+    """차별적 핵심 구성이라고 해서 세 번째 문헌의 직접 근거를 버리지 않는다."""
     target = claim(importances=(5, 3, 3, 4))                    # D가 핵심, 마지막에 남도록 구성
     matches = (
         [cell("1", "A", "동일")] + [cell("1", label, "대응 없음") for label in "BCD"]
@@ -316,17 +290,24 @@ def test_a_third_document_is_still_blocked_for_a_core_gap():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and chain.secondaries == ["2"]  # B·C를 한 번에 메우는 2가 먼저
-    assert chain.uncovered == ["D"]                             # 핵심 D는 3문헌 예외로 못 메운다
-    assert coverage_of(chain, "D").reference_document == "3"    # 정보와 사유는 남는다
-    assert chain.dropped_supplements[0].document_id == "3"
+    assert chain.primary == "1" and chain.secondaries == ["2", "3"]  # B·C를 한 번에 메우는 2가 먼저
+    assert chain.uncovered == []
+
+
+def test_combination_stops_when_a_document_adds_nothing():
+    """이득이 없으면 문헌 수 상한이 없어도 결합이 멈춘다. 상한 대신 이득이 제동을 건다."""
+    matches = ([cell("1", label, "동일") for label in "ABC"]
+               + [cell("2", label, "일부 유사") for label in "ABC"]
+               + [cell("3", label, "차이") for label in "ABC"])
+    chain = build(claim(), matches)
+    assert chain.secondaries == []
 
 
 def test_supplement_analysis_runs_even_when_nothing_is_uncovered():
     """공백이 없어도 보완 검토를 끝내지 않는다. 이전 구현은 여기서 조기 종료했다."""
     matches = [cell("1", label, "일부 차이") for label in "ABC"]
     chain = build(claim(), matches)
-    assert chain.uncovered == [] and chain.conventional == []
+    assert chain.uncovered == []
     assert chain.supplement_needed == ["A", "B", "C"]
     assert chain.residual == ["A", "B", "C"]
     assert "전 구성이 커버" not in chain.rationale
@@ -375,7 +356,6 @@ def test_unjudged_cell_never_becomes_a_no_correspondence_conclusion():
     assert chain.uncovered == []          # 대응 기재가 없다고 단정하지 않는다
     assert chain.primary is None
     assert chain.incomplete_reasons
-    assert "판정 불가" in rejection_basis(chain, claim())
 
 
 def test_partial_verification_never_satisfies_the_novelty_gate():
@@ -422,7 +402,6 @@ def test_single_document_covering_the_dependent_addition_stays_on_novelty():
                   all_claims=[parent_claim, child_claim])
     assert child.track == "novelty_single"
     assert child.primary == "1" and child.secondaries == []
-    assert "제29조제1항제2호" in rejection_basis(child, child_claim)
 
 
 def test_dependent_addition_absent_from_the_parent_document_moves_to_combination():

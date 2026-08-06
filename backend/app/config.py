@@ -43,6 +43,10 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "agy").lower()
 AGY_MODEL = os.getenv("AGY_MODEL", "gemini-3.6-flash-medium")
 AGY_TIMEOUT_SECONDS = int(os.getenv("AGY_TIMEOUT_SECONDS", "300"))  # agy --print-timeout 기본값 5분에 맞춘다
 AGY_MAX_RETRIES = int(os.getenv("AGY_MAX_RETRIES", "2"))
+# 셀 단위 구성대비를 동시에 몇 개까지 돌릴지. 셀은 서로 독립이고 대기 시간이 거의 전부라
+# 병렬로 돌리면 그만큼 줄어듭니다. 다만 하나가 CLI 프로세스 하나라서 무한정 올리면
+# 메모리와 provider 쪽 동시 요청 한도에 걸립니다.
+COMPARE_MAX_WORKERS = max(1, int(os.getenv("FORGE_COMPARE_WORKERS", "4")))
 MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "25"))
 MAX_TOTAL_UPLOAD_SIZE_MB = int(os.getenv("MAX_TOTAL_UPLOAD_SIZE_MB", "100"))
 TEMP_FILE_TTL_MINUTES = int(os.getenv("TEMP_FILE_TTL_MINUTES", "60"))

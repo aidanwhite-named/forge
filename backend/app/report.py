@@ -2,22 +2,22 @@
 
 LLM이 쓴 마크다운을 정규식으로 되돌려 고치는 코드가 필요 없어지는 대신,
 표현은 템플릿이 허용하는 범위로 제한됩니다. 판정 근거의 재현성을 우선한 선택입니다.
+
+구성 하나는 "유사도 한 줄 + 구성대비 한 문장 + (있으면) 차이점 한 줄"로 나갑니다.
+같은 내용을 서술·역할·잔여차이로 나눠 세 번 반복하던 종전 구조는 읽는 사람이 매번
+같은 문장을 다시 읽게 만들 뿐, 새로 알려 주는 것이 없어 걷어냈습니다.
 """
 import re
 
-from .chain import chain_documents, rejection_basis
-from .coverage import REPORT_GRADE, REPORT_PERCENT, best_match, item_similarity
+from .chain import chain_documents
+from .coverage import best_match, report_grade, report_similarity
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
                      DocumentMapping, ElementCoverage, ElementMatch, Evidence)
 
-_CONCLUSION = {
-    "동일": "동일합니다",
-    "실질적 동일": "실질적으로 동일합니다",
-    "일부 차이": "대체로 대응되나 세부 구현에 차이가 있습니다",
-    "일부 유사": "핵심 기능은 유사하나 목적·효과에 차이가 있습니다",
-    "차이": "대응된다고 보기 어렵습니다",
-    "대응 없음": "대응되는 기재가 확인되지 않습니다",
-}
+# 발췌 길이 상한. 요구 형식이 "최대 3줄, 가능하면 1줄"이므로 한 줄 분량으로 자릅니다.
+EXCERPT_LIMIT = 150
+ORIGINAL_LIMIT = 150
+_STATUS = {"동일": "개시됨", "실질적 동일": "개시됨", "일부 차이": "부분 개시", "일부 유사": "부분 개시"}
 _QUALITY = {"verified": "HIGH", "partial": "MEDIUM", "not_found": "UNVERIFIED",
             "short": "LOW", "empty": "UNVERIFIED"}
 
@@ -76,10 +76,9 @@ def _role(document_id: str, chains: list[ChainInfo]) -> str:
 def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[str, ElementMatch]],
                        documents: dict[str, Document], mappings: list[DocumentMapping]) -> ClaimReport:
     selected = chain_documents(chain)
-    merged: dict[str, ElementMatch] = {}
-    for element in claim.elements:
-        merged[element.label] = best_match([matrix.get(document_id, {}).get(element.label)
-                                            for document_id in selected])
+    merged = {element.label: best_match([matrix.get(document_id, {}).get(element.label)
+                                         for document_id in selected])
+              for element in claim.elements}
     coverages = {coverage.label: coverage for coverage in chain.element_coverage}
     results = [_element_result(claim, element.label, merged.get(element.label), chain, matrix,
                                documents, mappings, coverages.get(element.label))
@@ -89,12 +88,10 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         depends_on=claim.depends_on,
         preamble=claim.preamble,
         track=chain.track,
-        rejection_basis=rejection_basis(chain, claim),
         chain=chain,
         claims=results,
-        summary=_summary(claim, chain, results, merged, mappings),
-        summary_similarity=_summary_similarity(results),
-        summary_difference=_summary_difference(claim, chain, results),
+        summary_similarity=_summary_similarity(results, mappings),
+        summary_difference=_summary_difference(chain, results),
     )
 
 
@@ -104,247 +101,162 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
                     coverage: ElementCoverage | None = None) -> ClaimResult:
     element = next((item for item in claim.elements if item.label == label), None)
     text = element.text if element else label
+    is_preamble = bool(element and element.is_preamble)
     if chain.track == "analysis_incomplete":
         # 판정을 받지 못한 구성에 "확인되지 않았습니다"라고 쓰면 근거 없는 사실 주장이 됩니다.
         # 대표값·등급도 붙이지 않고 미판정임을 그대로 노출합니다.
-        errors = [cell.error for document_id in sorted(matrix)
-                  if (cell := matrix[document_id].get(label)) is not None and cell.error]
         return ClaimResult(
-            label=label, is_preamble=bool(element and element.is_preamble),
-            claim=text, similarity=None, grade="판정 불가", emoji="⚠️",
+            label=label, is_preamble=is_preamble, claim=text, grade="판정 불가", emoji="⚠️",
             status="판정 불가",
-            narrative=f'청구항의 "{_clip(text)}" 구성은 구성대비 판정을 받지 못했습니다. '
-                      "대응 기재의 유무가 확인되지 않은 상태입니다."
-                      + (f" (사유: {_clip(errors[0], 160)})" if errors else ""),
-            note="; ".join(dict.fromkeys(errors))[:400],
+            narrative=f'({label}) 구성은 구성대비 판정을 받지 못했습니다 — 재실행 필요',
         )
-    judgment = match.judgment if match else "대응 없음"
-    grade, emoji = REPORT_GRADE[judgment]
-    percent = REPORT_PERCENT[judgment]
-    supporting = [document_id for document_id in chain_documents(chain)
-                  if item_similarity(matrix.get(document_id, {}).get(label)) >= item_similarity(match) > 0]
+
+    primary = matrix.get(chain.primary or "", {}).get(label)
+    similarity = report_similarity(match)
+    grade, emoji = report_grade(match)
     evidence = _collect_evidence(label, chain, matrix, documents, mappings)
+    combined = bool(similarity is not None and match and chain.primary
+                    and match.document_id != chain.primary and _usable(primary))
     return ClaimResult(
         label=label,
-        is_preamble=bool(element and element.is_preamble),
+        is_preamble=is_preamble,
         claim=text,                      # 구성 원문은 입력을 그대로 씁니다. 모델이 고쳐 쓴 문장을 쓰지 않습니다.
-        similarity=percent,
+        similarity=similarity,
         grade=grade,
         emoji=emoji,
-        narrative=_narrative(text, match, chain, matrix, mappings, documents),
-        difference=_difference(match),
-        combination=len(supporting) > 1 or (match is not None and match.document_id != chain.primary),
-        references=[document_id for document_id in {evidence_item.document_id for evidence_item in evidence}],
+        narrative=_narrative(label, text, match, primary, combined, mappings, documents,
+                             _closest_related(label, matrix, mappings, documents)),
+        difference=_difference(match, primary, combined, mappings, documents),
+        combination=combined,
         evidence=evidence,
-        status={"동일": "개시됨", "실질적 동일": "개시됨", "일부 차이": "부분 개시",
-                "일부 유사": "부분 개시"}.get(judgment, "미개시"),
-        note=(match.verify_note if match else "") or _downgrade_note(match),
-        # 이 구성의 근거가 실제로 어느 문헌에서 왔는지. 전부 인용발명 1로 보이지 않게 하는 기준값입니다.
-        adopted_document=match.document_id if match else "",
-        adopted_reference=_reference_number(match.document_id, mappings) if match else None,
-        primary_disclosure=_disclosure_line(chain.primary, label, matrix, mappings, documents),
-        supplement_disclosure=_supplement_line(label, match, chain, matrix, mappings, documents),
-        residual_difference=_residual_line(coverage),
-        reference_note=_reference_only_line(coverage, mappings, matrix, documents, chain),
+        status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
+        adopted_document=match.document_id if similarity is not None and match else "",
+        adopted_reference=(_reference_number(match.document_id, mappings)
+                           if similarity is not None and match else None),
     )
 
 
-def _disclosure_line(document_id: str | None, label: str, matrix: dict[str, dict[str, ElementMatch]],
-                     mappings: list[DocumentMapping], documents: dict[str, Document]) -> str:
-    """문헌 1건이 이 구성의 무엇을 개시했는지 한 줄로. 판정과 누락 한정을 함께 적습니다."""
-    match = matrix.get(document_id or "", {}).get(label)
-    if match is None:
-        return f"{_reference_name(document_id, mappings)}: 대응 기재가 확인되지 않았습니다." if document_id else ""
-    related = next((span for span in match.evidence
-                    if span.verify == "verified" and span.quote), None)
-    if match.judgment == "대응 없음" and related is None:
-        return f"{_reference_name(document_id, mappings)}: 대응 기재가 확인되지 않았습니다."
-    shown = match.quote_translation or match.quote
-    quoted = f' "{_clip(shown, 120)}" ({_location(match, documents)})' if shown else ""
-    if not shown:
-        if related:
-            related_shown = related.quote_translation or related.quote
-            related_location = _chunk_location(match.document_id, related.chunk_id, documents)
-            quoted = f' / 관련 기재 "{_clip(related_shown, 120)}" ({related_location})'
-    line = f"{_reference_name(document_id, mappings)}: {match.judgment}{quoted}"
-    if match.missing_limitations:
-        line += f" / 누락 한정: {'; '.join(match.missing_limitations[:3])}"
-    return line
+# --- 구성대비 서술 -------------------------------------------------------------
 
+def _narrative(label: str, text: str, match: ElementMatch | None, primary: ElementMatch | None,
+               combined: bool, mappings: list[DocumentMapping],
+               documents: dict[str, Document], related: str = "") -> str:
+    """구성 1개의 구성대비를 한 문장으로 조립합니다.
 
-def _supplement_line(label: str, match: ElementMatch | None, chain: ChainInfo,
-                     matrix: dict[str, dict[str, ElementMatch]], mappings: list[DocumentMapping],
-                     documents: dict[str, Document]) -> str:
-    """보완 인용발명이 개시한 부분. 주 인용발명이 그대로 채택된 구성에서는 비어 있습니다."""
-    if match is None or not chain.primary or match.document_id == chain.primary:
-        return ""
-    return _disclosure_line(match.document_id, label, matrix, mappings, documents)
-
-
-def _residual_line(coverage: ElementCoverage | None) -> str:
-    if coverage is None or not coverage.residual_difference:
-        return ""
-    return "; ".join(coverage.residual_difference[:3])
-
-
-def _reference_only_line(coverage: ElementCoverage | None, mappings: list[DocumentMapping],
-                         matrix: dict[str, dict[str, ElementMatch]],
-                         documents: dict[str, Document], chain: ChainInfo | None = None) -> str:
-    """미채택 문헌 참고. 결합 문헌으로 표기하지 않고 '참고'로만 남깁니다.
-
-    탈락 사유는 chain이 확정한 실제 사유를 그대로 옮깁니다. 여기서 "문헌 수 제한"이라고
-    단정하면, 수 제한에 걸린 적이 없는 경우에도 그 문장이 나갑니다.
+    대응 문헌이 없으면 유사도 없이 미대응 한 줄만 남깁니다. 근거가 약한 대응을 억지로
+    문장으로 만들어 섞지 않습니다. 다만 원문 대조를 통과한 인접 기재까지 버리지는 않습니다.
+    그것을 감추면 심사관이 이미 확인된 문단을 처음부터 다시 찾게 되고, 어디까지 검토된
+    상태인지도 알 수 없게 됩니다.
     """
-    if coverage is None or not coverage.reference_document:
-        return ""
-    match = matrix.get(coverage.reference_document, {}).get(coverage.label)
-    shown = (match.quote_translation or match.quote) if match else ""
-    quoted = f' "{_clip(shown, 120)}" ({_location(match, documents)})' if shown and match else ""
-    reason = next((dropped.reason for dropped in (chain.dropped_supplements if chain else [])
-                   if dropped.document_id == coverage.reference_document),
-                  "인용발명 조합에는 넣지 않았습니다. 해당 구성의 대응 근거로만 참고합니다.")
-    return (f"{_reference_name(coverage.reference_document, mappings)}(미채택)에 "
-            f"{coverage.reference_judgment} 수준의 더 강한 대응{quoted}이 있으나, {reason}")
+    if report_similarity(match) is None or match is None:
+        line = f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
+        return f"{line}\n(가장 가까운 기재: {related} — 청구항 한정 전체를 개시하는 근거는 아님)" if related else line
+    passage = _passage(match, mappings, documents)
+    if combined and primary is not None:
+        missing = "; ".join(primary.missing_limitations[:2]) or "청구항이 요구하는 세부 구성"
+        return (f"{_passage(primary, mappings, documents)}는 구성이 기재되어 있으나 {missing}에 대한 "
+                f"기재는 없고, {passage}는 구성이 기재되어 있어 이를 결합하면 "
+                f'청구항의 "{_clip(text)}" 구성과 대응됩니다.')
+    return (f"{passage}는 구성이 기재되어 있으며, {_reason_clause(match.reason)} "
+            f'청구항의 "{_clip(text)}" 구성과 대응됩니다.')
 
 
-def _narrative(text: str, match: ElementMatch | None, chain: ChainInfo,
-               matrix: dict[str, dict[str, ElementMatch]], mappings: list[DocumentMapping],
-               documents: dict[str, Document]) -> str:
-    related = (next((span for span in match.evidence
-                     if span.verify == "verified" and span.quote), None)
-               if match else None)
-    if match is None or (match.judgment == "대응 없음" and related is None):
-        return f'청구항의 "{_clip(text)}" 구성에 대응되는 기재가 인용발명에서 확인되지 않았습니다.'
+def _passage(match: ElementMatch, mappings: list[DocumentMapping],
+             documents: dict[str, Document]) -> str:
+    """`인용발명 N (문헌번호)에는 "발췌" (단락 [0000])("원문")` 까지를 만듭니다."""
     name = _reference_name(match.document_id, mappings)
-    sentences: list[str] = []
-
-    # 보조 문헌이 최종 근거라면 주 문헌의 한계를 먼저 밝힙니다. 인용문을 먼저 쓴 뒤
-    # 같은 내용을 보완 설명에서 다시 반복하던 종전 순서를 피하기 위한 것입니다.
-    if chain.primary and match.document_id != chain.primary:
-        primary = matrix.get(chain.primary, {}).get(match.label)
-        primary_name = _reference_name(chain.primary, mappings)
-        shortfall = (f"{primary.judgment} 판정에 그쳐" if primary and primary.judgment != "대응 없음"
-                     else "대응 기재가 없어")
-        sentences.append(
-            f"{primary_name}만으로는 이 구성이 {shortfall} 완전히 개시되었다고 보기 어렵습니다."
-        )
-        if primary and primary.missing_limitations:
-            sentences.append(f"누락된 한정은 {'; '.join(primary.missing_limitations[:3])}입니다.")
-
-    passages = _supporting_passages(match, documents)
-    if passages:
-        sentences.append(f"{name}에서 다음 대응 기재를 확인했습니다.")
-        for limitations, shown, original, location in passages:
-            subject = "; ".join(limitations) if limitations else "대표 대응 근거"
-            original_text = f' (원문: "{_clip(original)}")' if original else ""
-            sentences.append(f'- {_clip(subject, 180)}: "{_clip(shown)}" ({location}){original_text}')
-    else:
-        sentences.append(f"{name}에서 원문과 대조된 직접 발췌는 확인되지 않았습니다.")
-
-    if match.missing_limitations:
-        sentences.append(f"다만 {'; '.join(match.missing_limitations[:3])} 기재는 확인되지 않았습니다.")
-    conclusion = ("관련 기재가 있으나 청구항 한정 전체에 대응하는 개시로 보기 어렵습니다"
-                  if match.judgment == "대응 없음" and related else _CONCLUSION[match.judgment])
-    sentences.append(f'따라서 청구항의 "{_clip(text)}" 구성과 {conclusion}.')
-
-    return "\n".join(sentence for sentence in sentences if sentence).strip()
+    shown = _clip(match.quote_translation or match.quote, EXCERPT_LIMIT)
+    if not shown:
+        return f"{name}에는 해당 취지의 기재"
+    original = (f'("{_clip(match.quote, ORIGINAL_LIMIT)}")'
+                if match.quote_translation and match.quote else "")
+    return f'{name}에는 "{shown}" ({_location(match, documents)}){original}'
 
 
-def _supporting_passages(match: ElementMatch,
-                         documents: dict[str, Document]) -> list[tuple[list[str], str, str, str]]:
-    """검증된 하위 한정 발췌를 실제 청구항 구성과 일대일로 묶습니다.
+# 판단 이유를 "…므로 청구항의 … 구성과 대응됩니다"에 이어 붙이기 위한 어미 변환.
+# 프롬프트가 "므로"로 끝내라고 요구하지만, 모델이 평서형으로 답해도 문장이 깨지지 않게 합니다.
+_CONNECTIVE_ENDINGS = ("므로", "때문에", "어서", "아서", "여서", "이라서")
+_ENDING_REWRITES = (
+    ("하고 있습니다", "하고 있으므로"), ("하고 있다", "하고 있으므로"), ("있습니다", "있으므로"),
+    ("있다", "있으므로"), ("합니다", "하므로"), ("한다", "하므로"), ("입니다", "이므로"),
+    ("이다", "이므로"), ("됩니다", "되므로"), ("된다", "되므로"),
+    ("함", "하므로"), ("됨", "되므로"), ("음", "으므로"),
+)
 
-    대표 발췌 하나만 보여 주면, 다른 문장에서 입증된 하위 한정까지 그 한 문장이 뒷받침하는
-    것처럼 보입니다. 같은 발췌를 쓴 하위 한정은 한 행으로 합쳐 중복도 피합니다.
+
+def _reason_clause(reason: str) -> str:
+    """모델의 판단 이유를 결과절과 이어지는 원인절로 다듬습니다.
+
+    이유는 생략할 수 없는 항목입니다. 모델이 이유를 주지 않았을 때만 발췌 자체를 가리키는
+    중립 문구로 대체하고, 없는 근거를 지어내지 않습니다.
     """
-    grouped: dict[str, dict] = {}
-    for check in match.limitation_checks:
-        if not check.disclosed or check.verify != "verified" or not check.quote:
-            continue
-        key = re.sub(r"\s+", " ", check.quote).strip()
-        entry = grouped.setdefault(key, {
-            "limitations": [],
-            "shown": check.quote_translation or check.quote,
-            "original": check.quote if check.quote_translation else "",
-            "location": _chunk_location(match.document_id, check.chunk_id, documents),
-        })
-        if check.limitation and check.limitation not in entry["limitations"]:
-            entry["limitations"].append(check.limitation)
-
-    main_key = re.sub(r"\s+", " ", match.quote).strip()
-    if match.quote and match.verify == "verified" and main_key not in grouped:
-        grouped[main_key] = {
-            "limitations": [],
-            "shown": match.quote_translation or match.quote,
-            "original": match.quote if match.quote_translation else "",
-            "location": _location(match, documents),
-        }
-    # evidence는 누락 한정과 가장 가까운 기재이지 그 한정 전체를 충족하는 근거가 아니다.
-    # 보고서에서 버리면 실제로 관련 구조가 있는데도 "원문 발췌 없음"으로 보이고, 반대로
-    # 일반 대응 근거처럼 표시하면 과대평가된다. 성격을 명시해 검증된 원문만 별도로 보여 준다.
-    for span in match.evidence:
-        if span.verify != "verified" or not span.quote:
-            continue
-        key = re.sub(r"\s+", " ", span.quote).strip()
-        grouped.setdefault(key, {
-            "limitations": ["관련 기재(청구항 한정 전체를 개시하는 근거는 아님)"],
-            "shown": span.quote_translation or span.quote,
-            "original": span.quote if span.quote_translation else "",
-            "location": _chunk_location(match.document_id, span.chunk_id, documents),
-        })
-    return [(entry["limitations"], entry["shown"], entry["original"], entry["location"])
-            for entry in grouped.values()]
+    reason = re.sub(r"\s+", " ", str(reason or "")).strip().rstrip(". ")
+    # 모델이 프롬프트 내 문헌 순서를 "인용발명 1"로 써도 보고서의 확정 매핑 번호와
+    # 충돌하지 않도록 이유 앞의 임시 번호를 제거합니다.
+    reason = re.sub(r"^(?:인용발명|인용문헌|문헌)\s*\d*\s*(?:에는|에서는|에서|은|는|이|가)\s*", "", reason)
+    reason = re.sub(r"^청구항의?\s*", "", reason)
+    if not reason:
+        return "위 기재가 해당 구성의 입력·처리·출력 관계를 그대로 보여 주므로"
+    if reason.endswith(_CONNECTIVE_ENDINGS):
+        return reason
+    for ending, replacement in _ENDING_REWRITES:
+        if reason.endswith(ending):
+            return reason[: -len(ending)] + replacement
+    return f"{reason}에 해당하므로"
 
 
-def _chunk_location(document_id: str, chunk_id: str,
-                    documents: dict[str, Document]) -> str:
-    document = documents.get(document_id)
-    if document is not None:
-        for chunk in document.chunks:
-            if chunk.chunk_id != chunk_id:
-                continue
-            if chunk.paragraph:
-                return f"단락 [{chunk.paragraph}]"
-            if chunk.page:
-                return f"{chunk.page} 페이지"
-    return chunk_id or "출처 미상"
-
-
-def _reason_sentence(reason: str) -> str:
-    """모델의 짧은 판정 이유를 독립적으로 읽히는 한 문장으로 정돈합니다."""
-    reason = re.sub(r"\s+", " ", reason).strip().rstrip(". ")
-    # 모델이 프롬프트 내 문헌 순서를 "인용발명 1"로 써도 보고서의
-    # 확정 매핑 번호와 충돌하지 않도록 판단 이유 앞의 임시 번호를 제거한다.
-    reason = re.sub(r"^(?:인용발명|인용문헌|문헌)(?:\s*\d+)?(?:에는|에서|은|는|이|가)\s*",
-                    "이는 ", reason)
-    if reason.endswith("함"):
-        reason = reason[:-1] + "한다는 점을 보여 줍니다"
-    elif reason.endswith("됨"):
-        reason = reason[:-1] + "된다는 점을 보여 줍니다"
-    elif not reason.startswith(("이는 ", "청구항", "해당", "위 ")) and not reason.endswith(
-        ("합니다", "됩니다", "있습니다", "없습니다", "어렵습니다", "보여 줍니다")
-    ):
-        reason = f"그 대응 근거는 {reason}입니다"
-    return reason + "."
-
-
-def _difference(match: ElementMatch | None) -> str | None:
-    if match is None:
+def _difference(match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
+                mappings: list[DocumentMapping], documents: dict[str, Document]) -> str | None:
+    if match is None or report_similarity(match) is None:
         return None
+    if combined and primary is not None:
+        gap = "; ".join(primary.missing_limitations[:2]) or "세부 구성"
+        return (f"{_reference_name(primary.document_id, mappings)}은 {gap}에 대한 기재가 없으나 "
+                f"{_reference_name(match.document_id, mappings)} ({_location(match, documents)})의 "
+                "결합으로 해소됨")
     if match.missing_limitations:
         return "; ".join(match.missing_limitations[:3])
     if match.judgment in {"동일", "실질적 동일"} and not match.downgraded_from:
         return None
-    if match.judgment == "대응 없음":
-        return None
     return "세부 구현·조건에 차이가 있어 동일하다고 보기 어렵습니다."
 
 
-def _downgrade_note(match: ElementMatch | None) -> str:
-    if match and match.downgraded_from:
-        return f"발췌 검증 결과 {match.downgraded_from} 판정을 {match.judgment}(으)로 낮췄습니다."
+def _closest_related(label: str, matrix: dict[str, dict[str, ElementMatch]],
+                     mappings: list[DocumentMapping], documents: dict[str, Document]) -> str:
+    """미대응 구성에 대해 원문 대조를 통과한 가장 가까운 기재 하나를 고릅니다.
+
+    문헌 순서가 아니라 인용발명 번호 순으로 훑어, 같은 판정 자료에서는 항상 같은 문장이
+    선택되게 합니다.
+    """
+    for mapping in mappings:
+        match = matrix.get(mapping.document_id, {}).get(label)
+        if match is None:
+            continue
+        for span in match.evidence:
+            if span.verify != "verified" or not span.quote:
+                continue
+            shown = _clip(span.quote_translation or span.quote, EXCERPT_LIMIT)
+            location = _chunk_location(mapping.document_id, span.chunk_id, documents)
+            return f'{_reference_name(mapping.document_id, mappings)} "{shown}" ({location})'
     return ""
 
+
+def _chunk_location(document_id: str, chunk_id: str, documents: dict[str, Document]) -> str:
+    page, paragraph = _chunk_position(documents.get(document_id), chunk_id)
+    if paragraph:
+        return f"단락 [{paragraph}]"
+    if page:
+        return f"{page} 페이지"
+    return chunk_id or "출처 미상"
+
+
+def _usable(match: ElementMatch | None) -> bool:
+    """결합 문장에 주 인용발명을 함께 세울 수 있는지. 검증된 발췌가 있어야 합니다."""
+    return bool(match and match.quote and match.verify in {"verified", "partial"}
+                and match.judgment != "대응 없음")
+
+
+# --- 근거 위치 ----------------------------------------------------------------
 
 def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, ElementMatch]],
                       documents: dict[str, Document], mappings: list[DocumentMapping]) -> list[Evidence]:
@@ -363,10 +275,9 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
                      for span in match.evidence if span.quote)
         seen: set[tuple[str, str]] = set()
         for chunk_id, quote, translation, verify in spans:
-            key = (chunk_id, quote)
-            if key in seen:
+            if (chunk_id, quote) in seen:
                 continue
-            seen.add(key)
+            seen.add((chunk_id, quote))
             page, paragraph = _chunk_position(document, chunk_id)
             evidence.append(Evidence(
                 document_id=document_id,
@@ -381,10 +292,6 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
     return evidence
 
 
-def _position(match: ElementMatch, document: Document | None) -> tuple[int | None, str | None]:
-    return _chunk_position(document, match.chunk_id)
-
-
 def _chunk_position(document: Document | None, chunk_id: str) -> tuple[int | None, str | None]:
     if document is None:
         return None, None
@@ -395,20 +302,16 @@ def _chunk_position(document: Document | None, chunk_id: str) -> tuple[int | Non
 
 
 def _location(match: ElementMatch, documents: dict[str, Document]) -> str:
-    page, paragraph = _position(match, documents.get(match.document_id))
-    if paragraph:
-        return f"단락 [{paragraph}]"
-    if page:
-        return f"{page} 페이지"
-    return match.chunk_id or "출처 미상"
+    """단락번호가 있으면 단락으로, 없으면 페이지로 인용 위치를 적습니다."""
+    return _chunk_location(match.document_id, match.chunk_id, documents)
 
 
 def _reference_name(document_id: str | None, mappings: list[DocumentMapping]) -> str:
     for mapping in mappings:
         if mapping.document_id == document_id:
-            label = f"인용발명 {mapping.reference_number}"
             detail = mapping.document_number or mapping.filename
-            return f"{label} ({detail})" if detail else label
+            return f"인용발명 {mapping.reference_number} ({detail})" if detail \
+                else f"인용발명 {mapping.reference_number}"
     return f"문헌 {document_id}" if document_id else "주 인용발명"
 
 
@@ -419,114 +322,36 @@ def _reference_number(document_id: str, mappings: list[DocumentMapping]) -> int 
     return None
 
 
-def _summary_similarity(results: list[ClaimResult]) -> str:
-    """채택된 대응을 구성별 문장으로 반복하지 않고 전체 공통 내용을 한 줄로 요약합니다."""
+# --- 종합 분석 요약 -----------------------------------------------------------
+
+def _summary_similarity(results: list[ClaimResult], mappings: list[DocumentMapping]) -> str:
+    """출원발명과 인용발명들의 공통된 기술 내용을 한 줄로 정리합니다."""
     if any(result.status == "판정 불가" for result in results):
         return "구성대비 판정을 받지 못해 유사 내용을 요약할 수 없습니다."
-    disclosed = [result for result in results if result.status == "개시됨"]
-    partial = [result for result in results if result.status == "부분 개시"]
-    if not disclosed and not partial:
-        return "청구항과 인용발명 사이에 전체적으로 유사한 기술 내용이 확인되지 않았습니다."
-
-    references = list(dict.fromkeys(result.adopted_reference for result in [*disclosed, *partial]
-                                    if result.adopted_reference is not None))
-    reference_text = (" 및 ".join(f"인용발명 {number}" for number in references)
-                      if references else "채택 인용발명")
-    sentences: list[str] = []
-    if disclosed:
-        common_content = _clip(" 및 ".join(dict.fromkeys(_clip(result.claim, 100) for result in disclosed)), 240)
-        sentences.append(f"청구항과 {reference_text}는 {common_content}에 관한 기술 내용이 전체적으로 유사합니다.")
-    if partial:
-        labels = ", ".join(result.label for result in partial)
-        sentences.append(f"구성 {labels}에는 일부 대응 기재만 확인되며 완전한 개시로 보지 않습니다.")
-    return " ".join(sentences)
+    corresponded = [result for result in results if result.similarity is not None]
+    if not corresponded:
+        return "청구항과 인용발명 사이에 대응되는 기술 내용이 확인되지 않았습니다."
+    numbers = sorted({result.adopted_reference for result in corresponded
+                      if result.adopted_reference is not None})
+    references = ", ".join(f"인용발명 {number}" for number in numbers) or "제시된 인용발명"
+    disclosed = [result for result in corresponded if result.status == "개시됨"] or corresponded
+    common = _clip(" 및 ".join(dict.fromkeys(_clip(result.claim, 60) for result in disclosed[:3])), 200)
+    return f"청구항과 {references}는 {common}에 관한 기술적 목적과 핵심 메커니즘이 공통됩니다."
 
 
-def _labels_by_document(results: list[ClaimResult], merged: dict[str, ElementMatch],
-                        statuses: set[str]) -> dict[str, list[str]]:
-    grouped: dict[str, list[str]] = {}
-    for result in results:
-        match = merged.get(result.label)
-        if result.status in statuses and match is not None:
-            grouped.setdefault(match.document_id, []).append(result.label)
-    return grouped
-
-
-def _summary_difference(claim: Claim, chain: ChainInfo, results: list[ClaimResult]) -> str:
+def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
+    """구성별 차이점과 겹치지 않는 범위에서 가장 두드러진 차이를 한 줄로 정리합니다."""
     if chain.track == "analysis_incomplete":
         return "구성대비가 완료되지 않아 차이점을 특정할 수 없습니다."
-    parts: list[str] = []
-    uncovered = [label for label in chain.uncovered
-                 if label not in chain.conventional and label not in chain.preamble_undisclosed]
+    uncovered = [result.label for result in results
+                 if result.similarity is None and not result.is_preamble]
     if uncovered:
-        parts.append(f"구성 {', '.join(uncovered)}은 인용발명 결합으로도 청구항 한정 전체의 개시가 "
-                     "확인되지 않았습니다.")
-    if chain.preamble_undisclosed:
-        # 전제부가 한정적인지는 사건마다 다릅니다. 코드가 정하지 않고 판단 지점을 드러냅니다.
-        parts.append("전제부에 대응하는 기재는 확인되지 않았습니다. 전제부가 한정적 의미를 갖는지, "
-                     "아니면 용도·기술분야를 밝힌 기재인지 확인한 뒤 결론을 정하십시오. "
-                     "이 분석은 전제부를 결론 판단에서 제외했습니다.")
-    if chain.conventional:
-        parts.append(f"구성 {', '.join(chain.conventional)}은 중요도가 낮아 주지관용 검토 대상으로 "
-                     "분리했을 뿐, 주지관용임을 뒷받침하는 근거는 확인되지 않았습니다.")
-    residual = [label for label in chain.residual if label not in chain.uncovered + chain.conventional]
+        return (f"구성 {', '.join(uncovered)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
+                "추가 검색이 필요합니다.")
+    residual = [label for label in chain.residual if label not in chain.uncovered]
     if residual:
-        parts.append(f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다.")
-    elif not parts and [result.label for result in results if result.status == "부분 개시"]:
-        partial = [result.label for result in results if result.status == "부분 개시"]
-        parts.append(f"구성 {', '.join(partial)}에는 세부 구현상의 차이가 남아 있습니다.")
-    if chain.reference_only:
-        parts.append(f"구성 {', '.join(chain.reference_only)}은 미채택 문헌에 더 강한 대응이 있어 참고로 남겼습니다.")
-    return " ".join(parts)
-
-
-def _summary(claim: Claim, chain: ChainInfo, results: list[ClaimResult],
-             merged: dict[str, ElementMatch], mappings: list[DocumentMapping]) -> str:
-    primary = _reference_name(chain.primary, mappings) if chain.primary else "주 인용발명"
-    if chain.track == "analysis_incomplete":
-        return (f"청구항 {claim.number}은 구성대비 판정을 받지 못한 셀이 있어 신규성·진보성 판단을 "
-                "수행하지 않았습니다. 미판정은 '대응 없음'과 다르므로, 이 결과를 인용발명에 해당 "
-                "기재가 없다는 뜻으로 읽어서는 안 됩니다. 원인을 해소한 뒤 재실행해야 합니다.")
-    if chain.track == "novelty_single":
-        return (f"청구항 {claim.number}의 모든 필수 구성이 {primary} 하나에 직접 개시되어 있습니다. "
-                "신규성 부정 사유에 해당하는지 검토가 필요하나, 이 분석은 해당 문헌이 대상 청구항의 "
-                "우선일 전에 공지·공개되어 특허법 제29조의 선행기술로 적격한지를 확인하지 "
-                "않았습니다. 적격성 확인 전에는 결론이 아닙니다.")
-    if chain.track == "rejection_impossible":
-        pending = (f" 구성 {', '.join(chain.conventional)}은 중요도가 낮아 주지관용 검토 대상이지만,"
-                   " 근거가 없으므로 현재 보고서에서는 미개시 상태로 유지합니다."
-                   if chain.conventional else "")
-        return (f"청구항 {claim.number}은 {primary}을 주 인용발명으로 하더라도 구성 "
-                f"{', '.join(chain.uncovered) or '일부'}의 청구항 한정 전체를 충족하는 기재가 어느 "
-                "인용발명에서도 확인되지 않아 "
-                f"제시된 인용발명만으로는 거절 이유를 구성하기 어렵습니다.{pending}")
-    by_primary = _labels_by_document(results, merged, {"개시됨"}).get(chain.primary or "", [])
-    partial = [result.label for result in results if result.status == "부분 개시"]
-    supplemented = [result.label for result in results
-                    if (match := merged.get(result.label)) is not None and match.document_id != chain.primary
-                    and result.status == "개시됨"]
-    lead = (f"청구항 {claim.number}은 {primary}에 의해 구성 {', '.join(by_primary)}이 개시되어 있고, "
-            if by_primary else
-            f"청구항 {claim.number}의 " if supplemented else
-            f"청구항 {claim.number}은 ")
-    if supplemented:
-        adopted_documents = []
-        for label in supplemented:
-            document_id = merged[label].document_id
-            if document_id not in adopted_documents:
-                adopted_documents.append(document_id)
-        secondaries = ", ".join(_reference_name(document_id, mappings) for document_id in adopted_documents)
-        qualifier = "나머지 " if by_primary else ""
-        body = f"{qualifier}구성 {', '.join(supplemented)}은 {secondaries}에서 확인됩니다. "
-    else:
-        body = "제시된 인용발명에서 청구항의 각 구성이 확인됩니다. "
-    conventional = (f" 남은 구성 {', '.join(chain.conventional)}은 주지관용 기술 여부를 별도로 "
-                    "입증해야 하며, 이 분석은 그 근거를 제시하지 않았습니다."
-                    if chain.conventional else "")
-    partial_note = (f" 구성 {', '.join(partial)}에는 일부 대응 기재만 확인되며, 남은 하위 한정 때문에 "
-                    "완전한 개시로 보지 않습니다."
-                    if partial else "")
-    return f"{lead}{body}{partial_note}{conventional}"
+        return f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다."
+    return ""
 
 
 def _clip(text: str, limit: int = 200) -> str:
@@ -538,20 +363,18 @@ def _clip(text: str, limit: int = 200) -> str:
 
 def to_markdown(result: AnalysisResult) -> str:
     lines = ["# 구성대비 분석", ""]
-    # 실패는 맨 아래 "검증 참고" 각주가 아니라 첫 화면에서 보여야 합니다. 각주로 밀면
-    # 각 청구항 헤더의 확신에 찬 "거절 이유 유형"만 읽히고 실패 사실은 전달되지 않습니다.
     incomplete = [report.claim_number for report in result.reports
                   if report.track == "analysis_incomplete"]
     if incomplete:
         lines += [f"> ⚠️ **구성대비 미완료** — 청구항 "
                   f"{', '.join(str(number) for number in incomplete)}은 판정을 받지 못한 셀이 있어 "
-                  "신규성·진보성 판단을 수행하지 않았습니다. 미판정은 '대응 없음'과 다릅니다. "
-                  "아래 결과를 거절 가부 판단에 사용하지 마십시오.", ""]
+                  "결론을 만들지 않았습니다. 미판정은 '대응 없음'과 다릅니다.", ""]
     lines += ["## 문헌 매핑 테이블", "",
-             "| 인용발명 | 문헌번호 | 파일명 | 공개·제출일 | 문서 유형 | 단독 적합도 | 역할 |",
-             "|---|---|---|---|---|---|---|"]
-    lines += [f"| 인용발명 {mapping.reference_number} | {mapping.document_number or '-'} | {mapping.filename} "
-              f"| {mapping.publication_date or mapping.filing_date or '-'} | {mapping.document_type} | {mapping.main_score:.2f} | {mapping.role} |"
+              "| 인용발명 | 문헌번호 | 파일명 | 공개·제출일 | 역할 |",
+              "|---|---|---|---|---|"]
+    lines += [f"| 인용발명 {mapping.reference_number} | {mapping.document_number or '-'} "
+              f"| {mapping.filename} | {mapping.publication_date or mapping.filing_date or '-'} "
+              f"| {mapping.role} |"
               for mapping in result.claim_mapping]
     for report in result.reports:
         lines += _claim_section(report, result.claim_mapping)
@@ -564,7 +387,7 @@ def to_markdown(result: AnalysisResult) -> str:
                          + (f" (남은 차이: {hit.remaining_difference})" if hit.remaining_difference else "")
                          + (f" {hit.url}" if hit.url else ""))
     if result.validation:
-        lines += ["", "## 검증 참고", ""] + [f"- {item}" for item in result.validation]
+        lines += ["", "## 참고", ""] + [f"- {item}" for item in result.validation]
     return "\n".join(lines) + "\n"
 
 
@@ -572,63 +395,32 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
     header = f"청구항 {report.claim_number}"
     if report.depends_on:
         header += f" (청구항 {report.depends_on} 종속)"
-    # "거절 이유 유형"이라고 쓰면 뒤의 단서를 다 붙여도 헤더만 읽고 확정 결론으로 받아들입니다.
-    lines = ["", f"## {header}", "", f"**검토 트랙**: {report.rejection_basis}"]
+    lines = ["", f"## {header}", ""]
     if report.track == "analysis_incomplete":
-        # 결합 유사도를 찍지 않습니다. 판정이 없는 상태의 0.00%는 "유사하지 않다"로 읽힙니다.
         lines += ["**인용발명 조합**: 판정을 받지 못해 확정하지 않았습니다.", ""]
-        lines += ["> ⚠️ 이 청구항은 구성대비가 완료되지 않았습니다. 미판정 사유:"]
         lines += [f"> - {reason}" for reason in report.chain.incomplete_reasons] + [""]
+    elif not any(item.adopted_reference for item in report.claims):
+        # 종속항은 부모항의 조합을 상속하므로, 추가 구성에 대응이 하나도 없어도 상속된
+        # 문헌 이름이 그대로 찍힙니다. 그러면 그 문헌들이 이 청구항의 거절 근거인 것처럼
+        # 읽히지만, 실제로는 추가 한정을 개시한 문헌이 없습니다.
+        lines += ["**인용발명 조합**: 이 청구항의 구성에 대응하는 인용발명이 확인되지 않았습니다.", ""]
     else:
-        lines += [f"**인용발명 조합**: {_chain_text(report.chain, mappings)}",
-                  f"**결합 후 구성대비 지표**: {report.chain.combined_similarity:.2f}%"
-                  " (법적 결론이 아닌 내부 선정 지표)", ""]
+        lines += [f"**인용발명 조합**: {_chain_text(report.chain, mappings)}", ""]
     if report.preamble:
         lines += [f"> {report.preamble}", ""]
     for item in report.claims:
         heading = "전제부" if item.is_preamble else item.label
         lines += ["", f"### ({heading}) {item.claim}", ""]
-        if item.similarity is None:
-            lines.append(item.narrative)
-        else:
-            # 판정 라벨의 대표값이지 커버 여부가 아닙니다. 상태를 같은 줄에 붙이지 않으면
-            # "87%"와 "미개시"가 한 보고서 안에서 서로를 부정하는 것처럼 읽힙니다.
-            lines += [f"판정 대표값: {item.similarity}% {item.emoji} {item.grade} · {item.status}"
-                      + (f" · 채택 근거: 인용발명 {item.adopted_reference}" if item.adopted_reference else ""),
-                      "", item.narrative.replace("\n", "  \n")]
-        # 어느 문헌이 무엇을 개시했는지 구성마다 분리해 적습니다.
-        # 주 인용발명이 단독으로 채택된 구성은 위 서술과 겹치므로 역할 줄을 따로 적지 않습니다.
-        split_roles = bool(item.supplement_disclosure or item.reference_note or item.residual_difference)
-        if item.primary_disclosure and split_roles:
-            lines.append(f"- 주 인용발명 개시: {item.primary_disclosure}")
-        if item.supplement_disclosure:
-            lines.append(f"- 보완 인용발명 개시: {item.supplement_disclosure}")
-        if item.residual_difference:
-            lines.append(f"- 결합 후 남는 차이: {item.residual_difference}")
-        if item.reference_note:
-            lines.append(f"- 참고(미채택 문헌): {item.reference_note}")
+        if item.similarity is not None:
+            lines.append(f"유사도: {item.similarity}% {item.emoji} {item.grade}")
+        lines.append(item.narrative.replace("\n", "  \n"))
         if item.difference:
             lines.append(f"→ 차이점: {item.difference}")
-        if item.note:
-            lines.append(f"※ {item.note}")
-    if report.chain.conventional_notes:
-        lines += ["", "### 주지관용 검토 대상 (근거 미제시)", "",
-                  "아래 구성은 결합 후에도 커버 기준에 미치지 못했으나 중요도가 낮아 분리한 것입니다.",
-                  "주지관용 기술로 인정하려면 별도 근거가 필요하며, 이 분석은 그 근거를 찾지 않았습니다.", ""]
-        lines += [f"- ({note.label}) 중요도 {note.importance} · 결합 후 판정 {note.judgment}"
-                  + (f" · 미개시 한정: {', '.join(note.missing)}" if note.missing else "")
-                  + f" — {note.note}"
-                  for note in report.chain.conventional_notes]
-    if report.chain.dropped_supplements:
-        lines += ["", "### 결합에 채택하지 않은 대응", ""]
-        lines += [f"- {_reference_name(dropped.document_id, mappings)}: 구성 {', '.join(dropped.labels)} — {dropped.reason}"
-                  for dropped in report.chain.dropped_supplements]
     lines += ["", "### 종합 분석 요약", ""]
     if report.summary_similarity:
         lines.append(f"- 유사점: {report.summary_similarity}")
     if report.summary_difference:
         lines.append(f"- 차이점: {report.summary_difference}")
-    lines += ["", report.summary]
     return lines
 
 

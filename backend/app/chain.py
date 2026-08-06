@@ -8,29 +8,24 @@ from .coverage import (
     PRIMARY_CANDIDATE_MARGIN,
     best_match, combined_similarity, difference_labels, direct_similarity, has_correspondence,
     ineligible_reason, is_better_match, is_core, is_eligible_supplement,
-    no_correspondence_labels, quality_key, residual_difference, rows_for, score_document,
+    no_correspondence_labels, residual_difference, rows_for, score_document,
     supplement_gain, supplement_needed_labels, supplement_reason,
 )
-from .models import (Claim, ChainInfo, ConventionalNote, DocumentScore, DroppedSupplement,
-                     ElementCoverage, ElementMatch, NoveltyScreen, SupplementCandidate)
+from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
+                     NoveltyScreen, SupplementCandidate)
 
 # 이 판정들만 단일문헌 신규성의 직접 개시로 인정합니다.
 NOVELTY_DIRECT = {"동일", "실질적 동일"}
-# 중요도가 이 이하인 미커버 구성은 주지관용 검토로 분리합니다.
-# ClaimElement.importance의 기본값이 3이므로(중요도 판정 실패 시에도 3), 이 값을 3으로 올리면
-# 중요도를 받지 못한 구성이 전부 주지관용으로 분류됩니다. 여기는 2로 고정합니다.
-#
-# 이 분류는 중요도 하나만 보고 내리는 **행정적 분리**이지 주지관용 인정이 아닙니다.
-# 주지관용 기술은 근거 제시가 원칙이고 이 파이프라인은 그 근거를 찾지 않으므로,
-# 분리된 구성마다 무엇이 입증되지 않았는지를 conventional_notes에 남겨 보고서로 내보냅니다.
-CONVENTIONAL_IMPORTANCE = 2
-# 세 번째 문헌까지 허용할 수 있는 잔여 공백의 중요도 상한. 주지관용 분류와는 별개 기준입니다.
-# 차별적 핵심 구성(4~5)을 세 번째 문헌으로 메우는 것은 계속 막습니다.
-EXCEPTIONAL_GAP_IMPORTANCE = 3
-MAX_COMBINED_DOCUMENTS = 2        # 주 인용발명 1 + 보완 1
-MAX_EXCEPTIONAL_DOCUMENTS = 3     # 잔여 공백에 명시적·검증된 직접 근거가 있을 때만
 # 완전 미대응을 메우는 이득에 주는 우선순위. 남은 결합 여유를 품질 개선에 먼저 쓰지 않게 합니다.
 GAP_PRIORITY = 3.0
+# 보완 문헌을 하나 더 끌어오기 위해 요구하는 최소 이득. 결합 문헌 수에 상한을 두는 대신
+# 이 문턱으로 멈춥니다.
+#
+# 상한을 상수로 두면(종전 2건) 세 번째 문헌이 어느 구성의 **유일한** 검증 근거를 가지고
+# 있어도 통째로 버려지고, 그 구성은 "어느 인용발명에도 대응이 없다"로 보고됩니다. 실제로
+# 그런 문헌이 업로드되어 있는데도 그렇게 적으면 사실과 다른 보고가 됩니다. 문헌은 새로
+# 기여하는 것이 있을 때만 늘어나므로, 이득이 마르면 결합은 저절로 멈춥니다.
+MIN_SUPPLEMENT_GAIN = 0.05
 
 
 Matrix = dict[str, dict[str, ElementMatch]]   # document_id → label → 판정
@@ -107,7 +102,7 @@ def blocking_labels(claim: Claim, labels: list[str]) -> list[str]:
     전제부는 대비도 하고 보고서에도 남기지만 여기서는 빼냅니다. 전제부가 한정적 의미를
     갖는지는 사건마다 다른 법적 판단이고, 실무에서 흔한 "…장치에 있어서" 같은 범주 기재를
     하드 게이트로 삼으면 거의 모든 청구항이 "거절 이유 구성 곤란"으로 나옵니다.
-    대신 preamble_undisclosed에 남겨 검토 트랙 라벨에 함께 표시합니다.
+    대신 preamble_undisclosed에 남겨 감사 데이터에 그대로 노출합니다.
     """
     preamble = {element.label for element in claim.elements if element.is_preamble}
     return [label for label in labels if label not in preamble]
@@ -175,32 +170,20 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
     # 보완 검토 대상은 미커버 구성보다 넓습니다. '일부 차이'로 커버된 구성도 여기 들어옵니다.
     chain.supplement_needed = supplement_needed_labels(claim, merged)
 
-    limit = MAX_COMBINED_DOCUMENTS
-    blocked_by_limit = False
-    while len(chain.secondaries) + 1 < MAX_EXCEPTIONAL_DOCUMENTS + 1:
-        gaps = no_correspondence_labels(claim, merged)
+    # 새로 기여하는 문헌이 있는 한 계속 결합합니다. 이득이 문턱 아래로 떨어지면 멈춥니다.
+    while len(chain.secondaries) + 1 < len(matrix):
         targets = supplement_needed_labels(claim, merged)
         if not targets:
             break
-        candidate = _best_secondary(claim, matrix, merged, targets, gaps,
+        candidate = _best_secondary(claim, matrix, merged, targets,
+                                    no_correspondence_labels(claim, merged),
                                     exclude={chain.primary, *chain.secondaries})
         if candidate is None:
             break
-        if len(chain.secondaries) + 1 >= limit:
-            # 예외적 3문헌 결합: 남은 **공백**이 차별적 핵심 구성이 아니고, 세 번째 문헌이
-            # 그 공백 전부를 검증된 직접 근거로 개시할 때만. 근거 품질 개선만을 이유로는 안 됩니다.
-            remaining_core = [label for label in gaps if _importance(claim, label) > EXCEPTIONAL_GAP_IMPORTANCE]
-            if not gaps or remaining_core or not _has_explicit_support(matrix[candidate], gaps):
-                blocked_by_limit = True
-                break
         chain.secondaries.append(candidate)
         merged = _merge(claim, merged, matrix[candidate])
 
-    gaps = no_correspondence_labels(claim, merged)
-    chain.conventional = [label for label in gaps if _importance(claim, label) <= CONVENTIONAL_IMPORTANCE]
-    # 중요도가 낮아도 주지관용 근거가 없으면 여전히 미개시 구성이다.
-    # 별도 검토 표시(conventional)는 남기되 uncovered에서 제거하지 않는다.
-    chain.uncovered = list(gaps)
+    chain.uncovered = no_correspondence_labels(claim, merged)
     # 대응은 있으나 하위 한정이나 구현 방식에 차이가 남는 구성입니다.
     chain.residual = difference_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
@@ -211,7 +194,7 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
                            "어느 인용발명에서도 확인되지 않아 거절 이유를 구성하기 어렵습니다.")
     else:
         chain.rationale = _combination_rationale(chain)
-    return _finalize(claim, chain, merged, matrix, blocked_by_limit)
+    return _finalize(claim, chain, merged, matrix)
 
 
 def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore]) -> list[str]:
@@ -280,18 +263,7 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
             useful += 1
         if useful and gain > best_gain:
             best, best_gain = document_id, gain
-    return best
-
-
-def _has_explicit_support(matches: dict[str, ElementMatch], gaps: list[str]) -> bool:
-    """예외적 3문헌 결합의 문턱. 신규성 게이트와 같은 이유로 "verified"만 받습니다."""
-    return all(
-        (matches.get(label) is not None
-         and matches[label].quote
-         and matches[label].verify == "verified"
-         and matches[label].directness == "direct")
-        for label in gaps
-    )
+    return best if best_gain >= MIN_SUPPLEMENT_GAIN else None
 
 
 def _merge(claim: Claim, current: dict[str, ElementMatch], addition: dict[str, ElementMatch]) -> dict[str, ElementMatch]:
@@ -343,7 +315,6 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
             merged = _merge(claim, merged, matrix[candidate])
             gaps = no_correspondence_labels(claim, merged)
 
-    chain.conventional = [label for label in gaps if _importance(claim, label) <= CONVENTIONAL_IMPORTANCE]
     chain.uncovered = list(gaps)
     chain.residual = difference_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
@@ -379,15 +350,15 @@ def _single_document_novelty(claim: Claim, matrix: Matrix, parent: ChainInfo) ->
 
 def _fills_all(claim: Claim, candidate: dict[str, ElementMatch], merged: dict[str, ElementMatch],
                gaps: list[str]) -> bool:
-    """공백을 전부 메우는 문헌만 종속항에 추가합니다. 일부만 메우면 결합 한도를 넘게 됩니다."""
+    """공백을 전부 메우는 문헌만 종속항에 추가합니다. 하나를 거절하려 문헌을 둘씩 늘리지 않습니다."""
     return all(has_correspondence(best_match([merged.get(label), candidate.get(label)]))
-               for label in gaps if _importance(claim, label) > CONVENTIONAL_IMPORTANCE)
+               for label in gaps)
 
 
 # --- 공통 ---------------------------------------------------------------------
 
-def _finalize(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch], matrix: Matrix,
-              blocked_by_limit: bool = False) -> ChainInfo:
+def _finalize(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch],
+              matrix: Matrix) -> ChainInfo:
     rows = rows_for(claim, merged)
     # 전제부 공백은 트랙을 바꾸지 않지만 라벨과 보고서에는 반드시 나가야 합니다.
     # 미판정 상태에서는 "대응이 확인되지 않았다"고 적을 근거가 없으므로 비워 둡니다.
@@ -399,52 +370,17 @@ def _finalize(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch], m
     chain.combined_similarity = chain.combined_similarity or round(
         sum(row["importance"] * row["similarity"] for row in rows) / (sum(row["importance"] for row in rows) or 1) * 100, 2)
     chain.element_coverage = _element_coverage(claim, chain, merged, matrix)
-    chain.reference_only = [coverage.label for coverage in chain.element_coverage if coverage.reference_document]
-    chain.dropped_supplements = _dropped_supplements(chain, blocked_by_limit)
-    chain.conventional_notes = _conventional_notes(claim, chain, merged)
     return chain
-
-
-def _conventional_notes(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch]) -> list[ConventionalNote]:
-    """주지관용으로 분리한 구성마다 근거 상태를 남깁니다.
-
-    분리 기준은 중요도뿐이므로 여기서 인정되는 것은 아무것도 없습니다. 부분 대응이라도
-    검증된 근거가 있는지, 무엇이 아직 개시되지 않았는지를 적어 심사관이 직접 판단하게 합니다.
-    """
-    notes: list[ConventionalNote] = []
-    for label in chain.conventional:
-        match = merged.get(label)
-        supported = is_eligible_supplement(match)
-        missing = list(match.missing_limitations) if match else []
-        gap = ", ".join(missing) or "청구항 구성 전체"
-        notes.append(ConventionalNote(
-            label=label,
-            importance=_importance(claim, label),
-            judgment=match.judgment if match else "대응 없음",
-            partial_support=supported,
-            missing=missing,
-            note=(f"인용발명에 부분 대응 기재는 있으나 {gap}에 대해서는 주지관용 근거가 제시되지 않았습니다."
-                  if supported else
-                  "대응 기재가 확인되지 않았고 주지관용 근거도 제시되지 않았습니다."),
-        ))
-    return notes
 
 
 def _element_coverage(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch],
                       matrix: Matrix) -> list[ElementCoverage]:
-    """구성별 전 문헌 대응. **문헌 수 제한을 적용하지 않고** 모든 문헌을 그대로 평가합니다.
-
-    결합 한도 때문에 채택하지 못한 대응도 사유와 함께 남겨, 정보 자체가 사라지지 않게 합니다.
-    """
-    selected = set(chain_documents(chain))
+    """구성별 전 문헌 대응. 채택되지 않은 문헌의 판정도 감사용으로 그대로 남깁니다."""
     coverages: list[ElementCoverage] = []
     for element in claim.elements:
         label = element.label
         primary = matrix.get(chain.primary or "", {}).get(label)
         adopted = merged.get(label)
-        candidates = [_candidate_row(document_id, matrix[document_id].get(label), primary, adopted)
-                      for document_id in sorted(matrix)]
-        reference = _reference_document(matrix, label, adopted, selected)
         coverages.append(ElementCoverage(
             label=label,
             importance=element.importance,
@@ -457,9 +393,8 @@ def _element_coverage(claim: Claim, chain: ChainInfo, merged: dict[str, ElementM
             adopted_judgment=adopted.judgment if adopted else "대응 없음",
             adopted_role=_role_of(adopted.document_id, chain) if adopted else "미대응",
             residual_difference=residual_difference(adopted),
-            reference_document=reference,
-            reference_judgment=(matrix[reference][label].judgment if reference else "대응 없음"),
-            candidates=candidates,
+            candidates=[_candidate_row(document_id, matrix[document_id].get(label), primary, adopted)
+                        for document_id in sorted(matrix)],
         ))
     return coverages
 
@@ -480,46 +415,6 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         rejected_reason=reason,
         adopted=bool(adopted and adopted.document_id == document_id),
     )
-
-
-def _reference_document(matrix: Matrix, label: str, adopted: ElementMatch | None,
-                        selected: set[str]) -> str | None:
-    """채택되지 않은 문헌 중 이 구성을 명확히 더 잘 개시하는 문헌. 결합 문헌으로 쓰지는 않습니다."""
-    best: str | None = None
-    for document_id in sorted(matrix):
-        if document_id in selected:
-            continue
-        match = matrix[document_id].get(label)
-        if not is_eligible_supplement(match) or not is_better_match(match, adopted):
-            continue
-        if best is None or quality_key(match) > quality_key(matrix[best][label]):
-            best = document_id
-    return best
-
-
-def _dropped_supplements(chain: ChainInfo, blocked_by_limit: bool = False) -> list[DroppedSupplement]:
-    """채택하지 않은 보완을 문헌 단위로 묶습니다. 실제 결합 문헌으로 표기하지 않습니다.
-
-    탈락 사유를 실제로 작동한 규칙으로 적습니다. 문헌 수 한도에 걸린 적이 없는데도
-    "결합 문헌 수 제한"이라고 적으면, 보고서를 읽는 사람이 한도만 늘리면 채택된다고
-    잘못 판단하게 됩니다.
-    """
-    grouped: dict[str, list[str]] = {}
-    for coverage in chain.element_coverage:
-        if coverage.reference_document:
-            grouped.setdefault(coverage.reference_document, []).append(coverage.label)
-    if chain.track == "analysis_incomplete":
-        cause = "구성대비가 완료되지 않아 결합 여부를 판단하지 않았습니다."
-    elif chain.track == "novelty_single":
-        cause = "단일 인용발명으로 신규성을 판단해 다른 문헌을 결합하지 않았습니다."
-    elif blocked_by_limit:
-        cause = "결합 문헌 수 제한으로 인용발명 조합에는 넣지 않았습니다."
-    else:
-        cause = ("주 인용발명 대비 보완 이득이 다른 후보 문헌보다 작아 결합 문헌으로 선정되지 "
-                 "않았습니다.")
-    return [DroppedSupplement(document_id=document_id, labels=labels,
-                              reason=f"{cause} 해당 구성의 대응 근거로만 참고합니다.")
-            for document_id, labels in sorted(grouped.items())]
 
 
 def _role_of(document_id: str, chain: ChainInfo) -> str:
@@ -550,43 +445,9 @@ def _combination_rationale(chain: ChainInfo) -> str:
     base = ("주 인용발명이 완전히 개시하지 않은 구성을 보완 인용발명이 직접 개시하여 결합했습니다. "
             "이 결합은 구성 커버리지만으로 조립한 것이고, 결합의 동기·용이성·결합 방해 요소·"
             "작용효과는 평가하지 않았으므로 진보성 결론이 아닙니다.")
-    if chain.conventional:
-        base += (f" 구성 {', '.join(chain.conventional)}은 중요도가 낮아 주지관용 검토 대상으로 분리했을 뿐,"
-                 " 주지관용임을 뒷받침하는 근거는 확인하지 않았습니다.")
     if chain.residual:
         base += f" 결합 후에도 구성 {', '.join(chain.residual)}에는 차이가 남습니다."
     return base
-
-
-# 이 파이프라인이 실제로 확인하지 않은 것들. 조문을 인용하는 라벨에는 반드시 함께 나갑니다.
-# 조문만 적고 이 단서를 빼면, 기술적 구성대비 결과가 법적 결론으로 읽힙니다.
-NOVELTY_CAVEAT = "선행기술 적격성(공개일 vs 대상 청구항 우선일) 미확인"
-INVENTIVE_CAVEAT = "결합 동기·용이성 미평가 · " + NOVELTY_CAVEAT
-
-
-def rejection_basis(chain: ChainInfo, claim: Claim) -> str:
-    """확정된 인용발명 조합과 커버리지로 **검토 트랙** 라벨을 조립합니다.
-
-    이 파이프라인은 기술적 구성대비만 수행합니다. 선행기술 적격성(공개일과 대상 청구항
-    우선일의 선후)도, 진보성의 결합 동기·용이성도 평가하지 않으므로, 조문 번호를 확정형
-    거절 이유로 적지 않고 검토 후보와 미평가 항목을 함께 표시합니다.
-    """
-    if chain.track == "analysis_incomplete":
-        return "판정 불가 — 구성대비 미완료 (분석 실패 셀 존재)"
-    # 전제부 대응이 확인되지 않았다는 사실은 트랙과 무관하게 라벨에 붙습니다. 전제부를
-    # 한정으로 볼지는 심사관의 판단이므로, 코드가 대신 정하지 않고 쟁점만 드러냅니다.
-    preamble = (" · 전제부 대응 미확인(한정 여부 검토 필요)" if chain.preamble_undisclosed else "")
-    if chain.track == "novelty_single":
-        return (f"신규성 검토 후보 (제29조제1항제2호) — 단일 인용발명이 전 구성 개시"
-                f"{preamble} · {NOVELTY_CAVEAT}")
-    if chain.track == "rejection_impossible":
-        return f"거절 이유 구성 곤란 — 대응 기재 없는 구성 잔존{preamble}"
-    count = 1 + len(chain.secondaries)
-    suffix = f" — 인용발명 {count}건 결합" if count > 1 else " — 단일 인용발명"
-    if chain.conventional:
-        # 주지관용 인정이 아니라 별도 입증이 남았다는 표시입니다. 라벨에서 이를 감추지 않습니다.
-        suffix += " + 주지관용 기술(근거 미제시)"
-    return f"진보성 검토 후보 (제29조제2항){suffix}{preamble} · {INVENTIVE_CAVEAT}"
 
 
 def matrix_for(matches: list[ElementMatch]) -> Matrix:

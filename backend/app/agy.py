@@ -28,7 +28,10 @@ class AnalysisCancelled(RuntimeError):
 _job_local = threading.local()
 _job_lock = threading.RLock()
 _cancel_events: dict[str, threading.Event] = {}
-_active_processes: dict[str, subprocess.Popen] = {}
+# 작업 하나가 여러 CLI를 **동시에** 띄웁니다(구성대비 셀 병렬 처리). 프로세스를 하나만
+# 붙들고 있으면 나중에 뜬 것이 앞의 것을 덮어써서, 취소했을 때 살아남은 프로세스가
+# 계속 돌고 사용자는 멈춘 줄 압니다. 작업당 전부 들고 있다가 함께 정리합니다.
+_active_processes: dict[str, set[subprocess.Popen]] = {}
 
 
 def register_job(job_id: str) -> None:
@@ -42,11 +45,16 @@ def bind_job(job_id: str) -> None:
     _job_local.job_id = job_id
 
 
+def current_job() -> str | None:
+    """현재 스레드가 매인 작업. 병렬 워커가 부모 스레드의 작업을 이어받을 때 씁니다."""
+    return getattr(_job_local, "job_id", None)
+
+
 def finish_job(job_id: str) -> None:
     with _job_lock:
         _active_processes.pop(job_id, None)
         _cancel_events.pop(job_id, None)
-    if getattr(_job_local, "job_id", None) == job_id:
+    if current_job() == job_id:
         del _job_local.job_id
 
 
@@ -65,15 +73,16 @@ def raise_if_cancelled(job_id: str | None = None) -> None:
 
 
 def cancel_job(job_id: str) -> bool:
-    """Set the cancellation token and kill the exact CLI process tree, if any."""
+    """Set the cancellation token and kill every CLI process tree the job owns."""
     with _job_lock:
         event = _cancel_events.get(job_id)
-        process = _active_processes.get(job_id)
+        processes = list(_active_processes.get(job_id) or ())
         if event is None:
             return False
         event.set()
-    if process is not None and process.poll() is None:
-        _kill_process_tree(process)
+    for process in processes:
+        if process.poll() is None:
+            _kill_process_tree(process)
     return True
 
 
@@ -128,10 +137,10 @@ def run_cli(prompt: str, expect: str = "claims") -> dict:
                     cwd=sandbox,
                     start_new_session=os.name != "nt",
                 )
-                job_id = getattr(_job_local, "job_id", None)
+                job_id = current_job()
                 if job_id:
                     with _job_lock:
-                        _active_processes[job_id] = process
+                        _active_processes.setdefault(job_id, set()).add(process)
                 raise_if_cancelled(job_id)
                 stdout, stderr = process.communicate(input=stdin_prompt, timeout=AGY_TIMEOUT_SECONDS)
                 result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -144,11 +153,10 @@ def run_cli(prompt: str, expect: str = "claims") -> dict:
             except OSError as exc:
                 raise _launch_error(exc, settings) from exc
             finally:
-                job_id = getattr(_job_local, "job_id", None)
+                job_id = current_job()
                 if job_id and process is not None:
                     with _job_lock:
-                        if _active_processes.get(job_id) is process:
-                            _active_processes.pop(job_id, None)
+                        _active_processes.get(job_id, set()).discard(process)
             if result.returncode != 0:
                 detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
                 last_error = f"exit code {result.returncode}: {detail[-1000:]}"
