@@ -38,6 +38,9 @@ function App() {
   const [logsLoading, setLogsLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  // 선행기술 검색은 종속항 대비와 다른 작업입니다. actionBusy를 같이 쓰면 검색 중에
+  // 종속항 카드의 취소 버튼까지 떠서, 누르면 엉뚱한 취소 경로가 돕니다.
+  const [priorArtBusy, setPriorArtBusy] = useState(false);
   const [stage, setStage] = useState('입력 대기');
   const [message, setMessage] = useState('');
   const [settings, setSettings] = useState<Settings>({
@@ -49,8 +52,10 @@ function App() {
   const activeJob = useRef<string | null>(null);
   const uploadController = useRef<AbortController | null>(null);
   const cancelRequested = useRef(false);
+  const priorArtController = useRef<AbortController | null>(null);
+  const priorArtCancelled = useRef(false);
 
-  const busy = generating || actionBusy;
+  const busy = generating || actionBusy || priorArtBusy;
 
   useEffect(() => {
     refreshHistory();
@@ -369,21 +374,45 @@ function App() {
   };
 
   async function searchPriorArt() {
-    if (!result) return;
-    setActionBusy(true);
+    if (!result || busy) return;
+    const jobId = result.job_id;
+    const controller = new AbortController();
+    priorArtController.current = controller;
+    priorArtCancelled.current = false;
+    setPriorArtBusy(true);
     setMessage('미커버 구성의 선행기술을 검색 중입니다…');
     try {
-      const response = await fetch(`${API}/jobs/${result.job_id}/prior-art`, {method: 'POST'});
+      const response = await fetch(`${API}/jobs/${jobId}/prior-art`,
+        {method: 'POST', signal: controller.signal});
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail);
-      const next = await (await fetch(`${API}/jobs/${result.job_id}/result`)).json();
+      const next = await (await fetch(`${API}/jobs/${jobId}/result`)).json();
       setResult(next);
       setMessage(data.message || `선행기술 ${data.hits.length}건을 찾았습니다.`);
     } catch (error: any) {
+      // 취소 안내는 cancelPriorArt가 이미 띄웠습니다. 중단된 요청을 실패로 덮어쓰지 않습니다.
+      if (priorArtCancelled.current || error?.name === 'AbortError') return;
       setMessage(error.message || '선행기술 검색에 실패했습니다.');
     } finally {
-      setActionBusy(false);
+      priorArtController.current = null;
+      setPriorArtBusy(false);
     }
+  }
+
+  async function cancelPriorArt() {
+    if (!priorArtBusy || !result) return;
+    priorArtCancelled.current = true;
+    setMessage('선행기술 검색을 취소하는 중입니다…');
+    try {
+      // 로컬 abort만 하면 서버는 그대로 CLI를 물고 있습니다. 먼저 서버에 알려 프로세스를
+      // 정리해야 곧바로 다시 검색할 수 있습니다(실행 중이면 서버가 409로 막습니다).
+      await fetch(`${API}/jobs/${result.job_id}/prior-art`, {method: 'DELETE'});
+    } catch {
+      // 서버가 취소를 받지 못해도 아래 abort로 대기는 끝납니다. 취소는 다시 누를 수 있습니다.
+    }
+    priorArtController.current?.abort();
+    setMessage('선행기술 검색을 취소했습니다. 기존 보고서는 그대로입니다.');
+    setPriorArtBusy(false);
   }
 
   async function addDependentClaims() {
@@ -568,7 +597,12 @@ function App() {
             </div>
             {result && (
               <div className="result-actions">
-                <button className="ghost" disabled={busy} onClick={searchPriorArt}>부족한 구성 검색</button>
+                {priorArtBusy && (
+                  <button type="button" className="cancel" onClick={cancelPriorArt}>취소</button>
+                )}
+                <button type="button" className="ghost" disabled={busy} onClick={searchPriorArt}>
+                  {priorArtBusy ? '검색 중…' : '부족한 구성 검색'}
+                </button>
                 <a className="download" href={`${API}/jobs/${result.job_id}/download?format=md`}>내려받기</a>
               </div>
             )}
@@ -622,6 +656,7 @@ function App() {
                   </div>
 
                   {report.conclusion && <p className="claim-conclusion">{report.conclusion}</p>}
+                  {report.coverage_summary && <p className="claim-coverage">{report.coverage_summary}</p>}
 
                   <div className="results">
                     {report.claims.map((claim: any, index: number) => (
@@ -629,8 +664,15 @@ function App() {
                         <div className="claim-head">
                           <span className="badge">{claim.is_preamble ? '전제부'
                             : (claim.label || String.fromCharCode(65 + index))}</span>
-                          <strong>{claim.similarity == null ? '—' : `${claim.similarity}%`}</strong>
+                          {/* 백분율 대신 셀 수 있는 값을 보여 준다. 분자·분모가 그대로 보여야
+                              아래 근거와 대조해 검증할 수 있다. */}
+                          <strong>{claim.total_limitations
+                            ? `한정 ${claim.disclosed_limitations}/${claim.total_limitations}`
+                            : '—'}</strong>
                           <span className="quality">{claim.emoji} {claim.grade || claim.status}</span>
+                          {claim.evidence_locations > 0 && (
+                            <span className="reference-chip">근거 {claim.evidence_locations}곳</span>
+                          )}
                           {claim.adopted_reference && <span className="reference-chip">인용발명 {claim.adopted_reference}</span>}
                           {claim.combination && <span className="reference-chip">결합</span>}
                         </div>

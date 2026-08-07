@@ -360,6 +360,18 @@ def _save_decomposition(job_id: str, decomposition: dict | None) -> None:
     except OSError:
         pass  # 저장 실패로 분석을 멈추지 않습니다. 다음 실행에서 다시 분해합니다.
 
+_prior_art_lock = threading.Lock()
+_prior_art_running: set[str] = set()
+
+def _prior_art_token(job_id: str) -> str:
+    """선행기술 검색용 취소 토큰. 분석 job_id와 네임스페이스를 나눕니다.
+
+    같은 키를 쓰면 검색을 취소했을 때 완료된 보고서의 취소 토큰까지 세워져, 이후
+    같은 job에서 검색을 다시 누를 수 없게 됩니다. 검색은 완료된 보고서 위에서 도는
+    별도 작업이므로 취소 범위도 검색으로만 한정합니다.
+    """
+    return f"{job_id}:prior-art"
+
 @app.post("/api/jobs/{job_id}/prior-art")
 def search_prior_art(job_id: str, payload: dict | None = None):
     """미커버로 남은 구성만 웹에서 검색합니다. 외부 호출이므로 자동 실행하지 않습니다."""
@@ -371,8 +383,33 @@ def search_prior_art(job_id: str, payload: dict | None = None):
     result, claims_text = stored
     targets = uncovered_elements(result, claims_text)
     if not targets: return {"hits": [], "message": "결합 후 미커버로 남은 구성이 없습니다."}
-    hits, warnings = priorart.search(targets)
-    result.prior_art = hits; result.validation += warnings
+
+    token = _prior_art_token(job_id)
+    with _prior_art_lock:
+        if token in _prior_art_running:
+            raise HTTPException(409, "이미 선행기술을 검색하고 있습니다.")
+        _prior_art_running.add(token)
+    agy.register_job(token)
+    # run_cli는 띄운 CLI 프로세스를 current_job()에 달아 둡니다. 이 스레드를 묶어 두지
+    # 않으면 프로세스가 어디에도 등록되지 않아, 취소를 눌러도 죽일 대상을 찾지 못하고
+    # 검색이 타임아웃까지 계속 돕니다.
+    agy.bind_job(token)
+    try:
+        hits = priorart.search(targets)
+    except agy.AnalysisCancelled:
+        write_log(job_id, "prior art search cancelled")
+        raise HTTPException(409, "선행기술 검색을 취소했습니다.")
+    except priorart.SearchFailed as exc:
+        # 취소와 마찬가지로 보고서를 건드리지 않고 끝냅니다. CLI가 답을 못 낸 것은
+        # "0건"이 아니므로, 저장했다면 지난 검색 결과만 지우는 꼴이 됩니다.
+        write_log(job_id, f"prior art search failed: {exc}")
+        raise HTTPException(502, str(exc))
+    finally:
+        agy.finish_job(token)
+        with _prior_art_lock:
+            _prior_art_running.discard(token)
+
+    result.prior_art = hits
     history = HISTORY_DIR / job_id
     if history.exists():
         (history / "result.json").write_text(json.dumps(result.model_dump(), ensure_ascii=False), encoding="utf-8")
@@ -380,7 +417,24 @@ def search_prior_art(job_id: str, payload: dict | None = None):
         (history / "report.txt").write_text(to_markdown(result), encoding="utf-8")
     if job_id in jobs: jobs[job_id]["result"] = result.model_dump()
     write_log(job_id, f"prior art search: {len(hits)} hits for {len(targets)} uncovered elements")
-    return {"hits": [hit.model_dump() for hit in hits], "searched": targets, "warnings": warnings}
+    return {"hits": [hit.model_dump() for hit in hits], "searched": targets}
+
+@app.delete("/api/jobs/{job_id}/prior-art")
+def cancel_prior_art(job_id: str):
+    """진행 중인 선행기술 검색만 멈춥니다.
+
+    보고서 상태는 completed 그대로 둡니다. 검색을 취소했다고 보고서까지 취소 처리하면
+    다시 검색할 수도, 내려받을 수도 없게 됩니다.
+    """
+    job_id = safe_job_id(job_id)
+    token = _prior_art_token(job_id)
+    with _prior_art_lock:
+        running = token in _prior_art_running
+    if not running:
+        return {"job_id": job_id, "running": False, "kill_requested": False}
+    killed = agy.cancel_job(token)
+    write_log(job_id, "prior art cancellation requested")
+    return {"job_id": job_id, "running": True, "kill_requested": killed}
 
 def _load_result(job_id: str) -> tuple[AnalysisResult, str] | None:
     """메모리에 없으면 히스토리에서 결과와 청구항 원문을 되살립니다."""

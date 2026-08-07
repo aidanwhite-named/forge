@@ -6,7 +6,7 @@ CLI가 외부 웹에 나가는 단계이므로, 사용자가 명시적으로 눌
 import json
 import re
 
-from .agy import run_cli
+from .agy import AnalysisCancelled, run_cli
 from .models import PriorArtHit
 
 PRIOR_ART_PROMPT = """[역할]
@@ -28,14 +28,27 @@ PRIOR_ART_PROMPT = """[역할]
 """
 
 
-def search(uncovered: list[dict]) -> tuple[list[PriorArtHit], list[str]]:
+class SearchFailed(RuntimeError):
+    """CLI가 답을 내지 못했습니다.
+
+    "찾지 못했습니다(0건)"와 반드시 구분해야 합니다. 실패를 빈 결과로 돌려주면
+    호출부가 그것을 검색 결과로 받아들여, 지난 검색에서 찾아 둔 선행기술을 빈 목록으로
+    덮어쓰고 보고서에 저장해 버립니다.
+    """
+
+
+def search(uncovered: list[dict]) -> list[PriorArtHit]:
     """uncovered는 [{"label": "B", "text": "구성 원문"}] 형태입니다."""
     if not uncovered:
-        return [], []
+        return []
     try:
         raw = run_cli(PRIOR_ART_PROMPT + json.dumps(uncovered, ensure_ascii=False), expect="hits")
+    except AnalysisCancelled:
+        # AnalysisCancelled도 RuntimeError를 상속합니다. 아래에서 함께 잡으면 취소가
+        # 검색 실패로 둔갑하므로, 먼저 걸러 그대로 올립니다.
+        raise
     except RuntimeError as exc:
-        return [], [f"선행기술 검색에 실패했습니다: {exc}"]
+        raise SearchFailed(f"선행기술 검색에 실패했습니다: {exc}") from exc
     hits: list[PriorArtHit] = []
     for item in raw.get("hits") or []:
         if not isinstance(item, dict):
@@ -59,7 +72,7 @@ def search(uncovered: list[dict]) -> tuple[list[PriorArtHit], list[str]]:
             remaining_difference=_clean(item.get("remaining_difference")),
             url=_url(item.get("url")),
         ))
-    return hits, []
+    return hits
 
 
 def _clean(value) -> str:

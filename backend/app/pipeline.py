@@ -19,6 +19,7 @@ from .chain import build_chain, matrix_for
 from .claims import ancestry, assign_importance, input_quality_warnings, parse_claims
 from .compare import DEPENDENT_DOCUMENT_BUDGET_CHARS, compare_claims_documents, compare_document
 from .config import COMPARE_MAX_WORKERS, load_runtime_settings
+from .consistency import enforce_antecedents
 from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
 from .report import build_claim_report, build_mappings, refresh_mappings
 from .verify import verify_matches
@@ -45,6 +46,9 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     chains: dict[int, ChainInfo] = {}
     for claim in _processing_order(claims):
         claim_matrix = _claim_matrix(matches, documents, claim.number)
+        # 셀은 서로 독립적으로 판정되므로, 청구항 전체로 보면 성립할 수 없는 조합이 남습니다.
+        # 선정에 들어가기 전에 문헌 안에서의 지시 관계 모순만 정리합니다.
+        verify_notes += enforce_antecedents(claim, claim_matrix)
         chains[claim.number] = build_chain(claim, claim_matrix, chains, claims)
 
     ordered_chains = [chains[claim.number] for claim in claims]
@@ -116,6 +120,7 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
         if claim.depends_on is not None and claim.depends_on not in chains:
             continue
         claim_matrix = _claim_matrix(matches, documents, claim.number)
+        existing.verify_notes += enforce_antecedents(claim, claim_matrix)
         new_matrices[claim.number] = claim_matrix
         chains[claim.number] = build_chain(claim, claim_matrix, chains, all_claims)
         added.append(claim)
@@ -365,7 +370,10 @@ def summarize_matrix(result: AnalysisResult) -> dict:
                 # chain에는 구성별 전 문헌 대응(element_coverage)이 들어 있습니다.
                 "chain": report.chain.model_dump(),
                 "elements": [
-                    {"label": item.label, "similarity": item.similarity, "grade": item.grade,
+                    {"label": item.label, "grade": item.grade, "corresponded": item.corresponded,
+                     "disclosed_limitations": item.disclosed_limitations,
+                     "total_limitations": item.total_limitations,
+                     "evidence_locations": item.evidence_locations,
                      "status": item.status, "difference": item.difference,
                      "combination": item.combination,
                      "adopted_document": item.adopted_document,

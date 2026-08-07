@@ -3,14 +3,15 @@
 LLM이 쓴 마크다운을 정규식으로 되돌려 고치는 코드가 필요 없어지는 대신,
 표현은 템플릿이 허용하는 범위로 제한됩니다. 판정 근거의 재현성을 우선한 선택입니다.
 
-구성 하나는 "유사도 한 줄 + 구성대비 한 문장 + (있으면) 차이점 한 줄"로 나갑니다.
+구성 하나는 "정량 지표 한 줄 + 구성대비 한 문장 + (있으면) 차이점 한 줄"로 나갑니다.
 같은 내용을 서술·역할·잔여차이로 나눠 세 번 반복하던 종전 구조는 읽는 사람이 매번
 같은 문장을 다시 읽게 만들 뿐, 새로 알려 주는 것이 없어 걷어냈습니다.
 """
 import re
 
 from .chain import chain_documents
-from .coverage import best_match, report_grade, report_similarity
+from .coverage import (JUDGMENT_RANK, best_match, evidence_locations, limitation_counts,
+                       report_grade)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
                      DocumentMapping, ElementCoverage, ElementMatch, Evidence)
 
@@ -91,7 +92,8 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         chain=chain,
         claims=results,
         conclusion=_conclusion(claim, chain, merged),
-        summary_similarity=_summary_similarity(results, mappings),
+        coverage_summary=_coverage_summary(results),
+        summary_similarity=_summary_similarity(claim, results, mappings),
         summary_difference=_summary_difference(chain, results),
     )
 
@@ -113,16 +115,20 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         )
 
     primary = matrix.get(chain.primary or "", {}).get(label)
-    similarity = report_similarity(match)
+    corresponded = _corresponded(match)
     grade, emoji = report_grade(match)
     evidence = _collect_evidence(label, chain, matrix, documents, mappings)
-    combined = bool(similarity is not None and match and chain.primary
+    combined = bool(corresponded and match and chain.primary
                     and match.document_id != chain.primary and _usable(primary))
+    disclosed, total = limitation_counts(match)
     return ClaimResult(
         label=label,
         is_preamble=is_preamble,
         claim=text,                      # 구성 원문은 입력을 그대로 씁니다. 모델이 고쳐 쓴 문장을 쓰지 않습니다.
-        similarity=similarity,
+        corresponded=corresponded,
+        disclosed_limitations=disclosed,
+        total_limitations=total,
+        evidence_locations=evidence_locations(match) if corresponded else 0,
         grade=grade,
         emoji=emoji,
         narrative=_narrative(label, text, match, primary, combined, mappings, documents,
@@ -131,10 +137,19 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         combination=combined,
         evidence=evidence,
         status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
-        adopted_document=match.document_id if similarity is not None and match else "",
+        adopted_document=match.document_id if corresponded and match else "",
         adopted_reference=(_reference_number(match.document_id, mappings)
-                           if similarity is not None and match else None),
+                           if corresponded and match else None),
     )
+
+
+def _corresponded(match: ElementMatch | None) -> bool:
+    """보고서가 "대응된 구성"으로 다루는지. 등급표에 오르는 판정만 해당합니다.
+
+    종전에는 `report_similarity(match) is not None`이 이 역할을 겸했습니다. 유사도 숫자를
+    없애면서, 그 숫자의 유무에 기대던 판단을 이름 있는 조건으로 드러냅니다.
+    """
+    return match is not None and match.judgment in _STATUS
 
 
 # --- 구성대비 서술 -------------------------------------------------------------
@@ -149,7 +164,7 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
     그것을 감추면 심사관이 이미 확인된 문단을 처음부터 다시 찾게 되고, 어디까지 검토된
     상태인지도 알 수 없게 됩니다.
     """
-    if report_similarity(match) is None or match is None:
+    if not _corresponded(match) or match is None:
         line = f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
         return f"{line}\n(가장 가까운 기재: {related} — 청구항 한정 전체를 개시하는 근거는 아님)" if related else line
     passage = _passage(match, mappings, documents)
@@ -159,7 +174,22 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
                 f"기재는 없고, {passage}는 구성이 기재되어 있어 이를 결합하면 "
                 f'청구항의 "{_clip(text)}" 구성과 대응됩니다.')
     return (f"{passage}는 구성이 기재되어 있으며, {_reason_clause(match.reason)} "
-            f'청구항의 "{_clip(text)}" 구성과 대응됩니다.')
+            f'청구항의 "{_clip(text)}" 구성과 {_correspondence_verb(match)}.')
+
+
+# 판정 라벨이 부분 대응이면 문장도 부분 대응이라고 끝나야 합니다.
+_FULL_CORRESPONDENCE = {"동일", "실질적 동일"}
+
+
+def _correspondence_verb(match: ElementMatch) -> str:
+    """대응의 정도를 문장 끝에 반영합니다.
+
+    모두 "대응됩니다"로 끝내면, 모델이 이유에 "…부분은 개시되어 있지 않다"고 적은 경우
+    "…개시되어 있지 않으므로 청구항의 '…' 구성과 대응됩니다"라는 자기모순 문장이 나갑니다.
+    등급은 '일부 유사'인데 문장만 완전 대응으로 읽히므로, 표를 보지 않는 사람은 그 구성이
+    개시된 것으로 인용하게 됩니다.
+    """
+    return "대응됩니다" if match.judgment in _FULL_CORRESPONDENCE else "부분적으로 대응됩니다"
 
 
 def _passage(match: ElementMatch, mappings: list[DocumentMapping],
@@ -208,8 +238,12 @@ def _reason_clause(reason: str) -> str:
 
 def _difference(match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
                 mappings: list[DocumentMapping], documents: dict[str, Document]) -> str | None:
-    if match is None or report_similarity(match) is None:
+    if match is None or not _corresponded(match):
         return None
+    # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 이 경우 하위 한정은 전부 개시로
+    # 남아 있어(예: 2/2) 집계와 등급이 어긋나 보이는데, 그 어긋남을 설명하는 것이 이 줄입니다.
+    if match.antecedent_note:
+        return match.antecedent_note
     if combined and primary is not None:
         gap = "; ".join(primary.missing_limitations[:2]) or "세부 구성"
         return (f"{_reference_name(primary.document_id, mappings)}은 {gap}에 대한 기재가 없으나 "
@@ -226,20 +260,40 @@ def _closest_related(label: str, matrix: dict[str, dict[str, ElementMatch]],
                      mappings: list[DocumentMapping], documents: dict[str, Document]) -> str:
     """미대응 구성에 대해 원문 대조를 통과한 가장 가까운 기재 하나를 고릅니다.
 
-    문헌 순서가 아니라 인용발명 번호 순으로 훑어, 같은 판정 자료에서는 항상 같은 문장이
-    선택되게 합니다.
+    **대표 발췌를 먼저 봅니다.** 종전에는 보조 발췌(evidence)만 훑었는데, 대표 발췌만 있고
+    보조 발췌가 없는 셀은 통째로 건너뛰어졌습니다. 그 셀이 바로 그 구성을 가장 잘 개시한
+    문헌인 경우가 있습니다 — 지시 관계 상한이나 결합 한도로 채택에서 빠진 문헌이 그렇습니다.
+    그러면 보고서에는 아무 관련 없는 문헌의 총론 문장이 "가장 가까운 기재"로 남고, 정작
+    확인된 원문은 사라집니다.
+
+    문헌 선택은 판정 강도 순입니다. 인용발명 번호 순으로 첫 번째를 집으면 그 구성과 무관한
+    문헌이 번호만 빠르다는 이유로 뽑힙니다. 동률이면 번호 순이라 결과는 항상 같습니다.
+
+    강도는 **강등되기 전** 판정으로 잽니다. 지시 관계 상한이나 발췌 검증으로 내려간 값으로
+    재면, 원래 그 구성을 가장 잘 개시했던 문헌과 총론 한 줄만 걸린 문헌이 같은 등급으로
+    납작해져 번호 순서가 승부를 가릅니다. "가장 가까운 기재"는 말 그대로 어디까지 근접했는지를
+    묻는 자리이므로 근접했던 정도를 그대로 씁니다.
     """
-    for mapping in mappings:
+    candidates: list[tuple] = []
+    for order, mapping in enumerate(mappings):
         match = matrix.get(mapping.document_id, {}).get(label)
         if match is None:
             continue
-        for span in match.evidence:
-            if span.verify != "verified" or not span.quote:
+        spans = [(match.chunk_id, match.quote, match.quote_translation, match.verify)]
+        spans += [(span.chunk_id, span.quote, span.quote_translation, span.verify)
+                  for span in match.evidence]
+        for chunk_id, quote, translation, verify in spans:
+            if verify != "verified" or not quote:
                 continue
-            shown = _clip(span.quote_translation or span.quote, EXCERPT_LIMIT)
-            location = _chunk_location(mapping.document_id, span.chunk_id, documents)
-            return f'{_reference_name(mapping.document_id, mappings)} "{shown}" ({location})'
-    return ""
+            strength = JUDGMENT_RANK.get(match.downgraded_from or match.judgment, 0)
+            candidates.append((strength, -order, mapping.document_id, chunk_id,
+                               translation or quote))
+            break
+    if not candidates:
+        return ""
+    _, _, document_id, chunk_id, quote = max(candidates)
+    location = _chunk_location(document_id, chunk_id, documents)
+    return f'{_reference_name(document_id, mappings)} "{_clip(quote, EXCERPT_LIMIT)}" ({location})'
 
 
 def _chunk_location(document_id: str, chunk_id: str, documents: dict[str, Document]) -> str:
@@ -388,19 +442,126 @@ def _equivalence_caveat(claim: Claim, chain: ChainInfo,
 
 # --- 종합 분석 요약 -----------------------------------------------------------
 
-def _summary_similarity(results: list[ClaimResult], mappings: list[DocumentMapping]) -> str:
-    """출원발명과 인용발명들의 공통된 기술 내용을 한 줄로 정리합니다."""
+def _summary_similarity(claim: Claim, results: list[ClaimResult],
+                        mappings: list[DocumentMapping]) -> str:
+    """청구항과 인용발명이 공유하는 내용을 한 줄로 요약합니다.
+
+    종전에는 구성 원문 세 개를 " 및 "로 이어 붙였습니다. 구성 문언은 "…하는 단계 및",
+    "…를 포함하되"처럼 다음 구성으로 이어지는 어미로 끝나는 일이 많아, 그대로 이으면
+    "…단계 및에 관한 기술적 목적과"처럼 문장이 깨집니다. 무엇보다 그것은 요약이 아니라
+    구성 목록이라, 이미 위에 구성별로 전부 적혀 있는 내용을 다시 읽히는 것뿐이었습니다.
+
+    요약은 **무엇이 공통인가**(가장 중요한 대응 구성 하나)와 **어디까지 공통인가**(대응 범위)
+    두 가지로 만듭니다. 둘 다 확정된 판정 데이터에서 나오므로 LLM을 다시 부르지 않습니다.
+    """
     if any(result.status == "판정 불가" for result in results):
         return "구성대비 판정을 받지 못해 유사 내용을 요약할 수 없습니다."
-    corresponded = [result for result in results if result.similarity is not None]
+    substantive = [result for result in results if not result.is_preamble]
+    corresponded = [result for result in substantive if result.corresponded]
     if not corresponded:
         return "청구항과 인용발명 사이에 대응되는 기술 내용이 확인되지 않았습니다."
     numbers = sorted({result.adopted_reference for result in corresponded
                       if result.adopted_reference is not None})
     references = ", ".join(f"인용발명 {number}" for number in numbers) or "제시된 인용발명"
-    disclosed = [result for result in corresponded if result.status == "개시됨"] or corresponded
-    common = _clip(" 및 ".join(dict.fromkeys(_clip(result.claim, 60) for result in disclosed[:3])), 200)
-    return f"청구항과 {references}는 {common}에 관한 기술적 목적과 핵심 메커니즘이 공통됩니다."
+    representative = _representative(claim, corresponded)
+    common = _summary_phrase(representative.claim)
+    # 부분 개시 구성을 "모두 …에서 공통된다"고 적으면, 정작 개시되지 않은 한정을 공통점으로
+    # 단언하게 됩니다. 실제로 "제1·제2 반사부재 **사이에** 배치되는 광원"이 그 배치 관계는
+    # 개시되지 않은 채 '일부 유사'를 받았는데, 요약은 그 문언 그대로를 공통점으로 적었습니다.
+    partial = representative.status != "개시됨"
+    ground = "구성에서 부분적으로 공통되며" if partial else "구성에서 공통되며"
+    # 구성 문언을 따옴표로 묶습니다. 긴 구성은 잘릴 수밖에 없는데, 묶지 않으면 어디까지가
+    # 청구항 문언이고 어디부터가 요약자의 말인지 구별되지 않고 생략 부호도 어색하게 붙습니다.
+    return (f"청구항과 {references}{_topic_particle(references)} \"{common}\" "
+            f"{ground}, {_scope(substantive, corresponded)}.")
+
+
+def _representative(claim: Claim, corresponded: list[ClaimResult]) -> ClaimResult:
+    """유사점을 대표할 구성 하나. 완전 개시를 먼저 보고, 그 안에서 중요도 순입니다.
+
+    여러 구성을 나열하면 요약이 아니라 목록이 됩니다. 어느 구성이 이 청구항의 변별점인지는
+    분해 단계가 매긴 중요도가 이미 말해 주므로 그것을 그대로 씁니다.
+
+    완전 개시를 앞세우는 이유: 부분 개시 구성의 문언에는 **개시되지 않은 한정까지** 들어
+    있어서, 그것을 공통점 문장에 그대로 넣으면 없는 개시를 단언하게 됩니다. 완전 개시가
+    하나도 없을 때만 부분 개시를 쓰고, 그때는 문장도 "부분적으로 공통"으로 바뀝니다.
+    """
+    importance = {element.label: element.importance for element in claim.elements}
+    order = {result.label: index for index, result in enumerate(corresponded)}
+    return max(corresponded, key=lambda result: (result.status == "개시됨",
+                                                 importance.get(result.label, 0),
+                                                 -order[result.label]))
+
+
+def _scope(substantive: list[ClaimResult], corresponded: list[ClaimResult]) -> str:
+    """대응 범위 한 마디. 몇 개 중 몇 개가, 어느 강도로 대응되는지."""
+    total, matched = len(substantive), len(corresponded)
+    partial = sum(1 for result in corresponded if result.status == "부분 개시")
+    scope = (f"청구항의 구성 {total}개 전부에 대응 기재가 확인됩니다" if matched == total
+             else f"청구항의 구성 {total}개 중 {matched}개에 대응 기재가 확인됩니다")
+    return f"{scope}(그중 {partial}개는 부분 개시)" if partial else scope
+
+
+# 구성 문언의 꼬리를 "… 구성에서 공통되며"에 이어 붙일 수 있는 관형형으로 바꿉니다.
+# 청구항 구성은 다음 구성으로 이어지는 어미로 끝나는 일이 많아, 그대로 두면 요약 문장이
+# 연결어미 자리에서 끊깁니다.
+_PHRASE_ENDINGS = (
+    ("되고", "되는"), ("되며", "되는"), ("되어", "되는"), ("된다", "되는"), ("됨", "되는"),
+    ("하고", "하는"), ("하며", "하는"), ("하여", "하는"), ("한다", "하는"), ("함", "하는"),
+    ("이고", "인"), ("이며", "인"), ("이다", "인"),
+)
+# 관형형 뒤에 붙는 형식 명사. 떼어 내야 "…하는 구성에서"로 이어집니다.
+_PHRASE_TAIL_NOUNS = re.compile(r"\s*(?:단계|과정|방법|장치|시스템|것)\s*$")
+
+
+def _summary_phrase(text: str, limit: int = 80) -> str:
+    """구성 문언을 요약 문장 안에 넣을 수 있는 형태로 다듬습니다.
+
+    앞뒤의 "상기"(앞 구성을 가리키는 지시어라 요약문에서는 가리킬 대상이 없습니다), 다음
+    구성으로 이어지는 꼬리("… 및", "…를 포함하되"), 관형형 뒤의 형식 명사를 떼어 내고
+    연결어미를 관형형으로 되돌립니다.
+    """
+    phrase = re.sub(r"\s+", " ", str(text or "")).strip()
+    phrase = re.sub(r"상기\s*", "", phrase)
+    phrase = re.sub(r"(?:을|를)?\s*포함하(?:되|고|며|는|여)\s*$", "", phrase.strip(" ,.;·"))
+    phrase = re.sub(r"[,\s]*(?:및|또는)\s*$", "", phrase.strip(" ,.;·")).strip(" ,.;·")
+    phrase = _PHRASE_TAIL_NOUNS.sub("", phrase).strip(" ,.;·")
+    for ending, adnominal in _PHRASE_ENDINGS:
+        if phrase.endswith(ending):
+            phrase = phrase[: -len(ending)] + adnominal
+            break
+    return _clip_words(phrase.strip(" ,.;·"), limit)
+
+
+def _clip_words(text: str, limit: int) -> str:
+    """낱말 경계에서 자릅니다. 글자 수로 끊으면 요약문이 낱말 한가운데서 끊깁니다."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    boundary = head.rfind(" ")
+    return (head[:boundary] if boundary > limit // 2 else head).rstrip(" ,.;·") + "…"
+
+
+# 숫자를 한국어로 읽었을 때 받침이 있는지. 조사 은/는 선택에만 씁니다.
+_DIGIT_HAS_FINAL = {"0": True, "1": True, "3": True, "6": True, "7": True, "8": True,
+                    "2": False, "4": False, "5": False, "9": False}
+
+
+def _topic_particle(word: str) -> str:
+    """앞 낱말의 받침에 따라 "은"/"는"을 고릅니다.
+
+    인용발명 번호가 그대로 조사 앞에 오므로("인용발명 1", "인용발명 2") 한쪽으로 고정하면
+    보고서마다 어느 한쪽이 반드시 틀립니다.
+    """
+    text = str(word or "").strip()
+    if not text:
+        return "은"
+    last = text[-1]
+    if last.isdigit():
+        return "은" if _DIGIT_HAS_FINAL[last] else "는"
+    if "가" <= last <= "힣":
+        return "은" if (ord(last) - 0xAC00) % 28 else "는"
+    return "은"
 
 
 def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
@@ -408,7 +569,7 @@ def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
     if chain.track == "analysis_incomplete":
         return "구성대비가 완료되지 않아 차이점을 특정할 수 없습니다."
     uncovered = [result.label for result in results
-                 if result.similarity is None and not result.is_preamble]
+                 if not result.corresponded and not result.is_preamble]
     if uncovered:
         return (f"구성 {', '.join(uncovered)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
                 "추가 검색이 필요합니다.")
@@ -472,13 +633,15 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
         lines += [f"**인용발명 조합**: {_chain_text(report.chain, mappings)}", ""]
     if report.conclusion:
         lines += [f"**결론**: {report.conclusion}", ""]
+    if report.coverage_summary:
+        lines += [f"**구성 집계**: {report.coverage_summary}", ""]
     if report.preamble:
         lines += [f"> {report.preamble}", ""]
     for item in report.claims:
         heading = "전제부" if item.is_preamble else item.label
         lines += ["", f"### ({heading}) {item.claim}", ""]
-        if item.similarity is not None:
-            lines.append(f"유사도: {item.similarity}% {item.emoji} {item.grade}")
+        if item.corresponded:
+            lines.append(_metric_line(item))
         lines.append(item.narrative.replace("\n", "  \n"))
         if item.difference:
             lines.append(f"→ 차이점: {item.difference}")
@@ -489,6 +652,39 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
     if report.summary_difference:
         lines.append(f"- 차이점: {report.summary_difference}")
     return lines
+
+
+def _metric_line(item: ClaimResult) -> str:
+    """구성 한 줄의 정량 지표. 백분율 대신 셀 수 있는 값만 적습니다.
+
+    분자·분모가 그대로 보이므로 독자가 바로 아래 근거 목록과 대조해 검증할 수 있습니다.
+    한정 분해가 되지 않은 구성(총 0개)에는 커버율을 적지 않습니다 — 없는 분모를 지어내면
+    "0/0 개시"처럼 읽혀 미개시로 오해됩니다.
+    """
+    parts = []
+    if item.total_limitations:
+        parts.append(f"한정 {item.disclosed_limitations}/{item.total_limitations} 개시")
+    parts.append(f"{item.emoji} {item.grade}")
+    if item.evidence_locations:
+        parts.append(f"근거 {item.evidence_locations}곳")
+    return " · ".join(parts)
+
+
+def _coverage_summary(results: list[ClaimResult]) -> str:
+    """이 청구항의 구성이 어떻게 갈렸는지 한 줄.
+
+    결론(신규성·진보성·거절 곤란)을 실제로 정하는 것은 구성별 등급이 아니라 이 집계입니다.
+    구성별 숫자만 늘어놓으면 읽는 사람이 표를 되짚어 직접 세게 됩니다.
+    """
+    substantive = [result for result in results if not result.is_preamble]
+    if not substantive:
+        return ""
+    if any(result.status == "판정 불가" for result in substantive):
+        return f"구성 {len(substantive)}개 — 판정을 받지 못해 집계하지 않았습니다"
+    full = sum(1 for result in substantive if result.status == "개시됨")
+    partial = sum(1 for result in substantive if result.status == "부분 개시")
+    uncovered = len(substantive) - full - partial
+    return (f"구성 {len(substantive)}개 — 완전개시 {full} · 부분개시 {partial} · 미대응 {uncovered}")
 
 
 def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
@@ -505,8 +701,22 @@ def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
     for proof in proofs:
         kind = f"{proof.kind} · " if proof.kind else ""
         lines.append(f"- ({kind}{_clip(proof.limitation, 80)}) "
-                     f'"{_clip(proof.excerpt, EXCERPT_LIMIT)}" ({_evidence_location(proof)})')
+                     f'"{_clip(proof.excerpt, EXCERPT_LIMIT)}" ({_evidence_source(proof)})')
     return lines
+
+
+def _evidence_source(evidence: Evidence) -> str:
+    """근거 한 줄의 출처. 인용발명 번호를 위치와 함께 반드시 적습니다.
+
+    구성 하나의 근거 목록에는 결합에 쓰인 **여러 문헌**의 발췌가 함께 들어갑니다. 번호가 없으면
+    바로 위 구성대비 문장이 지목한 문헌 하나가 목록 전체의 출처인 것처럼 읽히는데, 실제로는
+    다른 인용발명의 문장이 섞여 있습니다. 그대로 인용하면 어느 문헌에 없는 기재를 그 문헌의
+    개시로 적게 되고, 그것이 곧 거절 이유의 근거로 나갑니다.
+    """
+    location = _evidence_location(evidence)
+    if evidence.reference_number is None:
+        return location
+    return f"인용발명 {evidence.reference_number} · {location}"
 
 
 def _evidence_location(evidence: Evidence) -> str:

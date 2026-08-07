@@ -4,12 +4,12 @@ import json
 import pytest
 
 from app import agy, cache, claims as claims_module, compare, pipeline, priorart
-from app.models import (ChainInfo, Chunk, ClaimResult, Document, DocumentMapping,
-                        ElementMatch, EvidenceSpan)
+from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimResult, Document,
+                        DocumentMapping, ElementMatch, EvidenceSpan)
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
 from app.report import to_markdown
 from app.report import (_closest_related, _difference, _narrative, _reason_clause,
-                        _summary_difference, refresh_mappings)
+                        _summary_difference, _summary_similarity, refresh_mappings)
 
 CLAIMS = "전자장치에 있어서, (A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러; (B) 상태 변경 시 알림을 전송하는 통신부"
 QUOTE_A = "메모리 컨트롤러는 데이터 쓰기 요청을 큐에 저장한 후 순차적으로 처리한다."
@@ -87,8 +87,9 @@ def test_pipeline_combines_two_documents_and_calls_the_cli_once_per_cell(stub_cl
     assert report.track == "inventive_step_combination"
     assert report.chain.primary == "1" and report.chain.secondaries == ["2"]
     assert [item.label for item in report.claims] == ["P0", "A", "B"]
-    assert element(report, "A").similarity == 94 and element(report, "A").emoji == "🟢"
-    assert element(report, "B").similarity == 99                # 보조 문헌의 동일 판정이 채택됨
+    assert element(report, "A").emoji == "🟢" and element(report, "A").corresponded
+    assert element(report, "A").disclosed_limitations == 1 and element(report, "A").total_limitations == 1
+    assert element(report, "B").grade == "동일"                 # 보조 문헌의 동일 판정이 채택됨
 
 
 def test_an_undisclosed_preamble_is_reported_without_deciding_the_conclusion(stub_cli):
@@ -103,7 +104,7 @@ def test_an_undisclosed_preamble_is_reported_without_deciding_the_conclusion(stu
     assert report.chain.preamble_undisclosed == ["P0"]
     assert report.track == "inventive_step_combination"          # 결론을 막지는 않는다
     assert element(report, "P0").is_preamble is True
-    assert element(report, "P0").similarity is None
+    assert element(report, "P0").corresponded is False
     assert "추가 검색 필요" in element(report, "P0").narrative
 
 
@@ -140,17 +141,29 @@ def test_narrative_is_one_sentence_with_excerpt_location_and_reason():
         {"1": document},
     )
 
+    # '일부 차이'는 부분 대응이므로 문장도 부분 대응으로 끝난다. 전부 "대응됩니다"로 끝내면
+    # 모델이 이유에 "…부분은 개시되어 있지 않다"고 적은 경우 "…개시되어 있지 않으므로 …
+    # 대응됩니다"라는 자기모순 문장이 그대로 보고서에 나간다.
     assert narrative == (
         '인용발명 1 (US 2023/0362144 A1)에는 "에지 장치는 콘텐츠 도착 전에 가상 암호화 세션을 개시한다." '
         '(단락 [0037])("The edge device initiates a virtual encryption session before content arrives.")'
         '는 구성이 기재되어 있으며, 콘텐츠와 분리된 세션을 미리 만들어 두고 있으므로 '
-        '청구항의 "가상 세션을 생성하고 세션 토큰을 발급함" 구성과 대응됩니다.'
+        '청구항의 "가상 세션을 생성하고 세션 토큰을 발급함" 구성과 부분적으로 대응됩니다.'
     )
     assert "\n" not in narrative
 
+    full = _narrative(
+        "D", "가상 세션을 생성하고 세션 토큰을 발급함",
+        match.model_copy(update={"judgment": "실질적 동일"}), match, False,
+        [DocumentMapping(reference_number=1, filename="prior.pdf",
+                         document_id="1", document_number="US 2023/0362144 A1")],
+        {"1": document},
+    )
+    assert full.endswith('구성과 대응됩니다.')
+
 
 def test_an_element_with_no_correspondence_is_flagged_for_further_search():
-    """대응 문헌이 없으면 유사도를 붙이지 않고 추가 검색 대상으로 표시한다."""
+    """대응 문헌이 없으면 정량 지표를 붙이지 않고 추가 검색 대상으로 표시한다."""
     match = ElementMatch(claim_number=1, label="B", document_id="1", judgment="대응 없음",
                          directness="absent")
     narrative = _narrative("B", "유효 수요 지표를 산출함", match, match, False, [], {})
@@ -193,8 +206,8 @@ def test_hallucinated_quote_is_downgraded_before_selection(monkeypatch, stub_cli
     result = pipeline.analyze("job", CLAIMS, DOCUMENTS)
     item = element(result.reports[0], "A")
     # 검증에 실패한 발췌는 '차이' 이하로 내려가고, '차이'는 대응 구간(80% 이상)에 들지 못한다.
-    # 지어낸 문장 위에 유사도 퍼센트를 얹지 않는 것이 이 게이트의 목적이다.
-    assert item.similarity is None and item.status == "미개시"
+    # 지어낸 문장 위에 정량 지표를 얹지 않는 것이 이 게이트의 목적이다.
+    assert item.corresponded is False and item.status == "미개시"
     assert "추가 검색 필요" in item.narrative
     assert any("→" in note or "낮췄" in note for note in result.verify_notes)
     monkeypatch.setitem(RESPONSES, "1", RESPONSES["1"])
@@ -355,7 +368,7 @@ def test_a_failed_batch_call_falls_back_to_per_cell_comparison(monkeypatch, stub
     report = result.reports[1]
     assert calls == ["elements", "matches", "matches", "matches"]  # 일괄 1회 실패 + 셀 2회
     assert report.track != "analysis_incomplete"
-    assert report.claims[0].similarity == 99
+    assert report.claims[0].grade == "동일" and report.claims[0].corresponded
 
 
 def test_changing_the_guideline_invalidates_the_cache(stub_cli):
@@ -371,7 +384,7 @@ def test_markdown_carries_only_the_comparison_itself(stub_cli):
     assert "| 인용발명 1 | 10-2020-0001 | 1.pdf | - | 주 인용발명 |" in markdown
     assert "**인용발명 조합**: 인용발명 1 (10-2020-0001) + 인용발명 2 (10-2020-0002)" in markdown
     assert "### (A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러" in markdown
-    assert "유사도: 94% 🟢 실질적 동일" in markdown
+    assert "한정 1/1 개시 · 🟢 실질적 동일" in markdown
     assert "단락 [0021]" in markdown
     for noise in ("판정 대표값", "검토 트랙", "결합 후 구성대비 지표", "주지관용",
                   "결합에 채택하지 않은 대응", "주 인용발명 개시:", "결합 후 남는 차이:",
@@ -380,7 +393,7 @@ def test_markdown_carries_only_the_comparison_itself(stub_cli):
 
 
 def test_the_report_states_which_rejection_the_claim_faces(stub_cli):
-    """구성별 유사도만 늘어놓고 결론을 적지 않으면 읽는 사람이 표에서 결론을 추정하게 된다."""
+    """구성별 등급만 늘어놓고 결론을 적지 않으면 읽는 사람이 표에서 결론을 추정하게 된다."""
     result = pipeline.analyze("job", CLAIMS, DOCUMENTS)
 
     assert result.reports[0].conclusion.startswith("진보성 검토 (인용발명 결합) — ")
@@ -448,25 +461,36 @@ def test_each_limitation_keeps_the_sentence_that_proved_it(monkeypatch):
     markdown = to_markdown(result)
 
     assert "근거:" in markdown
-    assert f'- (core · 쓰기 요청을 큐에 저장함) "{QUOTE_A}" (단락 [0021])' in markdown
-    assert f'- (qualifier · 저장된 요청을 순차적으로 처리함) "{QUOTE_A}" (단락 [0021])' in markdown
+    # 근거 줄에는 출처 인용발명 번호가 반드시 함께 붙는다. 구성 하나의 근거 목록에는 결합된
+    # 여러 문헌의 발췌가 섞이므로, 번호가 없으면 바로 위 구성대비 문장이 지목한 문헌이
+    # 목록 전체의 출처인 것처럼 읽힌다.
+    assert f'- (core · 쓰기 요청을 큐에 저장함) "{QUOTE_A}" (인용발명 1 · 단락 [0021])' in markdown
+    assert (f'- (qualifier · 저장된 요청을 순차적으로 처리함) "{QUOTE_A}" '
+            "(인용발명 1 · 단락 [0021])") in markdown
     # 구성 원문 한 줄을 통째로 점검한 셀은 한정별 근거가 아니므로 반복해 적지 않는다.
     assert markdown.count("근거:") == 1
 
 
 def test_summary_states_the_common_ground_and_the_sharpest_difference(stub_cli):
     report = pipeline.analyze("job", CLAIMS, DOCUMENTS).reports[0]
-    assert report.summary_similarity.startswith("청구항과 인용발명 1, 인용발명 2는 ")
-    assert report.summary_similarity.endswith("기술적 목적과 핵심 메커니즘이 공통됩니다.")
-    assert "\n" not in report.summary_similarity
+    summary = report.summary_similarity
+    assert summary.startswith("청구항과 인용발명 1, 인용발명 2는 ")
+    assert "\n" not in summary
+    # 유사점은 한 줄 요약이다. 구성 원문을 이어 붙이면 "…단계 및에 관한"처럼 연결어미에서
+    # 문장이 끊기고, 이미 위에 구성별로 적힌 내용을 다시 나열하는 것에 그친다.
+    assert " 및에" not in summary and " 및 " not in summary
+    assert summary.count("구성에서 공통되며") == 1
+    # 무엇이 공통인지(가장 중요한 대응 구성)와 어디까지 공통인지(대응 범위)를 함께 적는다.
+    assert "쓰기 요청을 큐에 저장하는" in summary
+    assert "청구항의 구성 2개 전부에 대응 기재가 확인됩니다" in summary
     assert element(report, "B").adopted_reference == 2
 
 
 def test_a_gap_that_no_document_fills_is_named_in_the_summary_difference():
     results = [
-        ClaimResult(label="A", claim="재생 요청을 수신함", similarity=94, status="개시됨",
+        ClaimResult(label="A", claim="재생 요청을 수신함", corresponded=True, status="개시됨",
                     adopted_reference=1),
-        ClaimResult(label="B", claim="유효 수요 지표를 산출함", similarity=None, status="미개시"),
+        ClaimResult(label="B", claim="유효 수요 지표를 산출함", status="미개시"),
     ]
     difference = _summary_difference(ChainInfo(claim_number=1, primary="1",
                                                track="inventive_step_combination"), results)
@@ -558,10 +582,31 @@ def test_prior_art_hit_keeps_the_claim_number(monkeypatch):
         "url": "https://example.com/patent",
     }]})
 
-    hits, warnings = priorart.search([{"claim_number": 12, "label": "A", "text": "B-스플라인 경로"}])
+    hits = priorart.search([{"claim_number": 12, "label": "A", "text": "B-스플라인 경로"}])
 
-    assert warnings == []
     assert hits[0].claim_number == 12 and hits[0].label == "A"
+
+
+def test_prior_art_search_failure_is_raised_not_returned_as_zero_hits(monkeypatch):
+    """CLI 실패를 빈 결과로 돌려주면 호출부가 그것을 '0건'으로 저장해 버린다."""
+    def failing_cli(prompt, expect="hits"):
+        raise RuntimeError("exit code 1: provider unreachable")
+
+    monkeypatch.setattr(priorart, "run_cli", failing_cli)
+
+    with pytest.raises(priorart.SearchFailed, match="선행기술 검색에 실패했습니다"):
+        priorart.search([{"claim_number": 1, "label": "A", "text": "쓰기 요청"}])
+
+
+def test_prior_art_cancellation_is_not_mistaken_for_a_failure(monkeypatch):
+    """AnalysisCancelled도 RuntimeError라 SearchFailed로 뭉개지기 쉽다."""
+    def cancelling_cli(prompt, expect="hits"):
+        raise agy.AnalysisCancelled("보고서 생성을 취소했습니다.")
+
+    monkeypatch.setattr(priorart, "run_cli", cancelling_cli)
+
+    with pytest.raises(agy.AnalysisCancelled):
+        priorart.search([{"claim_number": 1, "label": "A", "text": "쓰기 요청"}])
 
 
 def test_document_classification_and_number_extraction():
@@ -799,3 +844,62 @@ def test_the_initial_analysis_compares_documents_in_parallel_without_extra_calls
     assert peak == 2                                    # 두 문헌이 실제로 동시에 떴다
     assert stub_cli.count("matches") == 4               # 셀당 1회 그대로. 호출이 늘지 않는다
     assert shuffled.model_dump() == baseline.model_dump()
+
+
+def test_summary_does_not_claim_an_undisclosed_limitation_as_common_ground():
+    """부분 개시 구성을 대표로 쓸 때는 "부분적으로 공통"이라고 적는다.
+
+    부분 개시 구성의 문언에는 개시되지 않은 한정까지 들어 있다. 그것을 "모두 …에서
+    공통된다"고 적으면 정작 없는 개시를 공통점으로 단언하게 된다.
+    """
+    claim = Claim(number=1, elements=[
+        ClaimElement(label="A", text="제1 반사부재와 제2 반사부재 사이에 배치되는 광원", importance=5),
+        ClaimElement(label="B", text="영상을 출력하는 디스플레이부", importance=3),
+    ])
+    partial_only = [
+        ClaimResult(label="A", claim=claim.elements[0].text, corresponded=True,
+                    status="부분 개시", adopted_reference=1),
+    ]
+    summary = _summary_similarity(claim, partial_only, [])
+    assert "부분적으로 공통되며" in summary
+
+    # 완전 개시 구성이 하나라도 있으면 중요도가 낮아도 그쪽을 대표로 삼는다.
+    mixed = partial_only + [
+        ClaimResult(label="B", claim=claim.elements[1].text, corresponded=True,
+                    status="개시됨", adopted_reference=1),
+    ]
+    summary = _summary_similarity(claim, mixed, [])
+    assert "영상을 출력하는 디스플레이부" in summary
+    assert "부분적으로" not in summary
+
+
+def test_closest_passage_prefers_the_document_that_came_nearest():
+    """미대응 구성의 "가장 가까운 기재"는 번호 순이 아니라 근접한 정도로 고른다.
+
+    대표 발췌만 있고 보조 발췌가 없는 셀을 건너뛰면, 정작 그 구성을 가장 잘 개시한 문헌이
+    사라지고 무관한 문헌의 총론 문장이 남는다. 강등되기 전 판정으로 재지 않으면 상한에
+    걸린 문헌들이 같은 등급으로 납작해져 번호 순서가 승부를 가른다.
+    """
+    boilerplate = "실시예들은 하나 이상의 컴퓨팅 장치와 관련하여 수행될 수 있다."
+    on_point = "사용자단말기는 통신모듈을 통하여 ID를 전송받고 서버에 관련 컨텐츠를 요청한다."
+    documents = {
+        "1": Document(id="1", filename="a.pdf", chunks=[
+            Chunk(document_id="1", chunk_id="D1-P-0039", page=7, paragraph="0039", text=boilerplate)]),
+        "2": Document(id="2", filename="b.pdf", chunks=[
+            Chunk(document_id="2", chunk_id="D2-P-0151", page=13, paragraph="0151", text=on_point)]),
+    }
+    matrix = {
+        "1": {"B": ElementMatch(claim_number=5, label="B", document_id="1", judgment="차이",
+                                downgraded_from="일부 유사", directness="direct", quote=boilerplate,
+                                chunk_id="D1-P-0039", verify="verified")},
+        "2": {"B": ElementMatch(claim_number=5, label="B", document_id="2", judgment="차이",
+                                downgraded_from="실질적 동일", directness="direct", quote=on_point,
+                                chunk_id="D2-P-0151", verify="verified")},
+    }
+    mappings = [DocumentMapping(reference_number=1, filename="a.pdf", document_id="1"),
+                DocumentMapping(reference_number=2, filename="b.pdf", document_id="2")]
+
+    related = _closest_related("B", matrix, mappings, documents)
+
+    assert "인용발명 2" in related and "단락 [0151]" in related
+    assert "컴퓨팅 장치" not in related

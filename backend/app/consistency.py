@@ -1,0 +1,110 @@
+"""구성 간 정합성. 같은 문헌 안에서 서로 모순되는 셀 판정을 바로잡습니다.
+
+비교 단계는 (구성 × 문헌) 셀을 서로 독립적으로 판정합니다. 셀 하나만 보면 그럴듯한 판정이
+청구항 전체로 보면 성립할 수 없는 경우가 생깁니다. 대표적인 것이 **선행 구성을 참조하는
+구성**입니다.
+
+  (A) … 제1반사부재 및 제2반사부재            ← 그 문헌에 대응 기재 없음
+  (B) 상기 제1 반사부재 및 상기 제2 반사부재 사이에 배치되는 광원   ← '일부 유사'로 개시 인정
+
+문헌에 제1·제2 반사부재가 없으면 "그 둘 **사이에** 배치되는 광원"도 그 문헌에 있을 수
+없습니다. 그런데 (B) 셀만 떼어 놓고 보면 "광원(패널 디스플레이)"이라는 문장이 있으므로
+모델은 부분 대응을 줍니다. 그 결과 남는 것은 "광원을 포함한다"뿐이고, 이는 그 분야의
+어떤 장치나 만족하는 문장입니다.
+
+여기서는 LLM을 다시 부르지 않고 청구항 문언의 **지시 관계**만으로 상한을 씌웁니다.
+지시 관계는 "상기 X" 표현에서 그대로 읽어 낼 수 있으므로 기술분야 사전이 필요 없습니다.
+"""
+import re
+
+from .coverage import JUDGMENT_RANK, has_correspondence
+from .models import Claim, ElementMatch
+
+_BY_RANK = {rank: judgment for judgment, rank in JUDGMENT_RANK.items()}
+# 지시 대상 어구가 끝나는 자리. 조사·연결어미를 만나면 거기까지가 대상입니다.
+# 위치 관계를 나타내는 명사(사이·중·간·내·외)는 뒤에 조사가 바로 붙어 공백이 없으므로
+# 따로 끊습니다. 끊지 않으면 "제2 반사부재 사이"가 통째로 지시 대상이 되어, 정작 앞
+# 구성에 있는 "제2반사부재"와 문자열이 어긋납니다.
+_BOUNDARY = re.compile(
+    r"(?:사이|중|간|내부|외부|내|외)(?=[에의를은는]|\s|$)"
+    r"|(?:은|는|이|가|을|를|에|의|와|과|로|으로|및|또는|에서|부터|까지)(?:\s|$)")
+# 상한의 하한선. 원문 대조를 통과한 발췌가 있으면 **부분 대응**까지는 남깁니다.
+#
+# '차이'까지 내리면 그 구성은 미대응이 되고, 그 문헌은 조합에서 빠져 근거 목록에서도
+# 사라집니다. 지시 대상이 다를 뿐 구성의 나머지 substance는 실제로 개시한 문헌이 그렇게
+# 통째로 지워지면, 심사관은 이미 확인된 문단을 다시 찾게 됩니다. 상한의 목적은 "완전 개시로
+# 세지 않는 것"이지 "기재가 없다고 단정하는 것"이 아니므로 부분 대응에서 멈춥니다.
+_PARTIAL = JUDGMENT_RANK["일부 유사"]
+
+
+def anaphora(text: str) -> list[str]:
+    """"상기 …"가 가리키는 대상 어구를 공백을 지운 형태로 뽑습니다.
+
+    공보와 청구항은 같은 용어를 띄어쓰기만 달리 적는 일이 흔해서("제1반사부재" ↔
+    "제1 반사부재") 공백을 지운 뒤 비교합니다.
+    """
+    targets: list[str] = []
+    for fragment in re.split(r"상기", str(text or ""))[1:]:
+        head = _BOUNDARY.split(fragment.strip(), 1)[0]
+        head = re.sub(r"\s+", "", head).strip(" ,.;·")
+        if len(head) >= 2 and head not in targets:
+            targets.append(head)
+    return targets
+
+
+def antecedents(claim: Claim) -> dict[str, list[str]]:
+    """구성마다 그것이 "상기 …"로 참조하는 **앞선 구성**의 라벨을 찾습니다.
+
+    앞선 구성에서 처음 등장한 어구만 지시 대상으로 인정합니다. 부모 청구항에서 온 용어는
+    이 청구항의 행렬에 없으므로 자연히 걸리지 않습니다.
+    """
+    collapsed = [(element.label, re.sub(r"\s+", "", element.text)) for element in claim.elements]
+    links: dict[str, list[str]] = {}
+    for index, element in enumerate(claim.elements):
+        for target in anaphora(element.text):
+            for label, text in collapsed[:index]:
+                if target in text and label not in links.setdefault(element.label, []):
+                    links[element.label].append(label)
+    return links
+
+
+def enforce_antecedents(claim: Claim, matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """선행 구성이 대응되지 않은 문헌에서는 그것을 참조하는 구성도 개시로 세지 않습니다.
+
+    상한은 **같은 문헌 안에서만** 걸립니다. 문헌 A가 앞 구성을, 문헌 B가 뒤 구성을 개시한
+    경우는 정상적인 결합이므로 건드리지 않습니다 — 결합은 이후 선정 단계가 판단합니다.
+    """
+    links = antecedents(claim)
+    if not links:
+        return []
+    notes: list[str] = []
+    for document_id in sorted(matrix):
+        matches = matrix[document_id]
+        for label, sources in links.items():
+            match = matches.get(label)
+            if match is None or match.error:
+                continue
+            limit = min((JUDGMENT_RANK.get(matches[source].judgment, 0)
+                         for source in sources if source in matches), default=None)
+            if limit is None or JUDGMENT_RANK.get(match.judgment, 0) <= limit:
+                continue
+            unresolved = [source for source in sources
+                          if source in matches and not has_correspondence(matches[source])]
+            if not unresolved:
+                continue
+            # 발췌가 원문 대조를 통과했다면 부분 대응까지는 남깁니다.
+            floor = _PARTIAL if match.quote and match.verify in {"verified", "partial"} else 0
+            capped = max(min(JUDGMENT_RANK.get(match.judgment, 0), limit), floor)
+            if capped >= JUDGMENT_RANK.get(match.judgment, 0):
+                continue
+            match.downgraded_from = match.downgraded_from or match.judgment
+            notes.append(f"청구항 {claim.number} ({label}) / 문헌 {document_id}: "
+                         f"{match.judgment} → {_BY_RANK[capped]} "
+                         f"(참조 구성 {', '.join(unresolved)}이 같은 문헌에서 대응되지 않음)")
+            # 보고서에도 남깁니다. 적지 않으면 "한정은 전부 개시인데 등급만 낮은" 결과가
+            # 이유 없이 보이고, 읽는 사람은 집계와 등급 중 어느 쪽이 맞는지 알 수 없습니다.
+            match.antecedent_note = (
+                f"같은 인용발명에서 구성 {', '.join(unresolved)}의 대응이 확인되지 않아, "
+                "이를 참조하는 이 구성을 완전 개시로 보지 않았습니다")
+            match.judgment = _BY_RANK[capped]
+    return notes

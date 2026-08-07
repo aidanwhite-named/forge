@@ -144,6 +144,56 @@ def test_verification_does_not_resurrect_a_satisfied_alternative():
     assert match.judgment == "동일"
 
 
+def test_a_limitation_quote_split_across_chunks_stays_disclosed():
+    """청크 경계에 걸친 근거를 미개시로 뒤집으면, 강등의 근거가 문헌 내용이 아니라 자르는 위치가 된다.
+
+    공보 PDF는 단락과 무관한 자리에서 잘리므로 한 문장이 두 청크에 나뉘는 일이 흔하다.
+    문헌 전체에서는 그대로 확인되는 문장인데도 단일 청크에 없다는 이유로 disclosed를
+    뒤집으면, 실제로 개시된 한정이 '누락 한정'이 되고 구성 판정까지 강등된다. 대표 발췌는
+    이미 같은 상황에서 판정을 유지하므로 두 경로가 서로 다른 답을 내고 있었다.
+    """
+    head = "In response to determining that there is unused programmer ad inventory ,"
+    tail = "the ad router server may send an ad request message to the MSO ADS ."
+    document = Document(id="1", filename="prior.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0064", page=7, paragraph="0064", text=head),
+        Chunk(document_id="1", chunk_id="D1-P-0065", page=7, paragraph="0065", text=tail)])
+    straddling = ElementMatch(
+        claim_number=1, label="C", document_id="1", judgment="실질적 동일", directness="direct",
+        quote=head, chunk_id="D1-P-0064", limitation_checks=[
+            LimitationCheck(index=0, limitation="판매 결과에 따라 정보를 전송함", disclosed=True,
+                            quote=f"{head} {tail}", chunk_id="D1-P-0064")])
+
+    notes = verify_matches([straddling], {"1": document})
+
+    assert straddling.limitation_checks[0].disclosed is True
+    assert straddling.limitation_checks[0].verify == "verified"
+    assert straddling.missing_limitations == []
+    assert straddling.judgment == "실질적 동일" and straddling.downgraded_from == ""
+    # 위치는 문장이 시작된 청크로 되돌린다. 비워 두면 근거는 확인되었는데 어디를 보라고
+    # 적을 수 없는 보고서가 된다.
+    assert straddling.limitation_checks[0].chunk_id == "D1-P-0064"
+    assert notes == []
+
+
+def test_a_fabricated_quote_is_still_rejected_when_it_spans_nothing():
+    """청크 경계 구제가 '원문에 없는 문장'까지 통과시켜서는 안 된다."""
+    document = Document(id="1", filename="prior.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0064", page=7, paragraph="0064",
+              text="The ad router server may hold any ad request to the MSO ADS .")])
+    fabricated = ElementMatch(
+        claim_number=1, label="C", document_id="1", judgment="실질적 동일", directness="direct",
+        quote="The ad router server may hold any ad request to the MSO ADS .",
+        chunk_id="D1-P-0064", limitation_checks=[
+            LimitationCheck(index=0, limitation="판매 결과에 따라 정보를 전송함", disclosed=True,
+                            quote="The server predicts future demand and reserves the slot .",
+                            chunk_id="D1-P-0064")])
+
+    verify_matches([fabricated], {"1": document})
+
+    assert fabricated.limitation_checks[0].disclosed is False
+    assert fabricated.missing_limitations == ["판매 결과에 따라 정보를 전송함"]
+
+
 def test_verification_restores_a_limitation_whose_quote_fails():
     """반대로 개시로 적힌 근거가 원문 대조에 실패하면 그 한정은 누락으로 되돌아간다."""
     real = "The one-way hash value contains a time-to-live value."

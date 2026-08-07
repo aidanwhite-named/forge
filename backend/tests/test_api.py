@@ -165,13 +165,117 @@ def test_prior_art_search_is_not_run_automatically(monkeypatch):
     """외부 웹에 나가는 단계라 분석 중에는 호출되지 않고, 별도 요청에서만 실행된다."""
     called = []
     monkeypatch.setattr(main, "analyze", fake_result)
-    monkeypatch.setattr(main.priorart, "search", lambda targets: (called.append(targets) or ([], [])))
+    monkeypatch.setattr(main.priorart, "search", lambda targets: (called.append(targets) or []))
     job_id = post_job()
     assert called == []
     response = client.post(f"/api/jobs/{job_id}/prior-art")
     assert response.status_code == 200
     assert called == []                      # 미커버 구성이 없으면 CLI를 부르지 않는다
     assert "미커버로 남은 구성이 없습니다" in response.json()["message"]
+
+
+def prepare_uncovered_search(monkeypatch) -> str:
+    """미커버 구성이 하나 남은 완료 보고서를 만들어 검색이 CLI까지 가게 한다."""
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = post_job()
+    monkeypatch.setattr(main, "uncovered_elements",
+                        lambda result, claims_text: [{"claim_number": 1, "label": "A", "text": "쓰기 요청"}])
+    return job_id
+
+
+def test_prior_art_search_can_be_cancelled_while_the_cli_is_running(monkeypatch):
+    """취소 요청이 검색 중인 CLI까지 닿는다.
+
+    엔드포인트가 스레드를 작업에 묶어 두지 않으면 run_cli가 띄운 프로세스가 어디에도
+    등록되지 않아, 취소를 눌러도 죽일 대상을 찾지 못하고 타임아웃까지 계속 돈다.
+    """
+    job_id = prepare_uncovered_search(monkeypatch)
+    entered, released = threading.Event(), threading.Event()
+
+    def blocking_cli(prompt, expect="claims"):
+        entered.set()
+        released.wait(timeout=5)
+        agy.raise_if_cancelled()             # 실제 run_cli가 프로세스 종료 뒤 확인하는 자리
+        return {"hits": []}
+
+    monkeypatch.setattr("app.priorart.run_cli", blocking_cli)
+
+    outcome = {}
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault("response", client.post(f"/api/jobs/{job_id}/prior-art")))
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    cancelled = client.delete(f"/api/jobs/{job_id}/prior-art")
+    released.set()
+    worker.join(timeout=5)
+
+    assert cancelled.json() == {"job_id": job_id, "running": True, "kill_requested": True}
+    assert outcome["response"].status_code == 409
+    assert "취소" in outcome["response"].json()["detail"]
+
+
+def seed_existing_prior_art(job_id: str):
+    """지난 검색에서 찾아 둔 선행기술이 이미 저장된 상태를 만든다."""
+    stored = main.HISTORY_DIR / job_id / "result.json"
+    saved = json.loads(stored.read_text(encoding="utf-8"))
+    saved["prior_art"] = [{"claim_number": 1, "label": "A", "document_number": "US 1 A",
+                           "title": "기존 문헌", "published": "", "correspondence": "",
+                           "remaining_difference": "", "url": ""}]
+    stored.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    main.jobs[job_id]["result"] = saved
+    return stored
+
+
+def test_cancelled_prior_art_search_keeps_the_existing_report(monkeypatch):
+    """취소는 실패가 아니다. 이미 찾아 둔 선행기술을 빈 목록으로 덮어쓰지 않는다."""
+    job_id = prepare_uncovered_search(monkeypatch)
+    stored = seed_existing_prior_art(job_id)
+
+    def self_cancelling_cli(prompt, expect="claims"):
+        agy.cancel_job(agy.current_job())
+        agy.raise_if_cancelled()
+
+    monkeypatch.setattr("app.priorart.run_cli", self_cancelling_cli)
+
+    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 409
+    kept = json.loads(stored.read_text(encoding="utf-8"))["prior_art"]
+    assert [hit["document_number"] for hit in kept] == ["US 1 A"]
+
+    # 취소한 job의 상태를 건드리지 않으므로 곧바로 다시 검색할 수 있다.
+    monkeypatch.setattr(main.priorart, "search", lambda targets: [])
+    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 200
+
+
+def test_failed_prior_art_search_keeps_the_existing_report(monkeypatch):
+    """CLI가 답을 못 낸 것은 '0건'이 아니다. 보고서를 건드리지 않고 오류로 끝낸다."""
+    job_id = prepare_uncovered_search(monkeypatch)
+    stored = seed_existing_prior_art(job_id)
+
+    def failing_cli(prompt, expect="claims"):
+        raise RuntimeError("exit code 1: provider unreachable")
+
+    monkeypatch.setattr("app.priorart.run_cli", failing_cli)
+
+    response = client.post(f"/api/jobs/{job_id}/prior-art")
+    assert response.status_code == 502
+    assert "선행기술 검색에 실패했습니다" in response.json()["detail"]
+
+    saved = json.loads(stored.read_text(encoding="utf-8"))
+    assert [hit["document_number"] for hit in saved["prior_art"]] == ["US 1 A"]
+    # 실패 기록은 로그에만 남깁니다. 보고서의 검증 참고는 분석상의 유보사항 자리입니다.
+    assert not any("검색에 실패" in note for note in saved["validation"])
+    assert "prior art search failed" in (main.LOG_DIR / f"{job_id}.log").read_text(encoding="utf-8")
+
+    # 실패해도 상태가 남지 않으므로 곧바로 다시 검색할 수 있다.
+    monkeypatch.setattr(main.priorart, "search", lambda targets: [])
+    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 200
+
+
+def test_cancelling_an_idle_prior_art_search_is_a_no_op(monkeypatch):
+    job_id = prepare_uncovered_search(monkeypatch)
+    assert client.delete(f"/api/jobs/{job_id}/prior-art").json() == {
+        "job_id": job_id, "running": False, "kill_requested": False}
 
 
 def test_cache_can_be_cleared(monkeypatch):

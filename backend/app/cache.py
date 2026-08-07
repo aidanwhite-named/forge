@@ -13,6 +13,10 @@ from .models import Claim, Document, ElementMatch
 CACHE_DIR = DATA_DIR / "comparison_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # 프롬프트나 정규화 규칙을 바꾸면 이 값을 올려 과거 캐시를 무효화합니다.
+# v13: "동일"·"실질적 동일"에 대상 대응 조건을 걸었습니다. 동작을 가리키는 낱말이 같아도
+#      그 동작이 걸리는 대상이 다르면 등가가 아닙니다. 종전 프롬프트는 "용어만 다르며
+#      기술적 의미와 작동 관계가 같음"이라고만 해서, 같은 분야에서 비슷한 목적을 가진
+#      문장이면 대상이 달라도 실질적 동일로 올라갔습니다.
 # v12: 선택적 한정("중 적어도 하나")을 대안 묶음으로 묶어 하나만 개시되면 충족으로 봅니다.
 # v11: 하위 한정을 core/qualifier로 나누고, 열거 항목의 상위 개념 인정을 막았습니다.
 # v10: 구성요소별 검색어를 프롬프트에 넣고, 판단 이유를 연결어미로 받도록 바꿨습니다.
@@ -21,7 +25,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # v7: 단건·일괄 경로가 같은 스키마(requirements + limitation_checks)를 요구하도록 통합했습니다.
 # 두 경로는 이 키를 공유하므로, 버전을 올리지 않으면 느슨한 스키마로 만든 셀이 엄격한
 # 경로의 재실행에서 그대로 재사용되어 불일치가 캐시에 영구 고착됩니다.
-PROMPT_VERSION = "compare-v12-alternative-groups"
+PROMPT_VERSION = "compare-v13-operand-correspondence"
 
 
 def cache_key(claim: Claim, document: Document, guideline: str = "") -> str:

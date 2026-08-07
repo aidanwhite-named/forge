@@ -107,6 +107,7 @@ class LimitationCheck(BaseModel):
     quote: str = ""
     quote_translation: str = ""
     verify: VerifyStatus = "empty"
+    verify_note: str = ""                     # 위치 복구·특정 실패 기록. 개시 여부와는 무관합니다.
 
 
 def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
@@ -150,6 +151,9 @@ class ElementMatch(BaseModel):
     verify: VerifyStatus = "empty"
     verify_note: str = ""
     downgraded_from: str = ""                 # 발췌 검증 실패로 강등된 원 판정
+    # 선행 구성이 같은 문헌에 없어 상한이 걸린 경우의 사유. 보고서의 차이점에 그대로 나갑니다.
+    # 이 값이 없으면 "한정은 전부 개시(2/2)인데 등급만 낮은" 결과가 이유 없이 보이게 됩니다.
+    antecedent_note: str = ""
     # 판정을 **받지 못한** 셀. "대응 없음"(받아본 결과 대응이 없었다)과 반드시 구분합니다.
     # 이 값이 차 있으면 그 청구항은 법적 결론을 만들지 않습니다.
     error: str = ""
@@ -212,7 +216,23 @@ class ChainInfo(BaseModel):
     primary: str | None = None                # document_id
     secondaries: list[str] = []
     inherited: list[str] = []                 # 종속항이 부모항에서 상속한 문헌
-    added: str | None = None                  # 종속항이 새로 추가한 문헌(최대 1개)
+    # 종속항이 부모 조합에 새로 더한 문헌. 독립항과 같이 보완 이득이 마르면 멈추므로
+    # 상수 상한은 없습니다. 상한을 1건으로 두면 공백을 서로 다른 문헌 둘이 나누어 메우는
+    # 종속항에서 한쪽이 통째로 버려지고, 그 문헌이 원문으로 개시한 구성까지 uncovered로
+    # 보고됩니다 — uncovered는 "어느 문헌에도 대응 기재가 없다"는 사실 진술입니다.
+    added: list[str] = []
+
+    @field_validator("added", mode="before")
+    @classmethod
+    def _accept_single_added(cls, value):
+        """문헌을 1건만 추가하던 시절의 기록(문자열·None)도 그대로 읽습니다.
+
+        히스토리의 result.json은 종속항을 뒤에 덧붙일 때 다시 읽히므로, 형이 바뀌면
+        예전 분석에 항을 추가하는 순간 검증에 실패합니다.
+        """
+        if value is None:
+            return []
+        return [value] if isinstance(value, str) else value
     uncovered: list[str] = []                 # 결합 후에도 대응 기재를 찾지 못한 라벨
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
@@ -258,8 +278,17 @@ class ClaimResult(BaseModel):
     label: str = ""
     is_preamble: bool = False                 # 전제부에서 세운 구성인지
     claim: str
-    # 판정 라벨이 정한 등급 밴드 안에서 근거 품질로 위치를 정한 값. 대응이 없으면 None입니다.
-    similarity: int | None = None
+    corresponded: bool = False                # 대응 기재가 확인된 구성인지
+    # 이 구성의 하위 한정 중 원문으로 개시가 확인된 수 / 전체 수.
+    #
+    # 종전에는 등급 밴드(90~94 등) 안의 위치를 백분율로 찍었습니다. 그 값은 대응된 구성에서
+    # 거의 항상 밴드 최댓값이라 등급 이름을 되풀이할 뿐이었고, 무엇보다 "%"가 "청구항의
+    # 94%가 개시되었다"로 읽히는데 실제 뜻은 그것이 아니었습니다. 분자·분모를 그대로 내보내면
+    # 독자가 아래 근거 목록과 대조해 검증할 수 있고, 값도 실제로 움직입니다.
+    # 대안 묶음("A, B 또는 C 중 적어도 하나")은 하나로 셉니다.
+    disclosed_limitations: int = 0
+    total_limitations: int = 0
+    evidence_locations: int = 0               # 근거로 인용된 서로 다른 원문 위치 수
     grade: str = ""
     emoji: str = ""
     narrative: str = ""                       # 결정론적으로 조립한 구성대비 서술 한 문장
@@ -282,6 +311,9 @@ class ClaimReport(BaseModel):
     # 확정해 두고도 보고서에는 한 번도 나오지 않아, 읽는 사람이 구성별 유사도 표에서
     # 신규성 결론인지 진보성 결론인지를 되짚어 추정해야 했습니다.
     conclusion: str = ""
+    # 이 청구항의 구성이 어떻게 갈렸는지 한 줄. 결론(신규성·진보성·거절 곤란)을 실제로
+    # 정하는 것은 구성별 등급이 아니라 이 집계입니다.
+    coverage_summary: str = ""
     summary_similarity: str = ""              # 종합 분석 요약의 유사점 한 줄
     summary_difference: str = ""              # 종합 분석 요약의 차이점 한 줄
 

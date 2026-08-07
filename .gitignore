@@ -33,6 +33,7 @@ backend/data/
 /history/
 /logs/
 *.log
+tmp/
 
 
 # IDE / Editor files

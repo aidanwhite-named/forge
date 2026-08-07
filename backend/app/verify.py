@@ -92,17 +92,30 @@ def verify_matches(matches: list[ElementMatch], documents: dict[str, Document]) 
                     cited_check and is_verbatim(check.quote, cited_check)):
                 check.chunk_id = _find_chunk_id(document, check.quote)
                 cited_check = chunk_text(document, check.chunk_id) if check.chunk_id else ""
-            if check.verify != "verified" or not cited_check:
-                recovered = _recover(check.quote, cited_check)
-                if recovered:
-                    check.quote, check.verify = recovered, "verified"
-                    # 문구를 복구했더라도 모델이 적은 표현 자체는 원문이 아니었으므로, 구성 전체의
-                    # 직접성은 보수적으로 inferred로 낮춘다. 하위 제한은 복구된 실제 문장으로만 센다.
-                    if match.directness == "direct":
-                        match.directness = "inferred"
-                    continue
-                check.disclosed = False
-                failed_limitations.append(check.limitation)
+            if check.verify == "verified":
+                # 원문 대조를 통과한 근거는 청크 위치를 특정하지 못하더라도 개시로 인정합니다.
+                # 대표 발췌에 이미 적용하는 규칙(아래 locator_verified 분기)과 같은 규칙입니다.
+                #
+                # 공보 PDF는 단락과 무관한 자리에서 잘리므로 한 문장이 두 청크에 나뉘는 일이
+                # 흔합니다. 그때마다 disclosed를 뒤집으면 문헌에 그대로 있는 한정이 '누락 한정'이
+                # 되고 구성 판정까지 강등되는데, 강등의 근거는 문헌의 내용이 아니라 청크를 어디서
+                # 잘랐는가입니다. 실제로 이 경로 하나가 주 인용발명이 단독으로 개시한 구성을
+                # 미개시로 만들어, 신규성 결론이 불필요한 문헌 결합으로 바뀌었습니다.
+                if not cited_check:
+                    check.verify_note = "원문은 확인되었으나 단일 청크 위치를 특정하지 못했습니다."
+                    notes.append(f"청구항 {match.claim_number} ({match.label}) / {document.filename}: "
+                                 f"하위 한정 근거의 청크 위치를 특정하지 못했습니다(원문 대조는 통과).")
+                continue
+            recovered = _recover(check.quote, cited_check)
+            if recovered:
+                check.quote, check.verify = recovered, "verified"
+                # 문구를 복구했더라도 모델이 적은 표현 자체는 원문이 아니었으므로, 구성 전체의
+                # 직접성은 보수적으로 inferred로 낮춘다. 하위 제한은 복구된 실제 문장으로만 센다.
+                if match.directness == "direct":
+                    match.directness = "inferred"
+                continue
+            check.disclosed = False
+            failed_limitations.append(check.limitation)
         # 검증이 check.disclosed를 뒤집으므로 누락 목록은 여기서 다시 계산합니다. 점검 결과가
         # 없는 셀은 모델이 적어 준 목록뿐이라 그대로 둡니다.
         if match.limitation_checks:
@@ -207,8 +220,39 @@ def _find_chunk_id(document: Document, quote: str) -> str:
         return ""
     candidates = [chunk for chunk in document.chunks if is_verbatim(quote, chunk.text)]
     if not candidates:
-        return ""
+        return _find_starting_chunk_id(document, quote)
     return min(candidates, key=lambda chunk: (len(chunk.text), chunk.page or 0, chunk.chunk_id)).chunk_id
+
+
+def _find_starting_chunk_id(document: Document, quote: str) -> str:
+    """청크 경계에 걸친 발췌는 그 문장이 **시작되는** 청크를 위치로 씁니다.
+
+    공보 PDF는 단락 경계와 무관한 자리에서 잘리므로, 문헌 전체에서는 그대로 확인되는
+    문장이 어느 단일 청크에도 온전히 들어 있지 않을 수 있습니다. 그때 위치를 비워 두면
+    근거는 확인되었는데 어디를 보라고 적을 수 없는 보고서가 됩니다. 앞부분이 가장 길게
+    일치하는 청크가 그 문장이 시작된 자리이므로 그것을 인용 위치로 삼습니다.
+    """
+    collapsed = collapse(quote)
+    if len(collapsed) < MIN_SEGMENT_LEN:
+        return ""
+    scored = [(_leading_overlap(collapsed, collapse(chunk.text)), chunk) for chunk in document.chunks]
+    length, chunk = max(scored, key=lambda item: (item[0], -len(item[1].text), item[1].chunk_id),
+                        default=(0, None))
+    return chunk.chunk_id if chunk is not None and length >= MIN_SEGMENT_LEN else ""
+
+
+def _leading_overlap(collapsed_quote: str, collapsed_chunk: str) -> int:
+    """청크에 들어 있는 발췌 앞부분의 최대 길이. 이분 탐색이라 청크 수에 선형입니다."""
+    if not collapsed_chunk or collapsed_quote[:MIN_SEGMENT_LEN] not in collapsed_chunk:
+        return 0
+    low, high, best = MIN_SEGMENT_LEN, len(collapsed_quote), 0
+    while low <= high:
+        middle = (low + high) // 2
+        if collapsed_quote[:middle] in collapsed_chunk:
+            best, low = middle, middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 def _recover(model_quote: str, cited_chunk: str) -> str:

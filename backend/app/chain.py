@@ -26,6 +26,11 @@ GAP_PRIORITY = 3.0
 # 그런 문헌이 업로드되어 있는데도 그렇게 적으면 사실과 다른 보고가 됩니다. 문헌은 새로
 # 기여하는 것이 있을 때만 늘어나므로, 이득이 마르면 결합은 저절로 멈춥니다.
 MIN_SUPPLEMENT_GAIN = 0.05
+# 종속항에서 **공백을 메우지 않는** 보완 문헌의 최대 건수. 공백을 메우는 추가에는 상한이
+# 없습니다(막으면 실제로 개시된 구성이 미대응으로 보고됨). 근거 품질만 올리는 추가는
+# 커버리지를 바꾸지 않으면서 결합 문헌 수만 늘리는데, 종속항 하나에 인용발명 서너 건을
+# 세운 거절 이유는 실무에서 그 자체로 설득력을 잃습니다.
+MAX_QUALITY_SUPPLEMENTS = 1
 
 
 Matrix = dict[str, dict[str, ElementMatch]]   # document_id → label → 판정
@@ -304,18 +309,46 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
     for document_id in inherited:
         merged = _merge(claim, merged, matrix.get(document_id, {})) if merged else dict(matrix.get(document_id, {}))
     chain.supplement_needed = supplement_needed_labels(claim, merged)
-    gaps = no_correspondence_labels(claim, merged)
-    if gaps:
-        # 종속항에서 새 문헌을 끌어오는 이유는 '공백'뿐입니다. 근거 품질 개선은 참고로만 남깁니다.
-        candidate = _best_secondary(claim, matrix, merged, gaps, gaps, exclude=set(inherited))
-        # 종속항 하나를 거절하기 위해 새 문헌을 2개 이상 추가하지 않습니다.
-        if candidate and _fills_all(claim, matrix[candidate], merged, gaps):
-            chain.added = candidate
-            chain.secondaries.append(candidate)
-            merged = _merge(claim, merged, matrix[candidate])
-            gaps = no_correspondence_labels(claim, merged)
 
-    chain.uncovered = list(gaps)
+    # 종속항도 독립항과 **같은 보완 탐색**을 돌립니다. 공백(uncovered)뿐 아니라 '보완 검토
+    # 대상'(supplement_needed) 전체를 후보 대상으로 삼습니다.
+    #
+    # 종전에는 대상을 공백으로만 한정했습니다("새 문헌을 끌어오는 이유는 공백뿐"). 그러면
+    # 상속한 문헌이 어떤 구성을 **약하게라도** 커버한 순간 그 구성은 탐색에서 빠지고, 같은
+    # 구성을 원문으로 직접 개시한 다른 문헌이 있어도 영원히 채택되지 않습니다. 실제로 한
+    # 보고서에서 "고유 식별값에 매칭된 영상을 호출하는 제어부"가, 그런 기재가 전혀 없는
+    # 문헌의 "컴퓨팅 장치를 사용할 수 있다"는 총론 문단에 '일부 유사'로 붙었습니다. 그
+    # 구성을 실제로 개시한 문헌은 '실질적 동일·direct·검증됨'이었는데도 미채택으로 남았습니다.
+    # README가 독립항에 대해 "보완 검토 대상 ≠ 미커버"라고 정한 것과 같은 이유입니다.
+    #
+    # 다만 **공백을 메우지 않는 추가는 1건까지**입니다(MAX_QUALITY_SUPPLEMENTS).
+    # 공백을 메우는 추가는 제한하지 않습니다 — 그것을 막으면 실제로 개시된 구성이 다시
+    # "어느 인용발명에도 대응이 없다"로 보고되기 때문입니다. 반면 근거 품질만 올리는 추가는
+    # 커버리지를 바꾸지 않으면서 결합 문헌 수만 늘립니다. 종속항 하나에 인용발명 서너 건을
+    # 세운 거절 이유는 실무에서 그 자체로 설득력을 잃으므로, 이쪽만 예산을 둡니다.
+    #
+    # 예산이 떨어지면 대상을 공백으로 좁혀 계속 돕니다. 루프를 끊으면 품질 개선 후보가
+    # 공백 메우기 후보보다 먼저 뽑혔다는 이유만으로 남은 공백이 방치됩니다.
+    added: list[str] = []
+    quality_budget = MAX_QUALITY_SUPPLEMENTS
+    while len(chain.secondaries) + 1 < len(matrix):
+        gaps = no_correspondence_labels(claim, merged)
+        targets = supplement_needed_labels(claim, merged) if quality_budget > 0 else gaps
+        if not targets:
+            break
+        candidate = _best_secondary(claim, matrix, merged, targets, gaps,
+                                    exclude={chain.primary, *chain.secondaries})
+        if candidate is None:
+            break
+        following = _merge(claim, merged, matrix[candidate])
+        if len(no_correspondence_labels(claim, following)) >= len(gaps):
+            quality_budget -= 1          # 공백은 그대로이고 근거 품질만 올린 추가
+        added.append(candidate)
+        chain.secondaries.append(candidate)
+        merged = following
+    chain.added = added
+
+    chain.uncovered = no_correspondence_labels(claim, merged)
     chain.residual = difference_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
     parents = ancestry(all_claims, claim.number)
@@ -326,7 +359,8 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
         chain.rationale = (f"{inherited_text}했으나 추가 한정 {', '.join(blocking)}에 대응하는 기재를 "
                            "어느 인용발명에서도 확인하지 못해 거절 이유를 구성하기 어렵습니다.")
     elif chain.added:
-        chain.rationale = f"{inherited_text}하고, 추가 한정을 개시하는 인용발명 1건을 결합했습니다."
+        chain.rationale = (f"{inherited_text}하고, 추가 한정을 개시하는 인용발명 "
+                           f"{len(chain.added)}건을 결합했습니다.")
     else:
         chain.rationale = f"{inherited_text}했으며 추가 문헌 없이 종속항 한정까지 커버됩니다."
     return _finalize(claim, chain, merged, matrix)
@@ -346,13 +380,6 @@ def _single_document_novelty(claim: Claim, matrix: Matrix, parent: ChainInfo) ->
     if not candidates:
         return None
     return parent.primary if parent.primary in candidates else min(candidates)
-
-
-def _fills_all(claim: Claim, candidate: dict[str, ElementMatch], merged: dict[str, ElementMatch],
-               gaps: list[str]) -> bool:
-    """공백을 전부 메우는 문헌만 종속항에 추가합니다. 하나를 거절하려 문헌을 둘씩 늘리지 않습니다."""
-    return all(has_correspondence(best_match([merged.get(label), candidate.get(label)]))
-               for label in gaps)
 
 
 # --- 공통 ---------------------------------------------------------------------
@@ -420,7 +447,7 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
 def _role_of(document_id: str, chain: ChainInfo) -> str:
     if document_id == chain.primary:
         return "주 인용발명"
-    if document_id == chain.added:
+    if document_id in chain.added:
         return "추가 인용발명"
     if document_id in chain.secondaries:
         return "보조 인용발명"

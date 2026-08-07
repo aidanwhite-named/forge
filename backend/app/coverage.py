@@ -1,7 +1,7 @@
 """커버리지 계산. LLM 없이 판정 라벨과 근거만으로 문헌 적합도와 표출 유사도를 산출합니다.
 
-문헌 선정에 쓰는 내부 지표(score_document)와 보고서에 찍히는 유사도(report_similarity)는
-서로 다른 값입니다. 후자는 판정 라벨이 정한 등급 밴드 안에서 근거 품질로 위치를 정합니다.
+문헌 선정에 쓰는 내부 지표(score_document)와 보고서에 찍히는 정량 지표
+(limitation_counts)는 서로 다른 값입니다. 후자는 하위 한정의 개시 수를 그대로 셉니다.
 """
 from .models import Claim, ClaimElement, ElementMatch
 
@@ -14,13 +14,15 @@ JUDGMENT_SIMILARITY = {
     "차이": 0.15,
     "대응 없음": 0.00,
 }
-# 보고서 표출 등급. 유사도 구간과 등급명이 1:1로 대응합니다.
-# "차이"·"대응 없음"은 대응 구간(80% 이상)에 들지 못하므로 유사도를 표기하지 않습니다.
-REPORT_BANDS = {
-    "동일": (95, 99, "동일", "🔵"),
-    "실질적 동일": (90, 94, "실질적 동일", "🟢"),
-    "일부 차이": (85, 89, "기술 사상 동일, 세부 구현 방식의 단순 변경", "🟠"),
-    "일부 유사": (80, 84, "핵심 기능 유사하나 목적/효과에 일부 차이", "🟡"),
+# 보고서 표출 등급. "차이"·"대응 없음"은 대응으로 세지 않으므로 여기에 없습니다.
+# 등급 뒤에 붙던 백분율 구간은 없앴습니다 — 그 값은 등급 이름을 숫자로 다시 쓴 것에 가까웠고,
+# "%" 기호 때문에 "청구항의 몇 %가 개시되었다"로 잘못 읽혔습니다. 정량 지표는
+# limitation_counts(개시 한정 수 / 전체 한정 수)가 대신합니다.
+REPORT_GRADES = {
+    "동일": ("동일", "🔵"),
+    "실질적 동일": ("실질적 동일", "🟢"),
+    "일부 차이": ("기술 사상 동일, 세부 구현 방식의 단순 변경", "🟠"),
+    "일부 유사": ("핵심 기능 유사하나 목적/효과에 일부 차이", "🟡"),
 }
 UNCORRESPONDED_GRADE = ("대응 안됨", "⚪")
 
@@ -71,6 +73,14 @@ def atomic_coverage(match: ElementMatch) -> float | None:
 def _is_redundant_alternative(check, satisfied: set[str]) -> bool:
     """충족된 묶음에서 개시되지 않은 대안. 분모에서 뺍니다."""
     return check.alternative_group in satisfied and not check.disclosed
+
+
+def _counted_checks(match: ElementMatch) -> list:
+    """커버율·근거 품질을 셀 때 분모가 되는 하위 한정. 충족된 묶음의 잉여 대안은 뺍니다."""
+    satisfied = {check.alternative_group for check in match.limitation_checks
+                 if check.disclosed and check.alternative_group}
+    return [check for check in match.limitation_checks
+            if not check.alternative_group or not _is_redundant_alternative(check, satisfied)]
 
 
 def item_similarity(match: ElementMatch | None) -> float:
@@ -172,30 +182,47 @@ def score_document(claim: Claim, matches: dict[str, ElementMatch]) -> tuple[floa
     return round(main_score * 100, 2), detail
 
 
-def report_similarity(match: ElementMatch | None) -> int | None:
-    """보고서에 찍는 유사도. 판정 라벨이 등급 밴드를 정하고 근거 품질이 그 안의 위치를 정합니다.
+def limitation_counts(match: ElementMatch | None) -> tuple[int, int]:
+    """이 구성의 하위 한정 중 **개시가 확인된 수 / 전체 수**.
 
-    라벨마다 고정 대표값 하나만 쓰면, 하위 한정을 모두 입증한 '일부 차이'와 절반만 입증한
-    '일부 차이'가 같은 숫자로 나옵니다. 밴드 안에서만 움직이므로 등급과 숫자가 어긋나는 일은
-    없고, 같은 판정 자료에서는 항상 같은 값이 나옵니다.
+    보고서에 찍는 정량 지표입니다. 종전의 백분율 유사도는 판정 라벨이 정한 등급 밴드 안의
+    위치라서, 대응된 구성에서는 거의 항상 밴드 최댓값이었고 등급 이름을 되풀이할 뿐이었습니다.
+    무엇보다 "94%"가 "청구항의 94%가 개시되었다"로 읽히는데 실제 뜻은 그것이 아니었습니다.
+
+    이 값은 분자·분모가 그대로 보고서에 나가므로 독자가 근거 목록과 대조해 검증할 수 있고,
+    한정이 빠질 때마다 실제로 움직입니다. 대안 묶음은 하나로 셉니다 — 선택지를 넉넉히 나열한
+    청구항일수록 분모만 커지면, 문언을 충족하는 문헌이 오히려 낮게 나옵니다.
     """
-    band = REPORT_BANDS.get(match.judgment) if match else None
-    if band is None:
-        return None
-    low, high = band[0], band[1]
-    signals = [
-        {"direct": 1.0, "inferred": 0.5}.get(match.directness, 0.0),
-        {"verified": 1.0, "partial": 0.5}.get(match.verify, 0.0),
-    ]
-    atomic = atomic_coverage(match)
-    if atomic is not None:
-        signals.append(atomic)
-    return low + round((high - low) * (sum(signals) / len(signals)))
+    if match is None or not match.limitation_checks:
+        return 0, 0
+    counted = _counted_checks(match)
+    if not counted:
+        return 0, 0
+    satisfied = {check.alternative_group for check in match.limitation_checks
+                 if check.disclosed and check.alternative_group}
+    disclosed = sum(1 for check in counted
+                    if check.disclosed or check.alternative_group in satisfied)
+    return disclosed, len(counted)
+
+
+def evidence_locations(match: ElementMatch | None) -> int:
+    """개시 근거로 인용된 서로 다른 원문 위치 수.
+
+    한 문단을 모든 한정의 근거로 되풀이 인용한 대응은, 한정마다 다른 문단을 짚은 대응보다
+    약합니다. 전자는 그 문단 하나의 해석이 무너지면 구성 전체가 무너집니다.
+    """
+    if match is None:
+        return 0
+    locations = {check.chunk_id or check.quote for check in match.limitation_checks
+                 if check.disclosed and check.quote}
+    if not locations and match.quote:
+        return 1
+    return len(locations)
 
 
 def report_grade(match: ElementMatch | None) -> tuple[str, str]:
-    band = REPORT_BANDS.get(match.judgment) if match else None
-    return (band[2], band[3]) if band else UNCORRESPONDED_GRADE
+    grade = REPORT_GRADES.get(match.judgment) if match else None
+    return grade or UNCORRESPONDED_GRADE
 
 
 def has_correspondence(match: ElementMatch | None) -> bool:

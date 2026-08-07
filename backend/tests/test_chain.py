@@ -1,7 +1,7 @@
 """인용발명 선정 알고리즘. 비교 매트릭스가 같으면 항상 같은 조합이 나와야 한다."""
 from app.chain import build_chain, matrix_for
-from app.coverage import score_document
-from app.models import Claim, ClaimElement, ElementMatch
+from app.coverage import evidence_locations, limitation_counts, report_grade, score_document
+from app.models import Claim, ClaimElement, ElementMatch, LimitationCheck
 
 
 def claim(number: int = 1, depends_on: int | None = None, importances=(5, 5, 3)) -> Claim:
@@ -117,7 +117,7 @@ def test_dependent_claim_does_not_pass_novelty_on_its_added_limitation_alone():
 
     assert chain.track != "novelty_single"
     assert chain.inherited == ["1"]
-    assert chain.added == "2"
+    assert chain.added == ["2"]
 
 
 def test_a_partially_disclosed_element_records_what_is_still_missing():
@@ -147,12 +147,12 @@ def test_dependent_claim_inherits_the_parent_chain_and_adds_one_document():
                      + [cell("3", label, "대응 없음", number=2) for label in "AB"] + [cell("3", "C", "동일", number=2)])
     chain = build(child, child_matches, {1: parent_chain}, [parent, child])
     assert chain.inherited == ["1", "2"]
-    assert chain.added == "3"
+    assert chain.added == ["3"]
     assert chain.uncovered == []
 
 
-def test_dependent_claim_never_adds_two_new_documents():
-    """하나의 종속항 거절을 위해 새 문헌을 2개 이상 추가하지 않는다."""
+def test_dependent_claim_stops_when_no_document_fills_a_remaining_gap():
+    """상수 상한이 아니라 보완 이득으로 멈춘다. 공백에 기여하지 못하는 문헌은 붙지 않는다."""
     parent, child = claim(1, importances=(5, 5, 5)), claim(2, depends_on=1, importances=(5, 5, 5))
     parent_chain = build(parent, [cell("1", label, "동일") for label in "AB"] + [cell("1", "C", "대응 없음")],
                          all_claims=[parent, child])
@@ -162,8 +162,30 @@ def test_dependent_claim_never_adds_two_new_documents():
         + [cell("3", "A", "대응 없음", number=2), cell("3", "B", "대응 없음", number=2), cell("3", "C", "동일", number=2)]
     )
     chain = build(child, child_matches, {1: parent_chain}, [parent, child])
-    assert chain.added in {None, "3"}
-    assert len([document for document in chain.secondaries if document not in chain.inherited]) <= 1
+    assert chain.added == ["3"]                  # 유일한 공백 C를 메우는 문헌만 붙는다
+    assert "2" not in chain.secondaries          # B는 이미 커버되어 새로 기여하는 것이 없다
+    assert chain.uncovered == []
+
+
+def test_dependent_claim_combines_two_documents_that_fill_different_gaps():
+    """공백을 서로 다른 문헌 둘이 나누어 메우면 둘 다 채택한다.
+
+    1건 상한을 두면 한쪽이 통째로 버려지고, 그 문헌이 원문으로 개시한 구성까지
+    "어느 인용발명에서도 확인하지 못했다"로 보고된다. uncovered는 결합이 실패했다는 뜻이
+    아니라 어느 문헌에도 대응 기재가 없다는 사실 진술이다.
+    """
+    parent, child = claim(1, importances=(5,)), claim(2, depends_on=1, importances=(4, 4))
+    parents = {1: build(parent, [cell("1", "A", "동일")], all_claims=[parent, child])}
+    child_matches = [cell("1", "A", "대응 없음", number=2), cell("1", "B", "대응 없음", number=2),
+                     cell("2", "A", "동일", number=2), cell("2", "B", "대응 없음", number=2),
+                     cell("3", "A", "대응 없음", number=2), cell("3", "B", "동일", number=2)]
+
+    chain = build(child, child_matches, parents=parents, all_claims=[parent, child])
+
+    assert chain.added == ["2", "3"]
+    assert chain.uncovered == []
+    assert chain.track == "inventive_step_combination"
+    assert "2건" in chain.rationale
 
 
 def test_a_document_that_directly_discloses_a_core_element_stays_a_candidate():
@@ -411,4 +433,51 @@ def test_dependent_addition_absent_from_the_parent_document_moves_to_combination
                   [cell("1", "A", "대응 없음", number=2), cell("2", "A", "동일", number=2)],
                   parents=parents, all_claims=[parent_claim, child_claim])
     assert child.track == "inventive_step_combination"
-    assert child.added == "2"
+    assert child.added == ["2"]
+
+
+# --- 보고서 정량 지표 ---------------------------------------------------------
+
+def checked(*chunks: str, judgment: str = "실질적 동일", disclosed: bool = True) -> ElementMatch:
+    """하위 한정마다 근거 청크를 지정한 셀. 같은 청크를 되풀이하면 근거가 한 자리에 몰린 것이다."""
+    return ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment=judgment, directness="direct",
+        quote="원문 발췌 문장입니다", chunk_id=chunks[0], verify="verified",
+        limitation_checks=[
+            LimitationCheck(index=index, limitation=f"한정 {index}", disclosed=disclosed,
+                            quote=f"한정 {index}의 근거 문장입니다", chunk_id=chunk, verify="verified")
+            for index, chunk in enumerate(chunks)])
+
+
+def test_limitation_counts_expose_the_numerator_and_denominator():
+    """백분율 대신 셀 수 있는 값을 낸다. 독자가 근거 목록과 대조해 검증할 수 있어야 한다."""
+    assert limitation_counts(checked("D1-P-0001", "D1-P-0002")) == (2, 2)
+    assert limitation_counts(checked("D1-P-0001", "D1-P-0002", disclosed=False)) == (0, 2)
+    assert limitation_counts(None) == (0, 0)
+
+
+def test_alternative_group_counts_as_one_limitation():
+    """"A, B 또는 C 중 적어도 하나"는 하나만 개시되면 충족이므로 분모를 키우지 않는다."""
+    match = ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment="실질적 동일", directness="direct",
+        quote="원문 발췌 문장입니다", chunk_id="D1-P-0001", verify="verified",
+        limitation_checks=[
+            LimitationCheck(index=0, limitation="길이를 포함함", alternative_group="속성",
+                            disclosed=True, quote="근거 문장입니다", chunk_id="D1-P-0001",
+                            verify="verified"),
+            LimitationCheck(index=1, limitation="장르를 포함함", alternative_group="속성"),
+        ])
+    assert limitation_counts(match) == (1, 1)
+
+
+def test_evidence_locations_count_distinct_passages():
+    """한 문단을 모든 한정의 근거로 되풀이 인용한 대응은 그 사실이 드러나야 한다."""
+    assert evidence_locations(checked("D1-P-0001", "D1-P-0002")) == 2
+    assert evidence_locations(checked("D1-P-0001", "D1-P-0001")) == 1
+
+
+def test_grade_carries_no_percentage_band():
+    """등급은 이름과 기호만 남긴다. 백분율은 등급을 숫자로 다시 쓴 것에 가까웠다."""
+    assert report_grade(checked("D1-P-0001")) == ("실질적 동일", "🟢")
+    assert report_grade(checked("D1-P-0001", judgment="차이")) == ("대응 안됨", "⚪")
+    assert report_grade(None) == ("대응 안됨", "⚪")
