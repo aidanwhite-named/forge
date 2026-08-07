@@ -401,6 +401,18 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
   font-size: 10px;
   font-weight: 800;
 }
+.claim-conclusion {
+  margin: 0 0 18px;
+  padding: 13px 15px;
+  border: 1px solid #bdd8cb;
+  border-left: 3px solid var(--green-bright);
+  border-radius: 10px;
+  color: #275345;
+  background: #eff8f3;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.7;
+}
 .results { display: grid; gap: 12px; }
 .claim { box-shadow: none; }
 .claim-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }

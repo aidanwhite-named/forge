@@ -379,6 +379,81 @@ def test_markdown_carries_only_the_comparison_itself(stub_cli):
         assert noise not in markdown
 
 
+def test_the_report_states_which_rejection_the_claim_faces(stub_cli):
+    """구성별 유사도만 늘어놓고 결론을 적지 않으면 읽는 사람이 표에서 결론을 추정하게 된다."""
+    result = pipeline.analyze("job", CLAIMS, DOCUMENTS)
+
+    assert result.reports[0].conclusion.startswith("진보성 검토 (인용발명 결합) — ")
+    assert "**결론**: 진보성 검토 (인용발명 결합)" in to_markdown(result)
+
+
+def test_a_novelty_conclusion_says_when_it_rests_on_equivalence(monkeypatch, stub_cli):
+    """신규성 부정이 문언 그대로의 개시가 아니라 등가 판단에 서 있으면 그렇다고 적는다.
+
+    '실질적 동일'은 용어가 다른 것을 같다고 본 **판단**이다. 이를 밝히지 않으면 보고서가
+    문언이 그대로 있었던 경우와 구별되지 않는 모습으로 나가고, 정작 다투어야 할 등가
+    여부가 검토 대상에서 빠진다.
+    """
+    preamble_quote = "본 실시예의 전자장치는 메모리 컨트롤러와 통신부를 포함한다."
+    single = document("1", f"{preamble_quote} {QUOTE_A} {QUOTE_B}", "0021")
+    everything = {"matches": [
+        {"label": "P0", "judgment": "실질적 동일", "directness": "direct", "reason": "전자장치를 개시함",
+         "quote": preamble_quote, "chunk_id": "D1-P-0021", "missing_limitations": [],
+         "limitation_checks": checks(True, preamble_quote, "D1-P-0021")},
+        {"label": "A", "judgment": "실질적 동일", "directness": "direct", "reason": "쓰기 요청을 큐에 저장함",
+         "quote": QUOTE_A, "chunk_id": "D1-P-0021", "missing_limitations": [],
+         "limitation_checks": checks(True, QUOTE_A, "D1-P-0021")},
+        {"label": "B", "judgment": "실질적 동일", "directness": "direct", "reason": "상태 변경 시 알림을 전송함",
+         "quote": QUOTE_B, "chunk_id": "D1-P-0021", "missing_limitations": [],
+         "limitation_checks": checks(True, QUOTE_B, "D1-P-0021")},
+    ]}
+    monkeypatch.setattr(compare, "run_cli",
+                        lambda prompt, expect="claims": (
+                            {"elements": []} if expect == "elements" else everything))
+
+    report = pipeline.analyze("job", CLAIMS, [single]).reports[0]
+
+    assert report.track == "novelty_single"
+    assert report.conclusion.startswith("신규성 없음 (단일 인용발명) — ")
+    assert "구성 A, B은 문언 그대로의 개시가 아니라 '실질적 동일'" in report.conclusion
+    # 전제부는 한정 여부 자체가 미정이라 등가 확인 대상으로 세우지 않는다.
+    assert "P0" not in report.conclusion
+
+
+def test_each_limitation_keeps_the_sentence_that_proved_it(monkeypatch):
+    """대표 발췌 한 문장만 남기면 어느 한정을 무엇으로 개시했는지가 보고서에서 사라진다."""
+    decomposition = {"elements": [
+        {"claim_number": 1, "label": "A", "importance": 5, "limitations": [
+            {"text": "쓰기 요청을 큐에 저장함", "kind": "core"},
+            {"text": "저장된 요청을 순차적으로 처리함", "kind": "qualifier"},
+        ]},
+    ]}
+    matches = {"matches": [
+        {"label": "P0", "judgment": "대응 없음", "directness": "absent", "quote": "",
+         "chunk_id": "", "limitation_checks": checks(False)},
+        {"label": "A", "judgment": "실질적 동일", "directness": "direct", "reason": "큐에 저장함",
+         "quote": QUOTE_A, "chunk_id": "D1-P-0021", "missing_limitations": [],
+         "limitation_checks": [
+             {"index": 0, "disclosed": True, "quote": QUOTE_A, "chunk_id": "D1-P-0021"},
+             {"index": 1, "disclosed": True, "quote": QUOTE_A, "chunk_id": "D1-P-0021"}]},
+        {"label": "B", "judgment": "대응 없음", "directness": "absent", "quote": "",
+         "chunk_id": "", "limitation_checks": checks(False)},
+    ]}
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli",
+                            lambda prompt, expect="claims": (
+                                decomposition if expect == "elements" else matches))
+
+    result = pipeline.analyze("job", CLAIMS, [DOCUMENTS[0]])
+    markdown = to_markdown(result)
+
+    assert "근거:" in markdown
+    assert f'- (core · 쓰기 요청을 큐에 저장함) "{QUOTE_A}" (단락 [0021])' in markdown
+    assert f'- (qualifier · 저장된 요청을 순차적으로 처리함) "{QUOTE_A}" (단락 [0021])' in markdown
+    # 구성 원문 한 줄을 통째로 점검한 셀은 한정별 근거가 아니므로 반복해 적지 않는다.
+    assert markdown.count("근거:") == 1
+
+
 def test_summary_states_the_common_ground_and_the_sharpest_difference(stub_cli):
     report = pipeline.analyze("job", CLAIMS, DOCUMENTS).reports[0]
     assert report.summary_similarity.startswith("청구항과 인용발명 1, 인용발명 2는 ")

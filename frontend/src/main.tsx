@@ -621,6 +621,8 @@ function App() {
                     </div>
                   </div>
 
+                  {report.conclusion && <p className="claim-conclusion">{report.conclusion}</p>}
+
                   <div className="results">
                     {report.claims.map((claim: any, index: number) => (
                       <article key={claim.label || index} className="card claim">

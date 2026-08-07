@@ -234,6 +234,11 @@ class Evidence(BaseModel):
     excerpt: str
     original_excerpt: str | None = None       # 외국어 문헌의 원문 병기
     quality: Literal["HIGH", "MEDIUM", "LOW", "UNVERIFIED"] = "MEDIUM"
+    # 이 발췌가 어느 하위 한정을 개시한 근거로 채택되었는지. 비어 있으면 구성 전체의 대표 발췌입니다.
+    # 대표 발췌는 모델이 구성 하나당 한 문장만 고른 것이라 총론·고찰 문장이 뽑히는 일이 잦은데,
+    # 보고서에는 그 한 문장만 찍히므로 "이 한정은 무엇으로 개시를 인정했는가"가 남지 않았습니다.
+    limitation: str = ""
+    kind: str = ""                            # core / qualifier
 
 
 class DocumentMapping(BaseModel):
@@ -273,6 +278,10 @@ class ClaimReport(BaseModel):
     track: str = ""
     chain: ChainInfo
     claims: list[ClaimResult] = []
+    # 이 청구항에 어떤 거절 이유가 서는지 한 줄. track과 rationale은 chain.py가 이미
+    # 확정해 두고도 보고서에는 한 번도 나오지 않아, 읽는 사람이 구성별 유사도 표에서
+    # 신규성 결론인지 진보성 결론인지를 되짚어 추정해야 했습니다.
+    conclusion: str = ""
     summary_similarity: str = ""              # 종합 분석 요약의 유사점 한 줄
     summary_difference: str = ""              # 종합 분석 요약의 차이점 한 줄
 

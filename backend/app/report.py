@@ -90,6 +90,7 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         track=chain.track,
         chain=chain,
         claims=results,
+        conclusion=_conclusion(claim, chain, merged),
         summary_similarity=_summary_similarity(results, mappings),
         summary_difference=_summary_difference(chain, results),
     )
@@ -268,16 +269,8 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
             continue
         document = documents.get(document_id)
         mapping = by_id.get(document_id)
-        spans = []
-        if match.quote:
-            spans.append((match.chunk_id, match.quote, match.quote_translation, match.verify))
-        spans.extend((span.chunk_id, span.quote, span.quote_translation, span.verify)
-                     for span in match.evidence if span.quote)
-        seen: set[tuple[str, str]] = set()
-        for chunk_id, quote, translation, verify in spans:
-            if (chunk_id, quote) in seen:
-                continue
-            seen.add((chunk_id, quote))
+        def add(chunk_id: str, quote: str, translation: str, verify: str,
+                limitation: str = "", kind: str = "") -> None:
             page, paragraph = _chunk_position(document, chunk_id)
             evidence.append(Evidence(
                 document_id=document_id,
@@ -288,7 +281,28 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
                 excerpt=translation or quote,
                 original_excerpt=quote if translation else None,
                 quality=_QUALITY.get(verify, "UNVERIFIED"),
+                limitation=limitation, kind=kind,
             ))
+
+        spans = []
+        if match.quote:
+            spans.append((match.chunk_id, match.quote, match.quote_translation, match.verify))
+        spans.extend((span.chunk_id, span.quote, span.quote_translation, span.verify)
+                     for span in match.evidence if span.quote)
+        seen: set[tuple[str, str]] = set()
+        for chunk_id, quote, translation, verify in spans:
+            if (chunk_id, quote) in seen:
+                continue
+            seen.add((chunk_id, quote))
+            add(chunk_id, quote, translation, verify)
+        # 하위 한정별 근거는 대표 발췌와 중복되더라도 따로 남깁니다. 대표 발췌 하나만
+        # 남기면 "어느 한정을 무엇으로 개시했는가"가 사라지고, 총론 문장 하나로 구성
+        # 전체를 개시했다고 적은 판정과 한정마다 원문을 짚은 판정이 보고서에서 구별되지
+        # 않습니다. 어느 쪽인지가 곧 그 판정을 다툴 수 있는지를 가릅니다.
+        for check in match.limitation_checks:
+            if check.disclosed and check.quote and not check.whole_element:
+                add(check.chunk_id, check.quote, check.quote_translation, check.verify,
+                    limitation=check.limitation, kind=check.kind)
     return evidence
 
 
@@ -320,6 +334,56 @@ def _reference_number(document_id: str, mappings: list[DocumentMapping]) -> int 
         if mapping.document_id == document_id:
             return mapping.reference_number
     return None
+
+
+# --- 결론 --------------------------------------------------------------------
+
+_TRACK_TITLES = {
+    "novelty_single": "신규성 없음 (단일 인용발명)",
+    "inventive_step_combination": "진보성 검토 (인용발명 결합)",
+    "rejection_impossible": "거절 이유 구성 곤란",
+    "analysis_incomplete": "구성대비 미완료",
+}
+
+
+def _conclusion(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch]) -> str:
+    """이 청구항에 어떤 거절 이유가 서는지 한 줄로 확정합니다.
+
+    구성별 유사도만 늘어놓고 결론을 적지 않으면, 읽는 사람은 표를 되짚어 신규성인지
+    진보성인지를 스스로 추정하게 됩니다. 추정의 방향은 읽는 사람마다 다르고, 그 추정이
+    보고서의 결론으로 인용됩니다. track과 rationale은 이미 확정된 값이므로 그대로 적습니다.
+    """
+    title = _TRACK_TITLES.get(chain.track, "결론 미확정")
+    if chain.track == "analysis_incomplete":
+        return f"{title} — 판정을 받지 못한 셀이 있어 신규성·진보성 결론을 만들지 않았습니다."
+    detail = [chain.rationale] if chain.rationale else []
+    detail += _equivalence_caveat(claim, chain, merged)
+    if chain.uncovered:
+        detail.append(f"미대응 구성: {', '.join(chain.uncovered)}.")
+    if chain.residual:
+        detail.append(f"차이가 남는 구성: {', '.join(chain.residual)}.")
+    return f"{title} — {' '.join(detail)}" if detail else title
+
+
+def _equivalence_caveat(claim: Claim, chain: ChainInfo,
+                        merged: dict[str, ElementMatch]) -> list[str]:
+    """신규성 부정이 문언 그대로의 개시가 아니라 등가 판단에 서 있으면 그렇다고 적습니다.
+
+    신규성 부정은 청구항을 죽이는 가장 강한 결론인데, `실질적 동일`은 "용어가 다르나
+    기술적 의미가 같다"는 **판단**입니다. 판단 근거가 등가성인 구성을 밝히지 않으면
+    보고서는 문언이 그대로 있었던 것과 구별되지 않는 모습으로 나가고, 정작 다투어야 할
+    등가 여부가 검토 대상에서 빠집니다. 등가로 본 구성이 하나도 없으면 아무것도 적지 않습니다.
+    """
+    if chain.track != "novelty_single":
+        return []
+    equivalent = [element.label for element in claim.elements
+                  if not element.is_preamble
+                  and (match := merged.get(element.label)) and match.judgment == "실질적 동일"]
+    if not equivalent:
+        return []
+    return [f"다만 구성 {', '.join(equivalent)}은 문언 그대로의 개시가 아니라 '실질적 동일'"
+            "(용어가 다르나 기술적 의미와 작동 관계가 같음) 판단에 근거하므로, 결론을 확정하기 전에 "
+            "각 구성의 등가 여부를 근거 발췌로 확인해야 합니다."]
 
 
 # --- 종합 분석 요약 -----------------------------------------------------------
@@ -406,6 +470,8 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
         lines += ["**인용발명 조합**: 이 청구항의 구성에 대응하는 인용발명이 확인되지 않았습니다.", ""]
     else:
         lines += [f"**인용발명 조합**: {_chain_text(report.chain, mappings)}", ""]
+    if report.conclusion:
+        lines += [f"**결론**: {report.conclusion}", ""]
     if report.preamble:
         lines += [f"> {report.preamble}", ""]
     for item in report.claims:
@@ -416,12 +482,39 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
         lines.append(item.narrative.replace("\n", "  \n"))
         if item.difference:
             lines.append(f"→ 차이점: {item.difference}")
+        lines += _limitation_evidence_lines(item)
     lines += ["", "### 종합 분석 요약", ""]
     if report.summary_similarity:
         lines.append(f"- 유사점: {report.summary_similarity}")
     if report.summary_difference:
         lines.append(f"- 차이점: {report.summary_difference}")
     return lines
+
+
+def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
+    """하위 한정마다 무엇을 근거로 개시를 인정했는지 적습니다.
+
+    대표 발췌 한 문장만 찍던 종전 형식으로는, 총론 한 줄로 구성 전체를 개시했다고 본
+    판정과 한정마다 실시 문장을 짚은 판정이 똑같이 "…는 구성이 기재되어 있으며"로 나갑니다.
+    등급이 같아도 다툴 수 있는 판정인지는 여기서 갈리므로, 근거를 한정 단위로 남깁니다.
+    """
+    proofs = [evidence for evidence in item.evidence if evidence.limitation]
+    if not proofs:
+        return []
+    lines = ["", "근거:"]
+    for proof in proofs:
+        kind = f"{proof.kind} · " if proof.kind else ""
+        lines.append(f"- ({kind}{_clip(proof.limitation, 80)}) "
+                     f'"{_clip(proof.excerpt, EXCERPT_LIMIT)}" ({_evidence_location(proof)})')
+    return lines
+
+
+def _evidence_location(evidence: Evidence) -> str:
+    if evidence.paragraph:
+        return f"단락 [{evidence.paragraph}]"
+    if evidence.page:
+        return f"{evidence.page} 페이지"
+    return evidence.chunk_id or "출처 미상"
 
 
 def _chain_text(chain: ChainInfo, mappings: list[DocumentMapping]) -> str:
