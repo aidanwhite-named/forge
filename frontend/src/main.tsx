@@ -17,8 +17,40 @@ type Result = {
 type Tab = 'analysis' | 'result' | 'history' | 'logs' | 'settings';
 type Settings = {provider: string; model: string; prompt: string};
 type LogItem = {job_id: string; size: number; updated_at?: string};
+type Progress = {done: number | null; total: number};
+// detail은 응답이 실패했을 때 FastAPI가 돌려주는 오류 메시지 자리입니다.
+type Job = {status: string; stage?: string; error?: string; progress?: Progress; detail?: string};
+type ViewTransition = {ready?: Promise<void>; finished: Promise<void>};
+type WithViewTransition = Document & {
+  startViewTransition?: (callback: () => void) => ViewTransition;
+};
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
+const scrollToTop = () => window.scrollTo({top: 0, behavior: 'smooth'});
+
+/** 셀 진행률 바. 서버가 done/total을 줄 때만 그립니다. */
+function ProgressBar({progress}: {progress: Progress | null}) {
+  if (!progress?.total) return null;
+  const done = progress.done || 0;
+  const percent = Math.min(100, Math.round((done / progress.total) * 100));
+  return (
+    <div className="run-progress">
+      <div className="track" role="progressbar" aria-valuenow={done} aria-valuemin={0}
+           aria-valuemax={progress.total}>
+        <i style={{width: `${percent}%`}} />
+      </div>
+      <span>{done}/{progress.total}</span>
+    </div>
+  );
+}
+// 선행기술 결과의 실재 확인 표시 → [CSS 클래스, 라벨]. 확인하지 못한 것도 감추지 않습니다.
+const PRIOR_ART_VERIFY: Record<string, [string, string]> = {
+  verified: ['verified', '✅ 확인됨'],
+  mismatch: ['mismatch', '⚠️ 번호 불일치'],
+  unreachable: ['unchecked', '❔ 확인 불가'],
+  unchecked: ['unchecked', '❔ 미확인'],
+};
+
 const formatLogDate = (value?: string) => {
   if (!value) return '수정 시각 없음';
   const date = new Date(value);
@@ -42,6 +74,9 @@ function App() {
   // 종속항 카드의 취소 버튼까지 떠서, 누르면 엉뚱한 취소 경로가 돕니다.
   const [priorArtBusy, setPriorArtBusy] = useState(false);
   const [stage, setStage] = useState('입력 대기');
+  const [progress, setProgress] = useState<Progress | null>(null);
+  // 서버가 재시작되면 분석이 중단됩니다. 404 대신 사유를 받아 그대로 보여 줍니다.
+  const [interrupted, setInterrupted] = useState('');
   const [message, setMessage] = useState('');
   const [settings, setSettings] = useState<Settings>({
     provider: 'agy',
@@ -116,38 +151,34 @@ function App() {
     }
   }
 
-  function navigate(next: Tab, scroll = true) {
+  // 탭 전환은 한 곳에서만 합니다. navigate와 openResult가 각자 뷰 전환 분기를 들고 있으면
+  // 한쪽만 고쳐져 같은 앱 안에서 전환 동작이 갈립니다.
+  function switchTab(next: Tab) {
+    const change = () => setTab(next);
+    const {startViewTransition} = document as WithViewTransition;
+    if (!startViewTransition) {
+      change();
+      requestAnimationFrame(scrollToTop);
+      return;
+    }
+    const transition = startViewTransition.call(document, change);
+    // 전환이 건너뛰어질 수 있습니다(탭이 백그라운드이거나 모션 축소 설정). 그때 ready는
+    // InvalidStateError로 거부되지만 change()는 그대로 실행되어 화면은 바뀝니다. 아무도
+    // 받지 않는 거부라 콘솔에 처리되지 않은 예외로 쌓여 진짜 오류를 덮으므로 삼킵니다.
+    transition.ready?.catch(() => undefined);
+    transition.finished.then(scrollToTop, scrollToTop);
+  }
+
+  function navigate(next: Tab) {
     if (next === 'result' && !result) return;
     if (next === 'logs') void refreshLogs();
-    const change = () => setTab(next);
-    const viewTransition = (document as Document & {
-      startViewTransition?: (callback: () => void) => {finished: Promise<void>};
-    }).startViewTransition;
-    if (viewTransition) {
-      const transition = viewTransition.call(document, change);
-      if (scroll) transition.finished.then(() => window.scrollTo({top: 0, behavior: 'smooth'}));
-    } else {
-      change();
-      if (scroll) requestAnimationFrame(() => window.scrollTo({top: 0, behavior: 'smooth'}));
-    }
+    switchTab(next);
   }
 
   function openResult(next: Result) {
     setResult(next);
-    requestAnimationFrame(() => {
-      const change = () => setTab('result');
-      const start = (document as Document & {
-        startViewTransition?: (callback: () => void) => {finished: Promise<void>};
-      }).startViewTransition;
-      if (start) {
-        start.call(document, change).finished.then(() =>
-          window.scrollTo({top: 0, behavior: 'smooth'}),
-        );
-      } else {
-        change();
-        window.scrollTo({top: 0, behavior: 'smooth'});
-      }
-    });
+    // setResult가 반영된 뒤에 전환해야 구성대비 탭이 한 프레임 비어 보이지 않습니다.
+    requestAnimationFrame(() => switchTab('result'));
   }
 
   async function loadModels(next: Settings, refresh = false) {
@@ -191,6 +222,15 @@ function App() {
     setMessage('분석 지침 프롬프트를 기본값으로 되돌렸습니다.');
   }
 
+  async function clearCache() {
+    if (!confirm('저장된 판정 캐시를 모두 지울까요? 다음 분석은 전부 다시 판정합니다.')) return;
+    const response = await fetch(API + '/cache', {method: 'DELETE'});
+    const data = await response.json();
+    setMessage(response.ok
+      ? `판정 캐시 ${data.removed}건을 지웠습니다.`
+      : '판정 캐시를 지우지 못했습니다.');
+  }
+
   async function testSettings() {
     const response = await fetch(API + '/settings/test', {
       method: 'POST',
@@ -208,6 +248,8 @@ function App() {
 
     setGenerating(true);
     setMessage('');
+    setInterrupted('');
+    setProgress(null);
     setStage('작업 준비 중');
     cancelRequested.current = false;
 
@@ -239,9 +281,14 @@ function App() {
       while (!cancelRequested.current) {
         await sleep(650);
         const statusResponse = await fetch(`${API}/jobs/${prepared.job_id}`);
-        const job = await statusResponse.json();
+        const job: Job = await statusResponse.json();
         if (!statusResponse.ok) throw new Error(job.detail || '작업 상태를 확인하지 못했습니다.');
         setStage(job.stage || '분석 중');
+        setProgress(job.progress || null);
+        if (job.status === 'interrupted') {
+          setInterrupted(job.error || '분석이 중단되었습니다.');
+          return;
+        }
         if (job.status === 'failed') throw new Error(job.error || '분석에 실패했습니다.');
         if (job.status === 'cancelled') return;
         if (job.status !== 'completed') continue;
@@ -267,7 +314,8 @@ function App() {
   }
 
   async function cancelGeneration() {
-    if (!generating && !actionBusy) return;
+    // 종속항 대비 취소는 cancelDependentClaims가 따로 처리합니다(저장된 항을 되불러와야 함).
+    if (!generating) return;
     cancelRequested.current = true;
     setStage('취소 중');
     uploadController.current?.abort();
@@ -299,7 +347,7 @@ function App() {
       await sleep(650);
       const statusResponse = await fetch(`${API}/jobs/${jobId}`);
       if (!statusResponse.ok) break;
-      const job = await statusResponse.json();
+      const job: Job = await statusResponse.json();
       setStage(job.stage || '취소 중');
       if (job.status === 'running' || job.status === 'cancelling') continue;
       const resultResponse = await fetch(`${API}/jobs/${jobId}/result`);
@@ -420,6 +468,8 @@ function App() {
     const jobId = result.job_id;
     setActionBusy(true);
     setMessage('');
+    setInterrupted('');
+    setProgress(null);
     setStage('종속항 구성대비 준비 중');
     cancelRequested.current = false;
     activeJob.current = jobId;
@@ -438,9 +488,14 @@ function App() {
       while (!cancelRequested.current) {
         await sleep(650);
         const statusResponse = await fetch(`${API}/jobs/${jobId}`);
-        const job = await statusResponse.json();
+        const job: Job = await statusResponse.json();
         if (!statusResponse.ok) throw new Error(job.detail || '작업 상태를 확인하지 못했습니다.');
         setStage(job.stage || '구성대비 중');
+        setProgress(job.progress || null);
+        if (job.status === 'interrupted') {
+          setInterrupted(job.error || '종속항 대비가 중단되었습니다.');
+          return;
+        }
         if (job.status === 'failed') throw new Error(job.error || '종속항 분석에 실패했습니다.');
         if (job.status !== 'completed' && job.status !== 'cancelled') continue;
 
@@ -568,6 +623,7 @@ function App() {
               <div>
                 <strong>{generating ? stage : '보고서 준비'}</strong>
                 <small>{generating ? '분석 프로세스가 실행 중입니다.' : '입력한 청구항과 문헌으로 구성대비합니다.'}</small>
+                {generating && <ProgressBar progress={progress} />}
               </div>
             </div>
             <div className="run-actions">
@@ -584,6 +640,7 @@ function App() {
               </button>
             </div>
           </section>
+          {interrupted && <div className="job-interrupted" role="status">{interrupted}</div>}
           {message && <div className="notice" role="status">{message}</div>}
         </main>
       )}
@@ -705,6 +762,7 @@ function App() {
                 <div className="action">
                   <span className="hint">
                     {actionBusy ? stage : '기존 문헌을 그대로 사용합니다.'}
+                    {actionBusy && <ProgressBar progress={progress} />}
                   </span>
                   {actionBusy && (
                     <button type="button" className="cancel" onClick={cancelDependentClaims}>취소</button>
@@ -718,10 +776,18 @@ function App() {
               {!!result.prior_art?.length && (
                 <section className="card prior-art">
                   <h2>추가 선행기술</h2>
+                  <p className="hint">
+                    웹 검색 결과입니다. 아래 표시는 제시된 URL을 열어 문헌번호가 그 페이지에
+                    있는지만 확인한 것이며, 선행기술 적격성 판단이 아닙니다.
+                  </p>
                   {result.prior_art.map((hit: any, index: number) => (
                     <div key={index} className="mapping-row">
                       <b>{hit.claim_number ? `청구항 ${hit.claim_number} ` : ''}({hit.label})</b>
                       <span>{hit.document_number || hit.title}</span>
+                      <span className={`verify-chip ${PRIOR_ART_VERIFY[hit.verify]?.[0] || 'unchecked'}`}
+                            title={hit.verify_note || ''}>
+                        {PRIOR_ART_VERIFY[hit.verify]?.[1] || '미확인'}
+                      </span>
                       <small>{hit.correspondence}</small>
                       {hit.url && <a href={hit.url} target="_blank" rel="noreferrer">열기</a>}
                     </div>
@@ -793,8 +859,13 @@ function App() {
               <textarea className="prompt-input" value={settings.prompt} onChange={event => setSettings({...settings, prompt: event.target.value})} />
             </label>
             <div className="action">
+              <span className="hint">
+                판정 캐시에는 업로드한 문헌의 원문 발췌가 남습니다. 저장물을 완전히 비우려면
+                여기서 지우세요.
+              </span>
               <button onClick={testSettings}>연결 테스트</button>
               <button onClick={resetPrompt}>기본값</button>
+              <button className="danger" onClick={clearCache}>판정 캐시 비우기</button>
               <button className="primary" onClick={() => saveSettings()}>저장</button>
             </div>
             {message && <div className="notice">{message}</div>}

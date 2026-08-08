@@ -102,19 +102,48 @@ agy와 Claude의 `-p`는 값을 받는 플래그이므로 프롬프트는 항상
 - `POST /api/jobs/prepare` → `POST /api/jobs/{id}/start` — 취소 가능한 작업 id를 먼저 받고 업로드와 분석을 시작합니다. `GET /api/jobs/{id}`로 진행 단계(`stage`)를, `DELETE /api/jobs/{id}`로 취소를 처리합니다.
 - `GET /api/jobs/{id}/result`, `GET /api/jobs/{id}/download?format=md|txt`
 - `GET /api/jobs/{id}/sources/{document_id}` — 분석 당시 히스토리에 보존한 원문 PDF
-- `POST /api/jobs/{id}/prior-art` — 결합 후 완전히 미커버된 구성과 일부 대응 뒤 남은 하위 한정을 웹에서 선행기술 검색합니다. 외부 호출이므로 분석 중 자동 실행하지 않고 이 요청에서만 동작합니다.
+- `POST/DELETE /api/jobs/{id}/prior-art` — 결합 후 완전히 미커버된 구성과 일부 대응 뒤 남은 하위 한정을 웹에서 선행기술 검색하고, 진행 중인 검색을 취소합니다. 외부 호출이므로 분석 중 자동 실행하지 않고 이 요청에서만 동작합니다. 저장된 보고서가 있으면 실행할 수 있습니다 — 종속항 대비를 취소해 일부만 반영된 보고서도 대상입니다(취소는 확정된 항을 남깁니다).
+  검색 결과는 코드가 다시 확인합니다: 제시된 URL을 열어 문헌번호가 그 페이지에 있는지 대조하고
+  `verify`에 `verified`/`mismatch`/`unreachable`을 남깁니다. 구성대비 발췌를 원문과 대조하는 것과
+  같은 이유이며, 확인하지 못한 결과도 지우지 않고 표시만 합니다(사내망이 외부를 막았을 수 있고,
+  그때 지우면 검색이 조용히 0건이 됩니다). `FORGE_PRIOR_ART_VERIFY_TIMEOUT=0`이면 대조하지 않습니다.
+  **웹 검색은 provider에 따라 동작이 다릅니다.** agy(`--sandbox`)는 터미널만 제한하므로 검색이
+  되지만, claude는 `--tools ""`로 내장 도구를 전부 끄고 codex는 기본 샌드박스라 검색이 나가지
+  않습니다. 이때 결과는 0건이 됩니다.
 - `GET/DELETE /api/history`, `DELETE /api/history/{id}` — 저장된 결과·리포트를 조회하거나 지웁니다. 로그는 별도 보존됩니다.
 - `DELETE /api/cache` — 판정 캐시 초기화.
 - `POST /api/jobs/{job_id}/dependent-claims` — 기존 보고서에 청구항 1의 종속항을 복수로 추가. 본문은
   `{"claims":"【청구항 2】 ... 【청구항 3】 ..."}` 형식이며, 최초 분석에서 저장한 인용발명 추출
   캐시를 재사용해 PDF 업로드 없이 모든 신규 종속항을 한 번의 구성대비 호출로 처리합니다.
-- `GET /api/logs`, `GET/PUT /api/logs/{job_id}`, `DELETE /api/logs` — 로그 목록·본문 조회, 전체 삭제
+- `GET /api/logs`, `GET /api/logs/{job_id}`, `DELETE /api/logs` — 로그 목록·본문 조회, 전체 삭제
 - `GET/PUT /api/settings`, `GET /api/settings/models`
 
 분석마다 Forge 루트의 `history/{job_id}/`에 `result.json`·`report.md`·`report.txt`·`judgment.json`과
 후속 종속항 분석용 `documents.json`이 남습니다. `judgment.json`은 문헌별 적합도 점수, 채택/미채택
 역할, 구성요소별 판정과 근거를 담은 판정 추적 데이터입니다.
 작업 로그는 Forge 루트의 `logs/`에 별도로 보존되며, 히스토리 삭제와 독립적으로 관리됩니다.
+두 위치는 `FORGE_HISTORY_DIR`·`FORGE_LOG_DIR`로 옮길 수 있습니다. 컨테이너에서는 Forge 루트가
+파일시스템 루트가 되므로 **반드시** 마운트된 볼륨 안을 가리켜야 합니다(`docker-compose.yml` 참고).
+
+결과·문헌·청구항 원문의 원본은 이 히스토리이고, 서버 메모리의 작업 레코드는 캐시일 뿐입니다.
+끝난 작업은 문헌 본문을 곧바로 놓아 주고(그래야 서버를 켜 둔 만큼 메모리가 늘지 않습니다),
+버려진 작업 레코드는 `FORGE_JOB_RECORD_TTL_MINUTES`(기본 60분) 뒤에 정리됩니다. 정리된 뒤에도
+같은 `job_id`로 결과 조회와 내려받기가 됩니다.
+
+진행 중인 작업의 상태는 `backend/data/jobs/`에도 남습니다. 분석 도중 서버가 재시작되면
+(포트 정리·크래시) 그 작업은 `interrupted`로 표시되어, 화면이 "작업을 찾을 수 없습니다" 대신
+중단 사유를 보여 줍니다. 같은 입력으로 다시 실행하면 이미 끝난 판정은 판정 캐시에서
+재사용되므로 남은 셀만 새로 대비합니다.
+
+### 삭제
+
+`DELETE /api/history/{id}`는 히스토리 폴더뿐 아니라 **레거시 사본(`backend/data/history/`)과
+그 분석이 사용한 판정 캐시 항목**까지 함께 지웁니다. 레거시 사본을 남기면 기동 시 마이그레이션이
+되살리고, 판정 캐시에는 업로드한 문헌의 **원문 발췌**가 들어 있어 그것을 남기면 지웠다고
+생각한 문장이 디스크에 남습니다. 어느 캐시 항목이 그 분석의 것인지는 `cache_keys.json`에
+기록해 둡니다. 로그도 마찬가지로 레거시 사본까지 지웁니다.
+
+전체를 비우려면 설정 탭의 "판정 캐시 비우기"(`DELETE /api/cache`)를 함께 쓰십시오.
 
 ## 테스트
 

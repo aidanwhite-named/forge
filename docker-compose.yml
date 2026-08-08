@@ -3,7 +3,11 @@ services:
     build: ./backend
     ports: ["8330:8330"]
     environment:
-      AGY_MODEL: "flash-3.6"
+      AGY_MODEL: "gemini-3.6-flash-medium"
+      # 컨테이너에서는 Forge 루트가 파일시스템 루트("/")라, 기본값을 두면 보고서와 로그가
+      # /history · /logs 에 쓰여 아래 볼륨 바깥으로 나가고 재시작마다 사라집니다.
+      FORGE_HISTORY_DIR: /app/data/history
+      FORGE_LOG_DIR: /app/data/logs
     volumes:
       - ./backend/data:/app/data
   frontend:

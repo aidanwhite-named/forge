@@ -221,7 +221,7 @@ def compare_document(claim: Claim, document: Document, guideline: str = "",
         return _placeholders(claim, document, f"{document.filename} 비교 호출 실패: {exc}"), [
             f"청구항 {claim.number} × {document.filename} 비교에 실패해 판정을 받지 못했습니다: {exc}"
         ]
-    return _build_matches(raw.get("matches"), claim, document, require_limitation_checks=True)
+    return _build_matches(raw.get("matches"), claim, document)
 
 
 def compare_claims_documents(claims: list[Claim], documents: list[Document],
@@ -284,8 +284,7 @@ def compare_claims_documents(claims: list[Claim], documents: list[Document],
     for claim in claims:
         for document in documents:
             key = (claim.number, document.id)
-            cell, cell_warnings = _build_matches(
-                grouped.get(key, []), claim, document, require_limitation_checks=True)
+            cell, cell_warnings = _build_matches(grouped.get(key, []), claim, document)
             # cell_warnings는 라벨이 빠졌거나 하위 제한 점검이 모자란다는 뜻입니다. 그런 셀은
             # 판정이 아니라 미판정이므로 채택하지 않고 호출부가 단건으로 다시 받게 둡니다.
             if not cell_warnings:
@@ -425,11 +424,15 @@ def _placeholders(claim: Claim, document: Document, error: str = "") -> list[Ele
             for element in claim.elements]
 
 
-def _build_matches(raw_matches, claim: Claim, document: Document,
-                   require_limitation_checks: bool = False) -> tuple[list[ElementMatch], list[str]]:
+def _build_matches(raw_matches, claim: Claim, document: Document
+                   ) -> tuple[list[ElementMatch], list[str]]:
     """입력 구성요소를 기준으로 정렬합니다. 라벨이 어긋난 응답은 미개시로 둡니다.
 
     위치로 폴백하면 (A)가 (B)의 판정을 가져가 이후 구성이 통째로 밀리므로 하지 않습니다.
+
+    하위 제한 점검은 항상 요구합니다. 종전에는 이것을 끌 수 있는 인자가 있었지만 두 호출
+    경로 모두 켠 채로만 불렀고, 끄면 같은 청구항이 최초 분석에 있었는지 나중에 추가됐는지에
+    따라 다른 판정을 받습니다.
     """
     by_label: dict[str, dict] = {}
     for item in raw_matches or []:
@@ -453,19 +456,16 @@ def _build_matches(raw_matches, claim: Claim, document: Document,
         directness = str(item.get("directness", "")).strip().lower()
         quote = re.sub(r"\s+", " ", str(item.get("quote") or "")).strip()
         missing = [str(value).strip() for value in item.get("missing_limitations") or [] if str(value).strip()]
-        checks: list[LimitationCheck] = []
-        omitted_checks: list[str] = []
-        if require_limitation_checks:
-            checks, check_missing, omitted_checks = _build_limitation_checks(
-                item.get("limitation_checks"), _requirements(element),
-                whole_element=not element.limitations)
-            # 점검 결과가 있으면 그쪽만 씁니다. 모델의 자유 서술 목록과 합치면 같은 한정이
-            # 표현만 달리해 두 번 실리고, 그대로 보고서의 차이점 줄에 중복으로 찍힙니다.
-            missing = check_missing if checks else missing
-            if omitted_checks:
-                warnings.append(
-                    f"청구항 {claim.number} ({element.label}) / {document.filename}: "
-                    f"하위 제한 점검 응답 {len(omitted_checks)}건이 누락되어 미개시로 처리했습니다.")
+        checks, check_missing, omitted_checks = _build_limitation_checks(
+            item.get("limitation_checks"), _requirements(element),
+            whole_element=not element.limitations)
+        # 점검 결과가 있으면 그쪽만 씁니다. 모델의 자유 서술 목록과 합치면 같은 한정이
+        # 표현만 달리해 두 번 실리고, 그대로 보고서의 차이점 줄에 중복으로 찍힙니다.
+        missing = check_missing if checks else missing
+        if omitted_checks:
+            warnings.append(
+                f"청구항 {claim.number} ({element.label}) / {document.filename}: "
+                f"하위 제한 점검 응답 {len(omitted_checks)}건이 누락되어 미개시로 처리했습니다.")
         valid_judgment = judgment if judgment in _JUDGMENTS else "대응 없음"
         downgraded_from = ""
         if missing and valid_judgment in {"동일", "실질적 동일"}:

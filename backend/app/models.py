@@ -7,11 +7,6 @@ Directness = Literal["direct", "inferred", "absent"]
 VerifyStatus = Literal["verified", "partial", "not_found", "empty", "short"]
 
 
-class JobCreate(BaseModel):
-    claims: str = Field(min_length=1)
-    analysis_prompt: str = ""
-
-
 class DependentClaimsAdd(BaseModel):
     claims: str = Field(min_length=1)
 
@@ -318,6 +313,12 @@ class ClaimReport(BaseModel):
     summary_difference: str = ""              # 종합 분석 요약의 차이점 한 줄
 
 
+# 검색 결과가 실재하는 문헌인지. 파이프라인의 나머지가 발췌를 원문 대조하는 것과 같은
+# 이유로, 이 단계의 산출물도 코드가 확인합니다. 확인 실패를 삭제하지는 않고 표시만 합니다 —
+# 망이 막혀 있을 수도 있고, 그때 결과를 지우면 검색이 조용히 0건이 됩니다.
+PriorArtVerify = Literal["verified", "mismatch", "unreachable", "unchecked"]
+
+
 class PriorArtHit(BaseModel):
     claim_number: int | None = None
     label: str
@@ -327,6 +328,11 @@ class PriorArtHit(BaseModel):
     correspondence: str = ""
     remaining_difference: str = ""
     url: str = ""
+    # verified: URL을 열어 그 페이지에서 문헌번호를 확인함
+    # mismatch: 페이지는 열렸으나 문헌번호가 없음 (지어냈을 가능성)
+    # unreachable: URL이 없거나 열리지 않음
+    verify: PriorArtVerify = "unchecked"
+    verify_note: str = ""
 
 
 class AnalysisResult(BaseModel):

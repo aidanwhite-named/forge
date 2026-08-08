@@ -860,7 +860,7 @@ def test_summary_does_not_claim_an_undisclosed_limitation_as_common_ground():
         ClaimResult(label="A", claim=claim.elements[0].text, corresponded=True,
                     status="부분 개시", adopted_reference=1),
     ]
-    summary = _summary_similarity(claim, partial_only, [])
+    summary = _summary_similarity(claim, partial_only)
     assert "부분적으로 공통되며" in summary
 
     # 완전 개시 구성이 하나라도 있으면 중요도가 낮아도 그쪽을 대표로 삼는다.
@@ -868,7 +868,7 @@ def test_summary_does_not_claim_an_undisclosed_limitation_as_common_ground():
         ClaimResult(label="B", claim=claim.elements[1].text, corresponded=True,
                     status="개시됨", adopted_reference=1),
     ]
-    summary = _summary_similarity(claim, mixed, [])
+    summary = _summary_similarity(claim, mixed)
     assert "영상을 출력하는 디스플레이부" in summary
     assert "부분적으로" not in summary
 

@@ -27,7 +27,13 @@ from .verify import verify_matches
 
 def analyze(job_id: str, claims_text: str, documents: list[Document],
             analysis_prompt: str = "", progress=None,
-            decomposition: dict | None = None) -> AnalysisResult:
+            decomposition: dict | None = None,
+            cache_keys: set[str] | None = None) -> AnalysisResult:
+    """cache_keys를 주면 이 분석이 사용한 판정 캐시 키를 담아 돌려줍니다.
+
+    캐시 항목에는 문헌 원문 발췌가 들어 있어서, 분석을 지울 때 그 항목도 함께 지워야
+    '삭제'가 실제 삭제가 됩니다. 어느 키가 이 분석의 것인지는 여기서만 알 수 있습니다.
+    """
     claims = parse_claims(claims_text)
     if not claims:
         raise RuntimeError("청구항을 인식하지 못했습니다.")
@@ -37,7 +43,8 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     validation += _date_eligibility_warnings(documents)
     by_id = {document.id: document for document in documents}
 
-    matches, cached_claims, compare_warnings = _compare_all(claims, documents, guideline, progress)
+    matches, cached_claims, compare_warnings = _compare_all(claims, documents, guideline,
+                                                            progress, cache_keys)
     validation += compare_warnings
     # 발췌 검증 기록(위치 자동 복구·판정 강등)은 판정을 추적할 때만 필요한 내부 정보입니다.
     # 보고서 본문에 섞으면 구성대비 결과보다 도구의 동작 로그가 더 길어집니다.
@@ -76,7 +83,8 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
                                  new_claim_numbers: set[int], documents: list[Document],
                                  analysis_prompt: str = "", progress=None,
                                  decomposition: dict | None = None,
-                                 checkpoint=None) -> AnalysisResult:
+                                 checkpoint=None,
+                                 cache_keys: set[str] | None = None) -> AnalysisResult:
     """기존 보고서의 인용발명을 재사용해 새 종속항 보고서를 덧붙입니다.
 
     기존 청구항은 다시 판정하지 않습니다. 새 종속항 중 캐시에 없는 (청구항 × 문헌) 셀만
@@ -98,7 +106,7 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
     cancelled: AnalysisCancelled | None = None
     try:
         cached_claims, warnings = _compare_all_batch(
-            new_claims, documents, guideline, progress, matches)
+            new_claims, documents, guideline, progress, matches, cache_keys)
     except AnalysisCancelled as exc:
         cancelled, cached_claims, warnings = exc, set(), []
     validation += warnings
@@ -159,7 +167,8 @@ def _claim_matrix(matches: list[ElementMatch], documents: list[Document],
 
 
 def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
-                 progress) -> tuple[list[ElementMatch], set[int], list[str]]:
+                 progress, cache_keys: set[str] | None = None
+                 ) -> tuple[list[ElementMatch], set[int], list[str]]:
     """(청구항 × 문헌) 전수 비교. 캐시가 있으면 CLI를 부르지 않습니다."""
     cells: dict[tuple[int, str], list[ElementMatch]] = {}
     cached_claims: set[int] = set()
@@ -167,7 +176,10 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
     for claim in claims:
         claim_cached = bool(documents)
         for document in documents:
-            cell = cache.load(cache.cache_key(claim, document, guideline))
+            key = cache.cache_key(claim, document, guideline)
+            if cache_keys is not None:
+                cache_keys.add(key)
+            cell = cache.load(key)
             if cell is None:
                 claim_cached = False
                 tasks.append((claim, document))
@@ -223,7 +235,10 @@ def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress
             done += 1
             if progress:
                 try:
-                    progress(f"구성대비 {done}/{total} — 청구항 {claim.number} × {document.filename}")
+                    # done/total을 문자열에만 담으면 화면이 진행 바를 그릴 수 없습니다.
+                    # 같은 값을 숫자로도 넘겨, 표시 방법은 호출부가 정하게 합니다.
+                    progress(f"구성대비 {done}/{total} — 청구항 {claim.number} × {document.filename}",
+                             done, total)
                 except AnalysisCancelled as exc:
                     # 이 셀의 판정은 이미 끝났습니다. 진행률 보고에서 취소를 알았다고 그
                     # 결과까지 버리면, 방금 받은 판정을 다음 실행에서 또 받게 됩니다.
@@ -245,7 +260,8 @@ def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress
 
 
 def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline: str,
-                       progress, matches: list[ElementMatch]) -> tuple[set[int], list[str]]:
+                       progress, matches: list[ElementMatch],
+                       cache_keys: set[str] | None = None) -> tuple[set[int], list[str]]:
     """캐시 누락 종속항을 한 번에 대비하고, 온전하지 않은 셀만 단건으로 메웁니다.
 
     판정은 ``matches``에 덧붙여 나갑니다. 반환값으로만 넘기면 중간에 취소되었을 때 이미
@@ -257,7 +273,10 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
     for claim in claims:
         claim_cached = bool(documents)
         for document in documents:
-            cell = cache.load(cache.cache_key(claim, document, guideline))
+            key = cache.cache_key(claim, document, guideline)
+            if cache_keys is not None:
+                cache_keys.add(key)
+            cell = cache.load(key)
             if cell is None:
                 claim_cached = False
                 misses_by_claim.setdefault(claim.number, []).append(document)

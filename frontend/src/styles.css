@@ -296,6 +296,36 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 .is-running .run-dot { background: #73b540; animation: status-pulse 1.2s infinite; }
 .run-actions { display: flex; align-items: center; gap: 8px; }
 
+/* 셀 진행률. 서버가 done/total을 숫자로 주므로 남은 양이 실제로 보입니다. */
+.run-progress { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
+.run-progress .track {
+  position: relative;
+  height: 4px;
+  flex: 1 1 auto;
+  min-width: 80px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, .09);
+}
+.run-progress .track i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: block;
+  border-radius: inherit;
+  background: #73b540;
+  transition: width .35s ease;
+}
+.run-progress span { color: var(--ink-soft); font-size: 11px; font-variant-numeric: tabular-nums; }
+.job-interrupted {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  color: #7a5a1e;
+  background: #fff8e6;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .primary,
 .cancel,
 .ghost,
@@ -439,6 +469,11 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 }
 .quality { background: var(--surface-soft); }
 .reference-chip { color: #fff; background: var(--green); }
+/* 선행기술 결과의 실재 확인 표시. 확인하지 못한 것을 감추지 않고 그대로 구분해 보입니다. */
+.verify-chip { padding: 4px 8px; border-radius: 999px; font-size: 10px; font-weight: 800; white-space: nowrap; }
+.verify-chip.verified { color: #2c5c22; background: #e8f6df; }
+.verify-chip.mismatch { color: #8a3b30; background: #ffe9e3; }
+.verify-chip.unchecked { color: #6a6f6c; background: var(--surface-soft); }
 .claim > p { margin: 18px 0 0; font-size: 14px; font-weight: 750; line-height: 1.72; }
 .narrative { color: #4c5651; font-size: 14px; line-height: 1.78; }
 .diff { margin-top: 13px; padding: 12px 14px; border-radius: 10px; color: #7f4038; background: #fff4f1; font-size: 12px; line-height: 1.7; }

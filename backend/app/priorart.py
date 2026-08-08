@@ -5,8 +5,13 @@ CLI가 외부 웹에 나가는 단계이므로, 사용자가 명시적으로 눌
 """
 import json
 import re
+import ssl
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
 
 from .agy import AnalysisCancelled, run_cli
+from .config import PRIOR_ART_VERIFY_TIMEOUT
 from .models import PriorArtHit
 
 PRIOR_ART_PROMPT = """[역할]
@@ -82,3 +87,61 @@ def _clean(value) -> str:
 def _url(value) -> str:
     url = _clean(value)
     return url if url.startswith(("http://", "https://")) else ""
+
+
+# --- 결과 검증 ----------------------------------------------------------------
+# 이 파이프라인의 원칙은 "LLM은 사실만 답하고 확인은 코드가 한다"입니다. 구성대비 발췌는
+# verify.py가 원문과 대조하는데, 선행기술 검색 결과만 그 원칙 밖에 있었습니다. 문헌번호도
+# URL도 공개일도 모델이 적어 준 그대로 보고서에 실려, 지어낸 문헌인지 구별할 수 없었습니다.
+# 여기서는 URL을 실제로 열어 그 페이지에 문헌번호가 있는지만 확인합니다.
+
+_MAX_VERIFY_WORKERS = 4
+_VERIFY_BODY_LIMIT = 400_000
+_USER_AGENT = "Mozilla/5.0 (compatible; EvidenceForge/1.0; +patent-analysis)"
+
+
+def _collapse(value: str) -> str:
+    """구분자를 지운 대조용 형태. 'WO 2022/019489 A1' ↔ 'WO2022019489A1'."""
+    return re.sub(r"[^0-9a-z]", "", str(value or "").lower())
+
+
+def verify_hits(hits: list[PriorArtHit]) -> None:
+    """각 결과의 URL을 열어 문헌번호를 대조하고 verify를 채웁니다(제자리 수정).
+
+    확인에 실패해도 결과를 버리지 않습니다. 사내망이 외부를 막아 두었을 수도 있고, 그때
+    결과를 지우면 검색이 조용히 0건이 됩니다. 판단은 보고서를 읽는 사람이 하도록 표시만 합니다.
+    """
+    if not hits or PRIOR_ART_VERIFY_TIMEOUT <= 0:
+        return
+    # certifi 번들만 쓰면 TLS를 가로채는 사내망에서 전부 실패합니다. OS 신뢰 저장소를
+    # 쓰면 그런 환경의 사설 CA도 그대로 통합니다.
+    context = ssl.create_default_context()
+    with httpx.Client(verify=context, timeout=PRIOR_ART_VERIFY_TIMEOUT, follow_redirects=True,
+                      headers={"User-Agent": _USER_AGENT}) as client:
+        with ThreadPoolExecutor(max_workers=min(_MAX_VERIFY_WORKERS, len(hits))) as pool:
+            list(pool.map(lambda hit: _verify_hit(client, hit), hits))
+
+
+def _verify_hit(client: httpx.Client, hit: PriorArtHit) -> None:
+    if not hit.url:
+        hit.verify, hit.verify_note = "unreachable", "URL이 제시되지 않아 실재 여부를 확인하지 못했습니다."
+        return
+    try:
+        response = client.get(hit.url)
+    except (httpx.HTTPError, ssl.SSLError, OSError) as exc:
+        hit.verify = "unreachable"
+        hit.verify_note = f"URL을 열지 못했습니다({type(exc).__name__}). 문헌을 직접 확인하십시오."
+        return
+    if response.status_code >= 400:
+        hit.verify = "unreachable"
+        hit.verify_note = f"URL이 HTTP {response.status_code}를 반환했습니다."
+        return
+    number = _collapse(hit.document_number)
+    if not number:
+        hit.verify, hit.verify_note = "unreachable", "문헌번호가 없어 대조할 수 없습니다."
+        return
+    if number in _collapse(response.text[:_VERIFY_BODY_LIMIT]):
+        hit.verify, hit.verify_note = "verified", ""
+        return
+    hit.verify = "mismatch"
+    hit.verify_note = "URL은 열렸으나 그 페이지에서 문헌번호를 찾지 못했습니다."

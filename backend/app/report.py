@@ -13,7 +13,7 @@ from .chain import chain_documents
 from .coverage import (JUDGMENT_RANK, best_match, evidence_locations, limitation_counts,
                        report_grade)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
-                     DocumentMapping, ElementCoverage, ElementMatch, Evidence)
+                     DocumentMapping, ElementMatch, Evidence)
 
 # 발췌 길이 상한. 요구 형식이 "최대 3줄, 가능하면 1줄"이므로 한 줄 분량으로 자릅니다.
 EXCERPT_LIMIT = 150
@@ -80,9 +80,8 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
     merged = {element.label: best_match([matrix.get(document_id, {}).get(element.label)
                                          for document_id in selected])
               for element in claim.elements}
-    coverages = {coverage.label: coverage for coverage in chain.element_coverage}
     results = [_element_result(claim, element.label, merged.get(element.label), chain, matrix,
-                               documents, mappings, coverages.get(element.label))
+                               documents, mappings)
                for element in claim.elements]
     return ClaimReport(
         claim_number=claim.number,
@@ -93,15 +92,14 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         claims=results,
         conclusion=_conclusion(claim, chain, merged),
         coverage_summary=_coverage_summary(results),
-        summary_similarity=_summary_similarity(claim, results, mappings),
+        summary_similarity=_summary_similarity(claim, results),
         summary_difference=_summary_difference(chain, results),
     )
 
 
 def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain: ChainInfo,
                     matrix: dict[str, dict[str, ElementMatch]], documents: dict[str, Document],
-                    mappings: list[DocumentMapping],
-                    coverage: ElementCoverage | None = None) -> ClaimResult:
+                    mappings: list[DocumentMapping]) -> ClaimResult:
     element = next((item for item in claim.elements if item.label == label), None)
     text = element.text if element else label
     is_preamble = bool(element and element.is_preamble)
@@ -442,8 +440,7 @@ def _equivalence_caveat(claim: Claim, chain: ChainInfo,
 
 # --- 종합 분석 요약 -----------------------------------------------------------
 
-def _summary_similarity(claim: Claim, results: list[ClaimResult],
-                        mappings: list[DocumentMapping]) -> str:
+def _summary_similarity(claim: Claim, results: list[ClaimResult]) -> str:
     """청구항과 인용발명이 공유하는 내용을 한 줄로 요약합니다.
 
     종전에는 구성 원문 세 개를 " 및 "로 이어 붙였습니다. 구성 문언은 "…하는 단계 및",
@@ -586,6 +583,15 @@ def _clip(text: str, limit: int = 200) -> str:
 
 # --- 마크다운 ----------------------------------------------------------------
 
+# 선행기술 결과의 실재 확인 표시. 구성대비 발췌를 원문 대조하는 것과 같은 이유로, 검색
+# 결과도 코드가 URL을 열어 문헌번호를 확인합니다. 확인하지 못한 것을 지우지는 않습니다.
+_PRIOR_ART_VERIFY = {
+    "verified": "✅ 확인됨",
+    "mismatch": "⚠️ 문헌번호 불일치",
+    "unreachable": "❔ 확인 불가",
+    "unchecked": "❔ 미확인",
+}
+
 def to_markdown(result: AnalysisResult) -> str:
     lines = ["# 구성대비 분석", ""]
     incomplete = [report.claim_number for report in result.reports
@@ -604,13 +610,17 @@ def to_markdown(result: AnalysisResult) -> str:
     for report in result.reports:
         lines += _claim_section(report, result.claim_mapping)
     if result.prior_art:
-        lines += ["", "## 미커버 구성 선행기술 검색", ""]
+        lines += ["", "## 미커버 구성 선행기술 검색", "",
+                  "> 이 절의 문헌은 웹 검색 결과입니다. 아래 표시는 제시된 URL을 열어 문헌번호가"
+                  " 그 페이지에 있는지만 확인한 것이며, 선행기술 적격성 판단이 아닙니다.", ""]
         for hit in result.prior_art:
-            lines.append(f"- ({hit.label}) {hit.document_number or hit.title or '문헌 미상'}"
+            lines.append(f"- {_PRIOR_ART_VERIFY[hit.verify]} ({hit.label}) "
+                         f"{hit.document_number or hit.title or '문헌 미상'}"
                          + (f" · {hit.published}" if hit.published else "")
                          + (f" — {hit.correspondence}" if hit.correspondence else "")
                          + (f" (남은 차이: {hit.remaining_difference})" if hit.remaining_difference else "")
-                         + (f" {hit.url}" if hit.url else ""))
+                         + (f" {hit.url}" if hit.url else "")
+                         + (f" [{hit.verify_note}]" if hit.verify_note else ""))
     if result.validation:
         lines += ["", "## 참고", ""] + [f"- {item}" for item in result.validation]
     return "\n".join(lines) + "\n"

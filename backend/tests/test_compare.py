@@ -63,7 +63,7 @@ def _judge(element: ClaimElement, quote: str, core_disclosed: bool) -> str:
             {"index": 1, "disclosed": False, "quote": "", "chunk_id": ""},
         ],
     }]
-    return _build_matches(raw, target, document, require_limitation_checks=True)[0][0].judgment
+    return _build_matches(raw, target, document)[0][0].judgment
 
 
 def test_a_missing_qualifier_alone_does_not_erase_the_correspondence():
@@ -102,7 +102,7 @@ def test_one_disclosed_alternative_satisfies_the_whole_set():
                 {"index": 1, "disclosed": False, "quote": "", "chunk_id": ""},
                 {"index": 2, "disclosed": False, "quote": "", "chunk_id": ""}]}]
 
-    match = _build_matches(raw, target, document, require_limitation_checks=True)[0][0]
+    match = _build_matches(raw, target, document)[0][0]
 
     assert match.missing_limitations == []          # 충족된 묶음의 미개시 대안은 차이가 아니다
     assert match.judgment == "실질적 동일"           # 누락이 없으므로 강등되지 않는다
@@ -121,7 +121,7 @@ def test_an_unsatisfied_alternative_set_is_still_missing():
             "limitation_checks": [{"index": 0, "disclosed": False, "quote": "", "chunk_id": ""},
                                   {"index": 1, "disclosed": False, "quote": "", "chunk_id": ""}]}]
 
-    match = _build_matches(raw, target, document, require_limitation_checks=True)[0][0]
+    match = _build_matches(raw, target, document)[0][0]
 
     assert len(match.missing_limitations) == 2
     assert match.judgment == "차이"
@@ -144,7 +144,7 @@ def test_batch_match_requires_every_atomic_limitation_check():
         }],
     }]
 
-    matches, warnings = _build_matches(raw, target, document, require_limitation_checks=True)
+    matches, warnings = _build_matches(raw, target, document)
 
     assert matches[0].judgment == "일부 차이"
     assert matches[0].missing_limitations == ["가우시안 스플랫을 동적으로 로딩함"]
@@ -171,7 +171,7 @@ def test_zero_disclosed_limitations_cannot_be_reported_as_partial_disclosure():
         ],
     }]
 
-    matches, _ = _build_matches(raw, target, document, require_limitation_checks=True)
+    matches, _ = _build_matches(raw, target, document)
     match = matches[0]
     match.verify = "verified"
 
@@ -226,7 +226,7 @@ def test_the_whole_element_fallback_is_not_reported_as_a_missing_sub_limitation(
     matches, _ = _build_matches(
         [{"label": "A", "judgment": "대응 없음", "directness": "absent",
           "limitation_checks": [{"index": 0, "disclosed": False}]}],
-        target, document, require_limitation_checks=True)
+        target, document)
 
     assert matches[0].missing_limitations == []
     assert matches[0].limitation_checks[0].whole_element is True

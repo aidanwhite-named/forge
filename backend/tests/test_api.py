@@ -4,7 +4,7 @@ import threading
 import time
 from fastapi.testclient import TestClient
 
-from app import agy, main
+from app import agy, cache, main
 from app.models import AnalysisResult
 
 client = TestClient(main.app)
@@ -36,7 +36,7 @@ def post_job():
 
 
 def fake_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                decomposition=None):
+                decomposition=None, cache_keys=None):
     if progress:
         progress("구성대비 1/1")
     if decomposition is not None:
@@ -64,7 +64,7 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
     entered = threading.Event()
 
     def slow_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                    decomposition=None):
+                    decomposition=None, cache_keys=None):
         entered.set()
         while not agy.is_cancelled(job_id):
             time.sleep(0.01)
@@ -87,7 +87,10 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
 
     assert client.get(f"/api/jobs/{job_id}").json()["status"] == "cancelled"
     assert not (main.HISTORY_DIR / job_id).exists()
-    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 409
+    # 보고서가 남지 않았으므로 그 위에서 도는 작업은 "찾을 수 없음"입니다. 상태 문자열이
+    # 아니라 저장된 보고서의 유무가 기준입니다 — 종속항 대비를 취소한 경우에는 보고서가
+    # 보존되므로 같은 cancelled 상태에서도 검색이 되어야 합니다(아래 전용 테스트).
+    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 404
     main.remove_job_record(job_id)
 
 
@@ -126,10 +129,91 @@ def test_history_can_be_cleared_at_once(monkeypatch):
     job_ids = [post_job() for _ in range(2)]
     assert len(client.get("/api/history").json()) == 2
     response = client.delete("/api/history")
-    assert response.json() == {"ok": True, "removed": 2}
+    assert response.json() == {"ok": True, "removed": 2, "cache_purged": 0}
     assert client.get("/api/history").json() == []
     assert len(client.get("/api/logs").json()) == 2
     assert all(job_id not in main.jobs for job_id in job_ids)
+
+
+def test_deleting_history_also_removes_the_legacy_copy(monkeypatch):
+    """레거시 사본을 남기면 다음 기동에 마이그레이션이 그대로 되살립니다.
+
+    사용자가 지웠는데 서버를 재시작하면 돌아오는 상태였습니다.
+    """
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = post_job()
+    legacy = main.DATA_DIR / "history" / job_id
+    legacy.mkdir(parents=True)
+    (legacy / "meta.json").write_text('{"job_id": "%s"}' % job_id, encoding="utf-8")
+
+    client.delete(f"/api/history/{job_id}")
+    assert not (main.HISTORY_DIR / job_id).exists()
+    assert not legacy.exists()
+
+
+def test_deleting_history_purges_that_jobs_judgment_cache(monkeypatch):
+    """판정 캐시에는 문헌 원문 발췌가 들어 있습니다.
+
+    히스토리만 지우고 캐시를 남기면, 사용자가 지웠다고 생각한 문장이 디스크에 남습니다.
+    """
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = post_job()
+    # 이 분석이 쓴 판정 2건이 캐시에 있는 상태를 만든다.
+    keys = ["cafe1234", "beef5678"]
+    for key in keys:
+        (cache.CACHE_DIR / f"{key}.json").write_text("[]", encoding="utf-8")
+    other = cache.CACHE_DIR / "unrelated.json"
+    other.write_text("[]", encoding="utf-8")
+    main._save_cache_keys(job_id, set(keys))
+
+    response = client.delete(f"/api/history/{job_id}")
+    assert response.json() == {"ok": True, "cache_purged": 2}
+    assert not any((cache.CACHE_DIR / f"{key}.json").exists() for key in keys)
+    assert other.exists()                      # 다른 분석의 판정은 건드리지 않는다
+
+
+def test_clearing_logs_also_removes_the_legacy_copies(monkeypatch):
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = post_job()
+    legacy = main.DATA_DIR / "logs"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / f"{job_id}.log").write_text("old", encoding="utf-8")
+
+    client.delete("/api/logs")
+    assert client.get("/api/logs").json() == []
+    assert not (legacy / f"{job_id}.log").exists()
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_an_interrupted_job_reports_why_instead_of_404(monkeypatch):
+    """서버가 재시작되면 메모리 레코드가 사라집니다.
+
+    404를 주면 폴링 중인 화면에는 "작업을 찾을 수 없습니다"만 남아, 분석이 왜 멈췄는지도
+    다시 돌려도 되는지도 알 수 없습니다.
+    """
+    job_id = client.post("/api/jobs/prepare").json()["job_id"]
+    main.set_job_status(job_id, status="running", stage="구성대비 3/8")
+    main.jobs.clear()                          # 서버 재시작과 같은 상태
+
+    assert main.recover_interrupted_jobs() == 1
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "interrupted"
+    assert "다시 실행하면" in job["error"]
+    main.remove_job_record(job_id)
+
+
+def test_cell_progress_is_exposed_as_numbers(monkeypatch):
+    """진행률을 문자열에만 담으면 화면이 진행 바를 그릴 수 없습니다."""
+    def analyze_with_progress(job_id, claims_text, documents, analysis_prompt="", progress=None,
+                              decomposition=None, cache_keys=None):
+        progress("구성대비 3/8 — 청구항 1 × prior.pdf", 3, 8)
+        assert client.get(f"/api/jobs/{job_id}").json()["progress"] == {"done": 3, "total": 8}
+        return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
+
+    monkeypatch.setattr(main, "analyze", analyze_with_progress)
+    job_id = post_job()
+    assert main.jobs[job_id]["status"] == "completed"
+    client.delete(f"/api/history/{job_id}")
 
 
 def test_history_and_logs_are_managed_independently(monkeypatch):
@@ -289,7 +373,7 @@ def test_dependent_claims_reuse_saved_documents_and_are_sent_as_one_batch(monkey
     captured = {}
 
     def fake_extend(result, claims_text, numbers, documents, prompt="", progress=None,
-                    decomposition=None, checkpoint=None):
+                    decomposition=None, checkpoint=None, cache_keys=None):
         captured.update(claims_text=claims_text, numbers=numbers,
                         decomposition=decomposition,
                         filenames=[document.filename for document in documents])
@@ -325,7 +409,7 @@ def test_a_cancelled_dependent_run_keeps_the_claims_it_already_judged(monkeypatc
     entered = threading.Event()
 
     def slow_extend(result, claims_text, numbers, documents, prompt="", progress=None,
-                    decomposition=None, checkpoint=None):
+                    decomposition=None, checkpoint=None, cache_keys=None):
         entered.set()
         while not agy.is_cancelled(job_id):
             time.sleep(0.01)
@@ -346,7 +430,57 @@ def test_a_cancelled_dependent_run_keeps_the_claims_it_already_judged(monkeypatc
     # 초기 분석의 보고서는 그대로 남고, 히스토리도 지워지지 않는다.
     assert (main.HISTORY_DIR / job_id / "result.json").exists()
     assert client.get(f"/api/jobs/{job_id}/result").status_code == 200
+
+    # 보존된 보고서 위에서 후속 작업이 계속 가능해야 한다. 종전에는 선행기술 검색만
+    # "cancelled"를 실행 중으로 취급해서, 종속항 추가는 되는데 검색만 영구히 막혔다.
+    monkeypatch.setattr(main, "uncovered_elements",
+                        lambda result, claims_text: [{"claim_number": 1, "label": "A", "text": "쓰기 요청"}])
+    monkeypatch.setattr(main.priorart, "search", lambda targets: [])
+    assert client.post(f"/api/jobs/{job_id}/prior-art").status_code == 200
     client.delete(f"/api/history/{job_id}")
+
+
+def test_history_list_survives_an_unreadable_meta(monkeypatch):
+    """meta.json 한 건이 깨져도 나머지 보고서는 목록에 남아야 한다.
+
+    meta.json은 취소·크래시가 쓰기 도중에 끼면 잘린 채 남을 수 있다. 그때 목록 전체가
+    500이 되면 멀쩡한 보고서까지 화면에서 사라져, 히스토리가 통째로 날아간 것처럼 보인다.
+    """
+    monkeypatch.setattr(main, "analyze", fake_result)
+    good, broken = post_job(), post_job()
+    (main.HISTORY_DIR / broken / "meta.json").write_text('{"job_id": "x", "crea',
+                                                         encoding="utf-8")
+    listed = client.get("/api/history")
+    assert listed.status_code == 200
+    assert [item["job_id"] for item in listed.json()] == [good]
+
+    # created_at이 없는 기록도 정렬에서 터지지 않는다.
+    (main.HISTORY_DIR / broken / "meta.json").write_text('{"job_id": "%s"}' % broken,
+                                                         encoding="utf-8")
+    assert client.get("/api/history").status_code == 200
+    client.delete("/api/history")
+
+
+def test_finished_jobs_release_the_extracted_document_text(monkeypatch):
+    """완료된 작업이 PDF 본문을 계속 붙들고 있으면 서버를 켜 둔 만큼 메모리가 늘기만 한다."""
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = post_job()
+    assert not (set(main.jobs[job_id]) & {"documents", "result", "claims", "claims_text"})
+    # 놓아준 뒤에도 결과 조회는 히스토리에서 그대로 된다.
+    assert client.get(f"/api/jobs/{job_id}/result").status_code == 200
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_abandoned_prepared_jobs_are_swept(monkeypatch):
+    """prepare만 하고 start를 하지 않으면(탭을 닫으면) 레코드와 취소 토큰이 영구히 남는다."""
+    monkeypatch.setattr(main, "JOB_RECORD_TTL_MINUTES", 0)
+    abandoned = client.post("/api/jobs/prepare").json()["job_id"]
+    assert abandoned in main.jobs and agy.is_cancelled(abandoned) is False
+    fresh = client.post("/api/jobs/prepare").json()["job_id"]
+    assert abandoned not in main.jobs
+    assert abandoned not in agy._cancel_events
+    main.jobs.pop(fresh, None)
+    agy.finish_job(fresh)
 
 
 def test_dependent_claim_endpoint_rejects_an_independent_claim(monkeypatch):

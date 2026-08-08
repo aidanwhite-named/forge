@@ -61,15 +61,18 @@ def is_verbatim(quote: str, corpus: str, min_segment_len: int = MIN_SEGMENT_LEN)
     return all(collapse(segment) in collapsed_corpus for segment in segments)
 
 
-def quote_status(quote: str, document: Document | None) -> str:
-    """발췌 1개의 검증 상태. 비교 매트릭스 밖에서도 같은 대조 규칙을 쓰기 위한 진입점입니다."""
-    if document is None:
-        return "not_found"
-    return _status(quote, document_corpus(document))
-
-
 def verify_matches(matches: list[ElementMatch], documents: dict[str, Document]) -> list[str]:
     """비교 매트릭스를 제자리에서 검증하고, 강등된 항목을 경고로 돌려줍니다."""
+    try:
+        return _verify_matches(matches, documents)
+    finally:
+        # _collapsed_corpus의 키와 값이 각각 문헌 말뭉치 **전문**입니다. 한 번의 검증
+        # 안에서는 같은 말뭉치를 수백 번 접으므로 캐시가 필요하지만, 검증이 끝난 뒤에도
+        # 프로세스가 살아 있는 내내 문헌 8건 분량을 붙들고 있을 이유는 없습니다.
+        _collapsed_corpus.cache_clear()
+
+
+def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document]) -> list[str]:
     corpus_cache: dict[str, str] = {}
     notes: list[str] = []
     for match in matches:

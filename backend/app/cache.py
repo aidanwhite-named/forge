@@ -73,3 +73,20 @@ def clear() -> int:
         path.unlink(missing_ok=True)
         removed += 1
     return removed
+
+
+def discard(keys) -> int:
+    """지정한 판정만 캐시에서 지웁니다.
+
+    분석을 삭제할 때 씁니다. 판정 캐시에는 업로드한 문헌의 **원문 발췌**가 그대로 들어
+    있으므로, 히스토리만 지우고 이것을 남기면 사용자가 지웠다고 생각한 문헌의 문장이
+    디스크에 계속 남습니다. 키는 그 분석이 실제로 사용한 것만 받습니다 — 다른 분석과
+    공유되는 키를 지워도 판정이 틀려지지는 않고 다음 실행에서 다시 받을 뿐입니다.
+    """
+    removed = 0
+    for key in set(keys or ()):
+        path = CACHE_DIR / f"{key}.json"
+        if path.exists():
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
