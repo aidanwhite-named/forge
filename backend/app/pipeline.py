@@ -3,10 +3,11 @@
 단계는 네 가지입니다.
   1. 청구항 분해 (정규식 + 중요도 LLM 1회, 결과는 재사용을 위해 저장)
   2. 구성요소 × 문헌 전수 비교 (LLM, 셀 단위 동시 실행·캐시됨) → 발췌 검증 (문자열 대조)
+     → 원자 한정별 의미검증 (검증된 근거 묶음만 사용·캐시됨)
   3. 인용발명 선정 (전부 코드)
   4. 보고서 조립 (전부 코드)
 
-LLM은 구성대비 사실만 답하고, 인용발명 조합과 보고서 문장은 전부 코드가 정합니다.
+LLM은 구성대비와 좁은 근거 의미검증만 답하고, 인용발명 조합과 보고서 문장은 전부 코드가 정합니다.
 같은 비교 매트릭스에서는 항상 같은 결과가 나옵니다. 그래서 2단계를 동시에 돌리더라도
 판정은 완료 순서가 아니라 (청구항, 문헌) 순서로 다시 모읍니다.
 """
@@ -17,9 +18,11 @@ from . import agy, cache
 from .agy import AnalysisCancelled
 from .chain import build_chain, matrix_for
 from .claims import ancestry, assign_importance, input_quality_warnings, parse_claims
-from .compare import DEPENDENT_DOCUMENT_BUDGET_CHARS, compare_claims_documents, compare_document
+from .compare import (DEPENDENT_DOCUMENT_BUDGET_CHARS, DOCUMENT_BUDGET_CHARS,
+                      compare_claims_documents, compare_document, parent_context)
 from .config import COMPARE_MAX_WORKERS, load_runtime_settings
 from .consistency import enforce_antecedents
+from .entailment import validate_entailment
 from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
 from .report import build_claim_report, build_mappings, refresh_mappings
 from .verify import verify_matches
@@ -44,11 +47,15 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     by_id = {document.id: document for document in documents}
 
     matches, cached_claims, compare_warnings = _compare_all(claims, documents, guideline,
-                                                            progress, cache_keys)
+                                                            progress, cache_keys, claims)
     validation += compare_warnings
     # 발췌 검증 기록(위치 자동 복구·판정 강등)은 판정을 추적할 때만 필요한 내부 정보입니다.
     # 보고서 본문에 섞으면 구성대비 결과보다 도구의 동작 로그가 더 길어집니다.
     verify_notes = verify_matches(matches, by_id)
+    # 문자열 대조는 인용문이 PDF에 있다는 사실만 확인합니다. 그 문장이 한정의 입력·동작·출력과
+    # 인과관계를 실제로 뒷받침하는지는 좁은 독립 검증으로 다시 확인합니다. 청구항을 함께 넘겨
+    # 앞 구성에서 물려받은 지시 대상을 이 구성의 요구사항으로 세지 않게 합니다.
+    verify_notes += validate_entailment(matches, by_id, cache_keys, claims)
 
     chains: dict[int, ChainInfo] = {}
     for claim in _processing_order(claims):
@@ -106,7 +113,7 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
     cancelled: AnalysisCancelled | None = None
     try:
         cached_claims, warnings = _compare_all_batch(
-            new_claims, documents, guideline, progress, matches, cache_keys)
+            new_claims, documents, guideline, progress, matches, cache_keys, all_claims)
     except AnalysisCancelled as exc:
         cancelled, cached_claims, warnings = exc, set(), []
     validation += warnings
@@ -119,6 +126,7 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
 
     by_id = {document.id: document for document in documents}
     existing.verify_notes = list(existing.verify_notes) + verify_matches(matches, by_id)
+    existing.verify_notes += validate_entailment(matches, by_id, cache_keys, all_claims)
     chains = {report.claim_number: report.chain for report in existing.reports}
     new_matrices: dict[int, dict[str, dict[str, ElementMatch]]] = {}
     added: list[Claim] = []
@@ -167,7 +175,8 @@ def _claim_matrix(matches: list[ElementMatch], documents: list[Document],
 
 
 def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
-                 progress, cache_keys: set[str] | None = None
+                 progress, cache_keys: set[str] | None = None,
+                 all_claims: list[Claim] | None = None
                  ) -> tuple[list[ElementMatch], set[int], list[str]]:
     """(청구항 × 문헌) 전수 비교. 캐시가 있으면 CLI를 부르지 않습니다."""
     cells: dict[tuple[int, str], list[ElementMatch]] = {}
@@ -175,8 +184,9 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
     tasks: list[tuple[Claim, Document]] = []
     for claim in claims:
         claim_cached = bool(documents)
+        parents = parent_context(claim, all_claims)
         for document in documents:
-            key = cache.cache_key(claim, document, guideline)
+            key = cache.cache_key(claim, document, guideline, DOCUMENT_BUDGET_CHARS, parents)
             if cache_keys is not None:
                 cache_keys.add(key)
             cell = cache.load(key)
@@ -189,7 +199,7 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
             cached_claims.add(claim.number)
     if progress and cells:
         progress(f"판정 캐시에서 {len(cells)}셀 재사용")
-    warnings = _compare_cells(tasks, guideline, progress, cells)
+    warnings = _compare_cells(tasks, guideline, progress, cells, all_claims=all_claims)
     # 완료 순서가 아니라 (청구항, 문헌) 순서로 펼칩니다. 동시에 돌려도 매트릭스는 같습니다.
     matches = [match for claim in claims for document in documents
                for match in cells.get((claim.number, document.id), [])]
@@ -198,7 +208,8 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
 
 def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress,
                    results: dict[tuple[int, str], list[ElementMatch]],
-                   budget: int | None = None) -> list[str]:
+                   budget: int | None = None,
+                   all_claims: list[Claim] | None = None) -> list[str]:
     """(청구항, 문헌) 셀을 동시에 대비하고 판정을 ``results``에 담습니다.
 
     셀끼리는 서로를 참조하지 않고 소요 시간의 거의 전부가 CLI 응답 대기라, 동시에 돌리면
@@ -226,9 +237,11 @@ def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress
         # 신호가 이 스레드에서 띄운 CLI 프로세스에는 닿지 않아 그대로 끝까지 돕니다.
         if job_id:
             agy.bind_job(job_id)
-        cell, cell_warnings = compare_document(claim, document, guideline, budget)
+        cell, cell_warnings = compare_document(claim, document, guideline, budget, all_claims)
         if not cell_warnings:
-            cache.store(cache.cache_key(claim, document, guideline), cell)
+            cache.store(cache.cache_key(claim, document, guideline,
+                                        budget or DOCUMENT_BUDGET_CHARS,
+                                        parent_context(claim, all_claims)), cell)
         with lock:
             results[(claim.number, document.id)] = cell
             warnings_by_cell[(claim.number, document.id)] = cell_warnings
@@ -261,19 +274,26 @@ def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress
 
 def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline: str,
                        progress, matches: list[ElementMatch],
-                       cache_keys: set[str] | None = None) -> tuple[set[int], list[str]]:
+                       cache_keys: set[str] | None = None,
+                       all_claims: list[Claim] | None = None) -> tuple[set[int], list[str]]:
     """캐시 누락 종속항을 한 번에 대비하고, 온전하지 않은 셀만 단건으로 메웁니다.
 
     판정은 ``matches``에 덧붙여 나갑니다. 반환값으로만 넘기면 중간에 취소되었을 때 이미
     끝난 셀까지 함께 사라져, 다시 눌렀을 때 처음부터 다시 돌게 됩니다.
+
+    이 경로의 셀은 종속항 문맥 예산으로 판정되므로 캐시 키에도 그 값을 넣습니다. 최초 분석
+    경로(문헌 전문에 가까운 예산)와 키를 공유하면, 좁은 문맥에서 나온 판정이 넓은 문맥으로
+    다시 볼 실행에서 그대로 재사용됩니다.
     """
     cached_claims: set[int] = set()
     misses_by_claim: dict[int, list[Document]] = {}
     claims_by_number = {claim.number: claim for claim in claims}
+    parents_by_claim = {claim.number: parent_context(claim, all_claims) for claim in claims}
     for claim in claims:
         claim_cached = bool(documents)
         for document in documents:
-            key = cache.cache_key(claim, document, guideline)
+            key = cache.cache_key(claim, document, guideline, DEPENDENT_DOCUMENT_BUDGET_CHARS,
+                                  parents_by_claim[claim.number])
             if cache_keys is not None:
                 cache_keys.add(key)
             cell = cache.load(key)
@@ -286,8 +306,8 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
             cached_claims.add(claim.number)
 
     missing_claims = [claim for claim in claims if claim.number in misses_by_claim]
-    missing_documents = [document for document in documents
-                         if any(document.id == item.id for values in misses_by_claim.values() for item in values)]
+    missing_ids = {item.id for values in misses_by_claim.values() for item in values}
+    missing_documents = [document for document in documents if document.id in missing_ids]
     if not missing_claims or not missing_documents:
         return cached_claims, []
 
@@ -295,7 +315,8 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
     if progress:
         progress(f"종속항 {len(missing_claims)}개 × 인용발명 {len(missing_documents)}건"
                  f" 일괄 구성대비 (셀 {total}개)")
-    batch_cells, warnings = compare_claims_documents(missing_claims, missing_documents, guideline)
+    batch_cells, warnings = compare_claims_documents(missing_claims, missing_documents, guideline,
+                                                     all_claims)
 
     # 일괄 응답에서 온전한 셀은 그대로 채택하고, 빠진 셀만 단건으로 다시 받습니다.
     # 예전에는 셀 하나가 어긋나도 응답 전체를 버리고 전 셀을 단건으로 다시 물었습니다.
@@ -308,7 +329,9 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
             cell = batch_cells.get((claim_number, document.id))
             if cell:
                 matches += cell
-                cache.store(cache.cache_key(claim, document, guideline), cell)
+                cache.store(cache.cache_key(claim, document, guideline,
+                                            DEPENDENT_DOCUMENT_BUDGET_CHARS,
+                                            parents_by_claim[claim_number]), cell)
             else:
                 still_missing.setdefault(claim_number, []).append(document)
 
@@ -322,7 +345,7 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
         cells: dict[tuple[int, str], list[ElementMatch]] = {}
         try:
             warnings += _compare_cells(tasks, guideline, progress, cells,
-                                       DEPENDENT_DOCUMENT_BUDGET_CHARS)
+                                       DEPENDENT_DOCUMENT_BUDGET_CHARS, all_claims)
         finally:
             # 취소로 중단되더라도 끝난 셀은 넘겨야 그때까지의 항을 보고서에 남길 수 있습니다.
             matches += [match for claim, document in tasks
@@ -353,14 +376,26 @@ def uncovered_elements(result: AnalysisResult, claims_text: str) -> list[dict]:
         claim = by_number.get(report.claim_number)
         coverage_by_label = {coverage.label: coverage for coverage in report.chain.element_coverage}
         labels = list(dict.fromkeys([*report.chain.uncovered, *report.chain.residual]))
+        # 결합 한도 밖 문헌에 이미 대응 기재가 있는 구성과 주지관용으로 다룬 구성은 검색
+        # 대상이 아닙니다. 선행기술을 새로 찾을 이유가 없는데도 검색하면, 이미 손에 든
+        # 문헌을 두고 웹에서 같은 것을 다시 찾는 일이 됩니다.
+        skip = {*report.chain.beyond_limit, *report.chain.well_known}
         for label in labels:
+            if label in skip:
+                continue
             element = next((item for item in (claim.elements if claim else []) if item.label == label), None)
             # 전제부는 한정 여부가 미정이라 검색 대상에서 뺍니다. "…장치에 있어서" 같은 범주
             # 기재로 선행기술을 검색하면 결과가 의미를 갖지 못합니다.
             if element and not element.is_preamble:
                 coverage = coverage_by_label.get(label)
+                # 한도 밖 문헌이 이미 개시한 한정은 검색어에서 뺍니다. 구성 전체가 그런 경우를
+                # skip이 걸러 내는 것과 같은 이유입니다 — 손에 든 문헌에 있는 기재를 웹에서
+                # 다시 찾을 이유가 없습니다. 남은 한정이 그것뿐이면 이 구성은 검색하지 않습니다.
+                found = report.chain.beyond_limit_residual.get(label, {})
                 remaining = [value for value in (coverage.residual_difference if coverage else [])
-                             if value and not _generic_residual(value)]
+                             if value and not _generic_residual(value) and value not in found]
+                if found and not remaining:
+                    continue
                 targets.append({
                     "claim_number": report.claim_number,
                     "label": label,

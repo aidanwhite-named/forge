@@ -1,4 +1,4 @@
-from app.models import Chunk, Document, ElementMatch, LimitationCheck
+from app.models import Chunk, Document, ElementMatch, EvidenceSpan, LimitationCheck
 from app.verify import is_verbatim, verify_matches
 
 CORPUS = "메모리 컨트롤러는 데이터 쓰기 요청을 큐에 저장한 후 순차적으로 처리한다."
@@ -75,13 +75,14 @@ def test_an_existing_but_wrong_chunk_location_is_also_repaired():
     assert "자동 복구" in wrong.verify_note and notes
 
 
-def test_paraphrase_is_recovered_from_the_cited_chunk_but_not_promoted():
-    """복구한 문장은 구성 일부만 뒷받침할 수 있으므로 직접 개시로 올리지 않는다."""
+def test_paraphrase_recovery_is_recorded_without_changing_semantic_directness():
+    """PDF 정렬 복구는 추출 품질 문제이며 의미상 직접성과 같은 축이 아니다."""
     paraphrased = match(quote="메모리 컨트롤러는 쓰기 요청을 큐에 넣고 차례대로 처리하는 구성이다")
     verify_matches([paraphrased], {"1": DOCUMENT})
     assert paraphrased.verify == "verified"
     assert paraphrased.quote == CORPUS
-    assert paraphrased.directness == "inferred"
+    assert paraphrased.directness == "direct"
+    assert paraphrased.alignment == "recovered"
 
 
 def test_direct_judgment_without_a_quote_is_downgraded():
@@ -116,8 +117,33 @@ def test_a_paraphrased_atomic_quote_is_recovered_from_its_cited_chunk():
     assert checked.limitation_checks[0].disclosed is True
     assert checked.limitation_checks[0].verify == "verified"
     assert checked.limitation_checks[0].quote == CORPUS
-    assert checked.directness == "inferred"
+    assert checked.directness == "direct"
+    assert checked.limitation_checks[0].alignment == "recovered"
     assert notes == []
+
+
+def test_a_verified_evidence_bundle_keeps_a_compound_limitation_disclosed():
+    """대표 문장이 깨져도 같은 한정을 위한 검증된 복수 근거가 있으면 의미검증까지 보존한다."""
+    first = "The GNSS neighborhood limits the candidate image pairs used for matching."
+    second = "The number of matching feature points is used as the graph edge weight."
+    document = Document(id="1", filename="sensors.pdf", type="paper", chunks=[
+        Chunk(document_id="1", chunk_id="D1-B-p005-01", page=5, text=first),
+        Chunk(document_id="1", chunk_id="D1-B-p006-01", page=6, text=second),
+    ])
+    checked = ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment="실질적 동일", directness="direct",
+        quote=first, chunk_id="D1-B-p005-01", limitation_checks=[LimitationCheck(
+            index=0, limitation="GNSS와 상대정합 정보를 그룹화 기준에 함께 사용함", disclosed=True,
+            quote="PDF 추출 순서가 깨져 원문에 없는 대표 문장입니다.", chunk_id="D1-B-p005-01",
+            evidence=[EvidenceSpan(chunk_id="D1-B-p005-01", quote=first),
+                      EvidenceSpan(chunk_id="D1-B-p006-01", quote=second)])])
+
+    verify_matches([checked], {"1": document})
+
+    check = checked.limitation_checks[0]
+    assert check.disclosed is True and check.verify == "verified"
+    assert [span.verify for span in check.evidence] == ["verified", "verified"]
+    assert checked.directness == "direct"
 
 
 def test_verification_does_not_resurrect_a_satisfied_alternative():

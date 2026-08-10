@@ -8,6 +8,7 @@ import json
 import re
 
 from .agy import AnalysisCancelled, run_cli
+from .claims import ancestry
 from .models import (Claim, ClaimElement, Document, ElementMatch, EvidenceSpan, Limitation,
                      LimitationCheck, missing_limitations)
 from .prompts import DEFAULT_ANALYSIS_PROMPT
@@ -74,6 +75,10 @@ requirements의 각 항목에는 kind가 붙어 있습니다.
 - limitation_checks는 requirement의 index와 정확히 일치해야 하며, 모든 index를 한 번씩 반환하십시오.
 - disclosed=true는 해당 하위 제한 전체를 뒷받침하는 원문이 있을 때만 허용됩니다.
 - 각 disclosed=true 항목에는 그 제한을 직접 뒷받침하는 실제 quote와 chunk_id가 반드시 있어야 합니다.
+- 한 문장만으로 복합 제한 전체를 입증할 수 없고 같은 실시 흐름의 여러 문단이 함께 필요하면,
+  가장 대표적인 문장을 quote에 두고 나머지는 evidence 배열에 넣으십시오. 서로 무관한 실시예의
+  문장을 조합해서는 안 되며, 각 문장이 입력·처리·출력 또는 그 인과 연결 중 무엇을 입증하는지
+  reason에 드러내십시오.
 - 배경기술의 필요성·문제점·기존 기술의 한계를 설명한 문장은, 뒤의 실시수단이 별도로 확인되지 않는 한
   발명의 긍정적인 개시 근거로 사용하지 마십시오.
 - 일반적인 기술상식으로 문헌에 없는 조건을 보충하지 마십시오. LOD가 기재되었다는 이유만으로 동적 로딩,
@@ -99,6 +104,25 @@ requirements의 각 항목에는 kind가 붙어 있습니다.
 - inferred: 원문에서 추론해야 도달함
 - absent: 근거 원문이 없음
 
+[발췌 선택 — 문헌을 끝까지 읽고 가장 좋은 기재를 고르십시오]
+**첫 번째로 비슷해 보이는 문장에서 멈추지 마십시오.** 구성 하나를 판정할 때는 CONTEXT에 실린
+chunk를 처음부터 끝까지 훑은 뒤, 그중 가장 직접적인 것 하나를 고릅니다. 앞쪽에서 그럴듯한
+문장을 찾았더라도 뒤쪽 chunk를 계속 확인하십시오. 공보는 앞이 배경기술·요약·과제이고 그 구성을
+**실제로 어떻게 하는지**는 뒤쪽 상세한 설명과 실시예에 있습니다. 앞의 총론 한 줄로 판정하면
+같은 문헌 뒤쪽에 있는 진짜 실시 기재를 놓치고, 그 문헌은 실제보다 낮은 등급을 받습니다.
+
+발췌 후보가 여러 개일 때의 우선순위입니다.
+1. 그 구성의 **입력·대상·출력**을 한 문장 안에서 모두 짚는 기재
+2. 구체적 실시예·동작 설명(수단, 조건, 순서가 드러나는 문장)
+3. 발명의 요약·과제 해결 수단의 총론 문장
+4. 배경기술·종래기술 문장 (이것만으로는 개시 근거가 되지 않습니다)
+같은 등급이면 **뒤쪽 chunk를 고르십시오.** 앞쪽 문장은 대개 같은 내용의 총론입니다.
+
+- 라벨 하나에 대한 판정은 정확히 하나만 출력하십시오. 후보를 여러 개 적지 말고, 위 우선순위로
+  고른 것 하나만 quote에 넣으십시오. 두 번째로 좋은 기재는 evidence에 넣을 수 있습니다.
+- 하위 제한도 각각 같은 방식으로 문헌 전체에서 찾으십시오. 대표 발췌가 있던 chunk 안에서만
+  찾으면, 그 한정을 실제로 개시한 다른 단락이 있어도 미개시로 처리됩니다.
+
 [근거 규칙]
 - quote는 해당 문헌 CONTEXT의 chunk 안에 **문자 그대로 존재하는 문장**만 사용하십시오. 여러 문장을
   조합하거나 표현을 다듬지 마십시오.
@@ -119,6 +143,14 @@ requirements의 각 항목에는 kind가 붙어 있습니다.
 - elements의 search_terms는 그 구성의 대응 기재를 찾기 위한 검색어입니다. 청구항 문언과 표기가
   달라도 이 검색어가 가리키는 개념이 원문에 있으면 대응으로 보십시오.
 
+[부모 청구항 parent_claims — 지시어 해석 전용]
+종속항을 대비할 때만 들어옵니다. 여기 실린 구성은 **판정 대상이 아닙니다.** matches에 넣지 마십시오.
+종속항 행렬에는 "…에 있어서" 뒤의 추가 한정만 들어 있어서, 그 한정에 나오는 "상기 …"가 무엇을
+가리키는지 이 항 안에서는 알 수 없습니다. 판정 대상이 "상기 이미지는 정적 이미지 및 동적 이미지 중
+적어도 하나"뿐이라면, parent_claims에서 "이미지"가 어느 구성에서 온 것인지 먼저 확인한 뒤 **그 대상에
+대한 한정**으로 판정하십시오. 대상을 모른 채 낱말만 맞추면 문헌의 아무 이미지 언급이나 대응이 됩니다.
+부모항 구성이 문헌에 없다는 이유로 이 항의 판정을 낮추지는 마십시오. 부모항 대비는 따로 이뤄집니다.
+
 [판단 이유 reason]
 - 발췌가 왜 그 구성에 대응하는지를 원문 내용에 근거해 한 문장으로 적으십시오.
 - 보고서가 "…, {reason} 청구항의 '…' 구성과 대응됩니다."로 이어 붙입니다. 그러므로 reason은
@@ -137,7 +169,9 @@ COMPARE_PROMPT = """[역할]
   "quote": "원문 발췌", "quote_translation": "한국어 번역",
   "chunk_id": "D1-P-0012", "missing_limitations": [],
   "limitation_checks": [{"index": 0, "disclosed": true, "chunk_id": "D1-P-0012",
-    "quote": "하위 제한을 뒷받침하는 원문", "quote_translation": ""}],
+    "quote": "하위 제한의 대표 원문", "quote_translation": "",
+    "evidence": [{"chunk_id": "D1-P-0013", "quote": "같은 실시 흐름의 보완 원문",
+      "quote_translation": ""}]}],
   "evidence": [{"chunk_id": "D1-P-0015", "quote": "보조 발췌", "quote_translation": ""}]}]}
 
 matches 배열은 아래 elements의 label을 하나도 빠짐없이 정확히 한 번씩 포함해야 합니다.
@@ -156,7 +190,9 @@ claims의 모든 (claim_number, label)과 documents의 모든 document_id 조합
   "quote": "원문 발췌", "quote_translation": "", "chunk_id": "D1-P-0012",
   "missing_limitations": [],
   "limitation_checks": [{"index": 0, "disclosed": true, "chunk_id": "D1-P-0012",
-    "quote": "하위 제한을 뒷받침하는 원문", "quote_translation": ""}], "evidence": []}]}
+    "quote": "하위 제한의 대표 원문", "quote_translation": "",
+    "evidence": [{"chunk_id": "D1-P-0013", "quote": "같은 실시 흐름의 보완 원문",
+      "quote_translation": ""}]}], "evidence": []}]}
 """
 
 
@@ -180,8 +216,25 @@ def _assemble_prompt(rules: str, guideline: str, context: dict) -> str:
             f"CONTEXT:\n{json.dumps(context, ensure_ascii=False)}")
 
 
+def parent_context(claim: Claim, all_claims: list[Claim] | None) -> list[dict]:
+    """종속항이 상속하는 부모항의 문언. 판정 대상이 아니라 지시어 해석용입니다.
+
+    종속항 행렬에는 "…에 있어서" 뒤의 추가 한정만 들어 있습니다. 그 한정은 거의 언제나
+    "상기 이미지", "상기 제어부"처럼 부모항에서 세운 대상을 가리키는데, 부모항 문언을 함께
+    주지 않으면 모델은 그 대상이 무엇인지 모른 채 낱말만 맞추게 됩니다. 그러면 문헌 어디에
+    있는 아무 "이미지" 언급이나 대응으로 잡힙니다.
+    """
+    by_number = {item.number: item for item in all_claims or []}
+    return [{"claim_number": number,
+             "preamble": by_number[number].preamble,
+             "elements": [{"label": element.label, "text": element.text}
+                          for element in by_number[number].elements]}
+            for number in ancestry(all_claims or [], claim.number) if number in by_number]
+
+
 def compare_document(claim: Claim, document: Document, guideline: str = "",
-                     budget: int | None = None) -> tuple[list[ElementMatch], list[str]]:
+                     budget: int | None = None,
+                     all_claims: list[Claim] | None = None) -> tuple[list[ElementMatch], list[str]]:
     """청구항 1건 × 문헌 1건을 대비합니다. 실패하면 전 구성을 '대응 없음'으로 채웁니다.
 
     budget은 문헌 한 건을 프롬프트에 실을 문자 예산입니다. 기본값은 문헌 전문이 들어가는
@@ -189,9 +242,11 @@ def compare_document(claim: Claim, document: Document, guideline: str = "",
     """
     if not claim.elements:
         return [], []
+    parents = parent_context(claim, all_claims)
     context = {
         "claim_number": claim.number,
         "claim_preamble": claim.preamble,
+        **({"parent_claims": parents} if parents else {}),
         # 일괄 경로와 동일한 페이로드입니다. 한쪽만 requirements를 빼면 같은 청구항이
         # 최초 분석에 있었는지 나중에 추가됐는지에 따라 다른 판정을 받습니다.
         "elements": [{"label": element.label, "text": element.text,
@@ -202,7 +257,6 @@ def compare_document(claim: Claim, document: Document, guideline: str = "",
         "document": {
             "id": document.id,
             "filename": document.filename,
-            "type": document.type,
             "document_number": document.document_number,
             "chunks": [{"chunk_id": chunk.chunk_id, "page": chunk.page, "paragraph": chunk.paragraph,
                         "section": chunk.section, "text": chunk.text}
@@ -225,7 +279,8 @@ def compare_document(claim: Claim, document: Document, guideline: str = "",
 
 
 def compare_claims_documents(claims: list[Claim], documents: list[Document],
-                             guideline: str = "") -> tuple[dict[tuple[int, str], list[ElementMatch]], list[str]]:
+                             guideline: str = "", all_claims: list[Claim] | None = None
+                             ) -> tuple[dict[tuple[int, str], list[ElementMatch]], list[str]]:
     """복수 종속항 × 전체 인용발명을 단 한 번의 CLI 호출로 대비합니다.
 
     출력의 claim_number/document_id/label을 복합 키로 사용하므로 여러 항의 같은 (A) 라벨도
@@ -245,6 +300,7 @@ def compare_claims_documents(claims: list[Claim], documents: list[Document],
             "claim_number": claim.number,
             "depends_on": claim.depends_on,
             "claim_preamble": claim.preamble,
+            **({"parent_claims": parents} if (parents := parent_context(claim, all_claims)) else {}),
             "elements": [{"label": element.label, "text": element.text,
                           "search_terms": element.search_terms,
                           "requirements": [_requirement(index, limitation)
@@ -254,7 +310,6 @@ def compare_claims_documents(claims: list[Claim], documents: list[Document],
         "documents": [{
             "id": document.id,
             "filename": document.filename,
-            "type": document.type,
             "document_number": document.document_number,
             "chunks": [{"chunk_id": chunk.chunk_id, "page": chunk.page, "paragraph": chunk.paragraph,
                         "section": chunk.section, "text": chunk.text}
@@ -312,52 +367,101 @@ def select_chunks_for_claims(claims: list[Claim], document: Document,
     if sum(len(chunk.text) for chunk in chunks) <= budget:
         return chunks
 
-    queues = [_ranked_chunks(chunks, terms) for terms in _element_terms(claims)]
+    # 청크는 문헌당 **한 번만** 토큰화합니다. 종전에는 구성요소마다 전 청크를 다시 훑어,
+    # 청크 500개 × 구성 20개면 정규식 토큰화가 1만 번 돌았습니다. 문헌 수만큼 곱해지므로
+    # 업로드 직후 대기 시간의 상당 부분이 여기였습니다.
+    profiles = [(_tokenize(chunk.text), chunk.text.lower(), len(chunk.text)) for chunk in chunks]
+    queues = [_ranked_chunks(profiles, keywords, phrases)
+              for keywords, phrases in _element_terms(claims)]
     selected: set[int] = set()
     used = 0
-    while queues:
-        for queue in list(queues):
-            index = next((value for value in queue if value not in selected), None)
-            if index is None:
-                queues.remove(queue)
+    # 큐를 소비할 때 리스트를 다시 만들지 않고 커서만 옮깁니다. 종전 구현은 한 항목을 꺼낼
+    # 때마다 큐 전체를 재작성해 (구성 × 청크²)로 늘어났습니다.
+    cursors = [0] * len(queues)
+    active = list(range(len(queues)))
+    while active:
+        for slot in list(active):
+            queue, cursor = queues[slot], cursors[slot]
+            while cursor < len(queue) and queue[cursor] in selected:
+                cursor += 1
+            cursors[slot] = cursor + 1
+            if cursor >= len(queue):
+                active.remove(slot)
                 continue
-            queue[:] = [value for value in queue if value != index]
+            index = queue[cursor]
             addition = [position for position
                         in range(max(0, index - NEIGHBOR_SPAN), min(len(chunks), index + NEIGHBOR_SPAN + 1))
                         if position not in selected]
-            size = sum(len(chunks[position].text) for position in addition)
+            size = sum(profiles[position][2] for position in addition)
             if used + size > budget:
                 # 이 구성의 몫은 여기까지입니다. 남은 예산은 다른 구성이 씁니다.
-                queues.remove(queue)
+                active.remove(slot)
                 continue
             selected.update(addition)
             used += size
     return [chunks[index] for index in sorted(_fill_context(chunks, selected, budget))]
 
 
-def _element_terms(claims: list[Claim]) -> list[set[str]]:
-    """구성요소 1개당 검색어 집합 하나. 분해 단계에서 받은 원어·번역어를 함께 씁니다.
+def _element_terms(claims: list[Claim]) -> list[tuple[set[str], list[str]]]:
+    """구성요소 1개당 (검색 토큰, 검색 구문) 한 쌍. 원어·번역어를 함께 씁니다.
 
     기술분야별 동의어 사전을 코드에 두지 않는 이유: 한 분야에 맞춘 표를 심으면 다른
     분야의 청구항에서는 한국어 청구항 ↔ 영문 공보의 토큰 교집합이 0이 되어 검색이
     사실상 동작하지 않습니다. 검색어는 청구항마다 새로 받습니다.
+
+    구문을 따로 들고 가는 이유: "common coordinate system"을 낱말로 쪼개면 "system"만 있는
+    문단도 1점을 얻습니다. 흔한 낱말이 노이즈가 되어, 그 개념을 실제로 다루는 문단이 상위에서
+    밀려납니다. 구문이 통째로 들어 있는 문단은 우연 일치와 구별해 가산합니다.
     """
-    terms: list[set[str]] = []
+    terms: list[tuple[set[str], list[str]]] = []
     for claim in claims:
         for element in claim.elements:
             source = " ".join([element.text, *(item.text for item in element.limitations),
                                *element.search_terms])
             keywords = _tokenize(source)
             keywords.update(token for term in element.search_terms for token in _tokenize(term))
+            phrases = _phrases(element.search_terms)
             if keywords:
-                terms.append(keywords)
-    return terms or [_tokenize(" ".join(claim.preamble for claim in claims))]
+                terms.append((keywords, phrases))
+    if terms:
+        return terms
+    return [(_tokenize(" ".join(claim.preamble for claim in claims)), [])]
 
 
-def _ranked_chunks(chunks, keywords: set[str]) -> list[int]:
-    """적중 수가 많은 청크부터. 적중이 없는 청크는 후보에 넣지 않습니다."""
-    scored = [(index, _hit_count(chunk.text, keywords)) for index, chunk in enumerate(chunks)]
-    return [index for index, hits in sorted(scored, key=lambda item: (-item[1], item[0])) if hits]
+def _phrases(search_terms: list[str]) -> list[str]:
+    """낱말 두 개 이상으로 된 검색어만 구문으로 씁니다. 한 낱말짜리는 토큰이 이미 잡습니다."""
+    phrases: list[str] = []
+    for term in search_terms:
+        phrase = re.sub(r"\s+", " ", str(term or "")).strip().lower()
+        if " " in phrase and len(phrase) >= 4 and phrase not in phrases:
+            phrases.append(phrase)
+    return phrases
+
+
+# 구문 하나가 통째로 들어 있으면 낱말 적중 몇 개만큼의 무게를 줍니다.
+PHRASE_HIT_WEIGHT = 2
+# 밀도를 잴 기준 길이. 같은 적중 수라면 짧고 집중된 문단이 긴 총론 문단보다 낫습니다.
+_DENSITY_WINDOW = 500.0
+
+
+def _ranked_chunks(profiles: list[tuple[set[str], str, int]], keywords: set[str],
+                   phrases: list[str]) -> list[int]:
+    """적중이 많은 청크부터. 적중이 없는 청크는 후보에 넣지 않습니다.
+
+    같은 적중 수에서는 **밀도**가 높은 쪽을 앞세웁니다. 낱말 적중은 집합 교집합이라 긴 청크일수록
+    서로 다른 낱말을 더 많이 품어 유리한데, 그 긴 청크는 대개 여러 주제를 함께 담은 총론
+    문단입니다. 그대로 두면 구성 하나를 집중적으로 설명한 짧은 실시예 문단이 뒤로 밀립니다.
+    """
+    scored: list[tuple[int, float, int]] = []
+    for index, (tokens, lowered, length) in enumerate(profiles):
+        hits = len(tokens & keywords)
+        hits += PHRASE_HIT_WEIGHT * sum(1 for phrase in phrases if phrase in lowered)
+        if not hits:
+            continue
+        density = hits / max(1.0, length / _DENSITY_WINDOW)
+        scored.append((hits, density, index))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [index for _, _, index in scored]
 
 
 def _tokenize(text: str) -> set[str]:
@@ -365,15 +469,17 @@ def _tokenize(text: str) -> set[str]:
             if token not in _STOPWORDS}
 
 
-def _hit_count(text: str, keywords: set[str]) -> int:
-    return len(_tokenize(text) & keywords)
-
-
 def _fill_context(chunks, selected: set[int], budget: int) -> set[int]:
     """키워드 적중량이 적어도 제목 몇 줄만 모델에 전달되지 않도록 문맥을 채웁니다.
 
-    앞부분(초록·배경), 뒷부분(청구항), 문헌 전반의 균등 표본 순으로 남은 예산을 사용합니다.
     관련 키워드 청크는 이미 ``selected``에 들어 있으므로 이 함수는 검색 실패 안전망입니다.
+
+    **문헌 전반의 균등 표본을 먼저** 씁니다. 종전에는 앞부분부터 예산의 절반을 채웠는데,
+    공보의 앞부분은 서지사항·배경기술·발명의 요약이고 그 구성을 실제로 어떻게 하는지는
+    상세한 설명과 실시예에 있습니다. 예산이 빠듯한 문헌(문헌 수가 많은 일괄 대비, 종속항
+    셀)에서는 그 절반이 통째로 총론에 나가고 정작 대응 기재가 있는 본문 후반이 잘렸습니다.
+    검색이 적중하지 못한 구성일수록 이 경로에 의존하므로, 어느 구간도 통째로 빠지지 않게
+    전반을 먼저 훑고 앞뒤는 남는 예산으로 채웁니다.
     """
     selected = set(selected)
     used = sum(len(chunks[index].text) for index in selected)
@@ -390,12 +496,12 @@ def _fill_context(chunks, selected: set[int], budget: int) -> set[int]:
                 selected.add(index)
                 used += size
 
-    add(range(len(chunks)), max(used, budget // 2))
-    add(range(len(chunks) - 1, -1, -1), max(used, budget * 3 // 4))
-    if used < budget and chunks:
-        # 남은 공간은 문헌 전반에서 균등하게 뽑아 본문 중간의 대응 기재도 놓치지 않습니다.
-        order = sorted(range(len(chunks)), key=lambda index: ((index * 997) % len(chunks), index))
-        add(order)
+    if chunks:
+        # 문헌 전반 균등 표본. 997은 청크 수와 서로소가 되기 쉬운 소수라 한 바퀴에 전 구간을 훑습니다.
+        spread = sorted(range(len(chunks)), key=lambda index: ((index * 997) % len(chunks), index))
+        add(spread, max(used, budget * 3 // 4))
+    add(range(len(chunks)), max(used, budget * 7 // 8))     # 앞부분(초록·배경)
+    add(range(len(chunks) - 1, -1, -1))                     # 뒷부분(청구항)
     return selected
 
 
@@ -434,12 +540,18 @@ def _build_matches(raw_matches, claim: Claim, document: Document
     경로 모두 켠 채로만 불렀고, 끄면 같은 청구항이 최초 분석에 있었는지 나중에 추가됐는지에
     따라 다른 판정을 받습니다.
     """
+    # 같은 라벨이 여러 번 오면 **가장 강한 판정**을 채택합니다. 먼저 온 것을 집으면, 모델이
+    # 문헌 앞쪽의 총론 문장으로 한 번 답한 뒤 뒤쪽 실시예를 찾아 다시 답한 경우 앞의 약한
+    # 판정이 남습니다. 그것은 정확히 "앞에서 비슷한 문장을 찾고 멈춘" 결과와 같습니다.
     by_label: dict[str, dict] = {}
     for item in raw_matches or []:
         if not isinstance(item, dict):
             continue
         label = str(item.get("label", "")).strip().strip("()").upper()
-        if label and label not in by_label:
+        if not label:
+            continue
+        current = by_label.get(label)
+        if current is None or _response_strength(item) > _response_strength(current):
             by_label[label] = item
     warnings: list[str] = []
     matches: list[ElementMatch] = []
@@ -501,6 +613,39 @@ def _build_matches(raw_matches, claim: Claim, document: Document
     return matches, warnings
 
 
+# 응답 우열. 이후 단계가 쓰는 판정 강도와 같은 순서입니다(coverage.quality_key).
+# 여기서는 아직 ElementMatch가 아니라 원시 dict라 값을 직접 읽습니다.
+_RESPONSE_JUDGMENT_RANK = {"대응 없음": 0, "차이": 1, "일부 유사": 2, "일부 차이": 3,
+                           "실질적 동일": 4, "동일": 5}
+_RESPONSE_DIRECTNESS_RANK = {"absent": 0, "inferred": 1, "direct": 2}
+
+
+def _response_strength(item: dict) -> tuple:
+    """같은 라벨의 응답이 여럿일 때 어느 것을 남길지. 근거가 실린 쪽을 우선합니다."""
+    checks = [check for check in item.get("limitation_checks") or [] if isinstance(check, dict)]
+    return (
+        _RESPONSE_JUDGMENT_RANK.get(str(item.get("judgment", "")).strip(), 0),
+        _RESPONSE_DIRECTNESS_RANK.get(str(item.get("directness", "")).strip().lower(), 0),
+        1 if str(item.get("quote") or "").strip() else 0,
+        sum(1 for check in checks if check.get("disclosed") is True and (
+            str(check.get("quote") or "").strip()
+            or any(isinstance(span, dict) and str(span.get("quote") or "").strip()
+                   for span in check.get("evidence") or []))),
+        1 if str(item.get("chunk_id") or "").strip() else 0,
+    )
+
+
+def _check_strength(item: dict) -> tuple:
+    """하위 제한 점검 응답의 우열. 개시 + 실제 발췌가 있는 쪽이 강합니다."""
+    quote = str(item.get("quote") or "").strip()
+    evidence = [span for span in item.get("evidence") or []
+                if isinstance(span, dict) and str(span.get("quote") or "").strip()]
+    has_support = bool(quote or evidence)
+    return (1 if (item.get("disclosed") is True and has_support) else 0,
+            len(evidence) + (1 if quote else 0),
+            1 if str(item.get("chunk_id") or "").strip() else 0)
+
+
 def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_element: bool = False
                              ) -> tuple[list[LimitationCheck], list[str], list[str]]:
     """요구한 하위 제한마다 정확히 한 행을 만들고, 누락·무근거 응답은 미개시로 둡니다.
@@ -509,6 +654,9 @@ def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_e
     누락 한정이 아니라 구성 자체의 미개시라서, 커버리지 계산에는 쓰되 누락 목록에는
     올리지 않습니다.
     """
+    # 같은 index가 여러 번 오면 근거가 실린 응답을 남깁니다. 먼저 온 것을 집으면, 모델이
+    # 처음에 "못 찾음"으로 답한 뒤 문헌 뒤쪽에서 실제 기재를 찾아 다시 답한 경우 그 근거가
+    # 버려지고 그 한정이 누락으로 보고됩니다.
     by_index: dict[int, dict] = {}
     for item in raw_checks or []:
         if not isinstance(item, dict):
@@ -517,7 +665,8 @@ def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_e
             index = int(item.get("index"))
         except (TypeError, ValueError):
             continue
-        if index not in by_index:
+        current = by_index.get(index)
+        if current is None or _check_strength(item) > _check_strength(current):
             by_index[index] = item
 
     checks: list[LimitationCheck] = []
@@ -528,7 +677,14 @@ def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_e
             omitted.append(requirement.text)
             item = {}
         quote = re.sub(r"\s+", " ", str(item.get("quote") or "")).strip()
-        disclosed = item.get("disclosed") is True and bool(quote)
+        evidence = _build_evidence(item.get("evidence"))
+        # 복합 한정은 한 문장에 다 들어 있지 않을 수 있습니다. 대표 발췌가 비었으면 근거 묶음의
+        # 첫 문장을 대표로 올리되, 의미 충족 여부는 뒤의 독립 entailment 검증이 판단합니다.
+        if not quote and evidence:
+            quote = evidence[0].quote
+            item = {**item, "chunk_id": evidence[0].chunk_id,
+                    "quote_translation": evidence[0].quote_translation}
+        disclosed = item.get("disclosed") is True and bool(quote or evidence)
         checks.append(LimitationCheck(
             index=index,
             limitation=requirement.text,
@@ -539,6 +695,7 @@ def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_e
             chunk_id=str(item.get("chunk_id") or "").strip(),
             quote=quote,
             quote_translation=re.sub(r"\s+", " ", str(item.get("quote_translation") or "")).strip(),
+            evidence=evidence,
         ))
     return checks, missing_limitations(checks), omitted
 

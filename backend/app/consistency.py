@@ -37,6 +37,16 @@ _BOUNDARY = re.compile(
 _PARTIAL = JUDGMENT_RANK["일부 유사"]
 
 
+def _heads(text: str) -> list[str]:
+    """"상기 …" 뒤에서 지시 대상 어구만 끊어 냅니다. 표기는 청구항 문언 그대로 둡니다."""
+    heads: list[str] = []
+    for fragment in re.split(r"상기", str(text or ""))[1:]:
+        head = _BOUNDARY.split(fragment.strip(), 1)[0].strip(" ,.;·")
+        if len(re.sub(r"\s+", "", head)) >= 2:
+            heads.append(head)
+    return heads
+
+
 def anaphora(text: str) -> list[str]:
     """"상기 …"가 가리키는 대상 어구를 공백을 지운 형태로 뽑습니다.
 
@@ -44,12 +54,35 @@ def anaphora(text: str) -> list[str]:
     "제1 반사부재") 공백을 지운 뒤 비교합니다.
     """
     targets: list[str] = []
-    for fragment in re.split(r"상기", str(text or ""))[1:]:
-        head = _BOUNDARY.split(fragment.strip(), 1)[0]
-        head = re.sub(r"\s+", "", head).strip(" ,.;·")
-        if len(head) >= 2 and head not in targets:
-            targets.append(head)
+    for head in _heads(text):
+        collapsed = re.sub(r"\s+", "", head)
+        if collapsed not in targets:
+            targets.append(collapsed)
     return targets
+
+
+def antecedent_terms(claim: Claim) -> dict[str, list[str]]:
+    """구성마다 그것이 "상기 …"로 가리키는 **앞선 구성**의 지시 어구를 문언 그대로 모읍니다.
+
+    antecedents()는 상한을 씌울 **라벨**을 주지만, 의미검증(entailment.py)은 라벨이 아니라
+    한정 문장 안의 낱말을 보고 판단합니다. 어느 낱말이 이 구성이 새로 도입한 수단이 아니라
+    앞 구성에서 이미 세워 둔 대상인지 알려면 어구 자체가 필요합니다.
+
+    분해된 한정 문언은 지시어를 풀어 적으므로("상기 플라이휠의 회전 운동을 …" → "크랭크-슬라이드
+    기구부가 플라이휠의 회전 운동을 …으로 변환함") 한정만 봐서는 그 낱말이 이 구성의 요구사항인지
+    앞 구성에서 온 지시 대상인지 구분할 수 없습니다. 구분은 구성 원문에서만 읽어 낼 수 있습니다.
+    """
+    collapsed = [(element.label, re.sub(r"\s+", "", element.text)) for element in claim.elements]
+    terms: dict[str, list[str]] = {}
+    for index, element in enumerate(claim.elements):
+        for head in _heads(element.text):
+            target = re.sub(r"\s+", "", head)
+            if not any(target in text for _, text in collapsed[:index]):
+                continue
+            bucket = terms.setdefault(element.label, [])
+            if head not in bucket:
+                bucket.append(head)
+    return terms
 
 
 def antecedents(claim: Claim) -> dict[str, list[str]]:

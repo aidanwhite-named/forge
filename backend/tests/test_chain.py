@@ -167,12 +167,12 @@ def test_dependent_claim_stops_when_no_document_fills_a_remaining_gap():
     assert chain.uncovered == []
 
 
-def test_dependent_claim_combines_two_documents_that_fill_different_gaps():
-    """공백을 서로 다른 문헌 둘이 나누어 메우면 둘 다 채택한다.
+def test_dependent_claim_adds_at_most_one_document():
+    """종속항이 부모 조합에 새로 더할 수 있는 문헌은 1건이다.
 
-    1건 상한을 두면 한쪽이 통째로 버려지고, 그 문헌이 원문으로 개시한 구성까지
-    "어느 인용발명에서도 확인하지 못했다"로 보고된다. uncovered는 결합이 실패했다는 뜻이
-    아니라 어느 문헌에도 대응 기재가 없다는 사실 진술이다.
+    한 줄짜리 추가 한정 하나를 위해 문헌을 여러 건 끌어오면 거절 이유가 실무에서 설득력을
+    잃는다. 다만 상한 때문에 뺀 문헌의 기재를 "없다"고 적으면 사실과 다르므로, 그 구성은
+    beyond_limit에 근거 문헌과 함께 남겨 uncovered의 다른 항목과 구별한다.
     """
     parent, child = claim(1, importances=(5,)), claim(2, depends_on=1, importances=(4, 4))
     parents = {1: build(parent, [cell("1", "A", "동일")], all_claims=[parent, child])}
@@ -182,10 +182,70 @@ def test_dependent_claim_combines_two_documents_that_fill_different_gaps():
 
     chain = build(child, child_matches, parents=parents, all_claims=[parent, child])
 
-    assert chain.added == ["2", "3"]
-    assert chain.uncovered == []
-    assert chain.track == "inventive_step_combination"
-    assert "2건" in chain.rationale
+    assert chain.added == ["2"]
+    assert chain.combination_limit == 1
+    assert chain.beyond_limit == ["B"] and chain.beyond_limit_documents["B"] == ["3"]
+    # "어느 인용발명에서도 확인되지 않았다"고 적지 않는다. 기재는 있고 한도를 넘었을 뿐이다.
+    assert "어느 인용발명에서도 확인되지 않았습니다" not in chain.rationale
+    assert "상한(1건)" in chain.rationale
+
+
+_GUIDANCE = "길 안내 정보를 제공함"
+
+
+def _partial(document_id: str, label: str, *, found: bool, number: int = 1) -> ElementMatch:
+    """한정 2개 중 하나만 개시된 셀. found면 나머지 하나(_GUIDANCE)까지 개시한다."""
+    return ElementMatch(
+        claim_number=number, label=label, document_id=document_id,
+        judgment="실질적 동일" if found else "일부 차이", directness="direct",
+        quote="원문 발췌 문장입니다", chunk_id=f"D{document_id}-P-0001", verify="verified",
+        missing_limitations=[] if found else [_GUIDANCE],
+        limitation_checks=[
+            LimitationCheck(index=0, kind="core", limitation="체적 영상을 표시함", disclosed=True,
+                            quote="원문 발췌 문장입니다", chunk_id=f"D{document_id}-P-0001",
+                            verify="verified"),
+            LimitationCheck(index=1, kind="core", limitation=_GUIDANCE, disclosed=found,
+                            quote="원문 발췌 문장입니다" if found else "",
+                            chunk_id=f"D{document_id}-P-0001" if found else "",
+                            verify="verified" if found else "empty"),
+        ])
+
+
+def test_a_remaining_limitation_that_an_over_limit_document_discloses_is_not_a_plain_gap():
+    """차이점 줄도 미대응 줄과 같은 규율을 따른다 — 손에 든 문헌의 기재를 "없다"고 적지 않는다.
+
+    구성 전체가 아니라 **하위 한정 하나**가 결합 한도 밖 문헌에 있는 경우다. 실측에서 전제부의
+    "길 안내 정보를 제공함"이 그냥 남은 차이로 적혔는데, 그 한정을 원문으로 개시한 내비게이션
+    특허가 이미 업로드되어 있었다. 그대로 두면 읽는 사람은 그것을 추가 검색 대상으로 옮겨 적고,
+    선행기술 검색도 이미 찾은 것을 웹에서 다시 찾는다.
+    """
+    parent, child = claim(1, importances=(5,)), claim(2, depends_on=1, importances=(4, 4))
+    parents = {1: build(parent, [cell("1", "A", "동일")], all_claims=[parent, child])}
+    child_matches = [cell("1", "A", "대응 없음", number=2), cell("1", "B", "대응 없음", number=2),
+                     cell("2", "A", "동일", number=2), _partial("2", "B", found=False, number=2),
+                     cell("3", "A", "대응 없음", number=2), _partial("3", "B", found=True, number=2)]
+
+    chain = build(child, child_matches, parents=parents, all_claims=[parent, child])
+
+    assert chain.added == ["2"]                   # 공백 A를 메우는 문헌이 유일한 추가 자리를 쓴다
+    assert chain.combination_limit == 1
+    assert chain.uncovered == [] and chain.residual == ["B"]
+    # 구성이 아니라 한정 단위로 남는다. 그 한정을 개시한 것은 채택되지 못한 문헌 3이다.
+    assert chain.beyond_limit_residual == {"B": {_GUIDANCE: ["3"]}}
+    assert chain.beyond_limit == []               # 구성 B 자체는 대응이 있으므로 미대응이 아니다
+
+
+def test_a_remaining_limitation_absent_everywhere_stays_a_plain_gap():
+    """한도 밖 문헌에도 없는 한정은 종전대로 그냥 남은 차이다. 문장을 늘리지 않는다."""
+    parent, child = claim(1, importances=(5,)), claim(2, depends_on=1, importances=(4, 4))
+    parents = {1: build(parent, [cell("1", "A", "동일")], all_claims=[parent, child])}
+    child_matches = [cell("1", "A", "대응 없음", number=2), cell("1", "B", "대응 없음", number=2),
+                     cell("2", "A", "동일", number=2), _partial("2", "B", found=False, number=2),
+                     cell("3", "A", "대응 없음", number=2), _partial("3", "B", found=False, number=2)]
+
+    chain = build(child, child_matches, parents=parents, all_claims=[parent, child])
+
+    assert chain.residual == ["B"] and chain.beyond_limit_residual == {}
 
 
 def test_a_document_that_directly_discloses_a_core_element_stays_a_candidate():
@@ -280,12 +340,12 @@ def test_an_unsupported_difference_does_not_displace_the_current_gap():
     assert best_match([current, unsupported]).document_id == "1"
 
 
-def test_documents_filling_different_gaps_are_all_combined():
-    """사례 5. 서로 다른 공백의 유일한 근거를 가진 문헌은 개수와 무관하게 모두 결합한다.
+def test_independent_claim_combines_at_most_two_documents():
+    """사례 5. 독립항 거절 이유에 세우는 인용발명은 최대 2건(주 1 + 보조 1)이다.
 
-    결합 문헌 수를 2건으로 묶어 두면, 세 번째 문헌이 어떤 구성의 **유일한** 검증 근거를
-    가지고 있어도 통째로 버려지고 그 구성이 "어느 인용발명에도 대응이 없다"로 보고된다.
-    업로드된 문헌에 기재가 있는데 그렇게 적는 것은 사실과 다르다.
+    3건을 결합한 거절 이유는 실무에서 성립하기 어렵다. 다만 상한 때문에 빠진 세 번째 문헌이
+    어떤 구성의 유일한 근거를 가지고 있다면 그 사실은 반드시 남는다 — 감추면 "어느 인용발명에도
+    대응이 없다"는 거짓 진술이 되고, 이미 손에 든 문헌을 다시 찾게 된다.
     """
     target = claim(importances=(5, 5, 4, 4))
     matches = (
@@ -294,16 +354,17 @@ def test_documents_filling_different_gaps_are_all_combined():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and sorted(chain.secondaries) == ["2", "3"]
-    assert chain.uncovered == []
+    assert chain.primary == "1" and chain.secondaries == ["2"]
+    assert chain.combination_limit == 2
     assert coverage_of(chain, "C").adopted_document == "2"
-    assert coverage_of(chain, "D").adopted_document == "3"
+    assert chain.beyond_limit == ["D"] and chain.beyond_limit_documents["D"] == ["3"]
+    assert "상한(2건)" in chain.rationale
     # 모든 문헌의 구성별 대응은 채택 여부와 무관하게 전부 분석된다.
     assert {candidate.document_id for candidate in coverage_of(chain, "D").candidates} == {"1", "2", "3"}
 
 
-def test_a_core_gap_is_filled_by_a_third_document_too():
-    """차별적 핵심 구성이라고 해서 세 번째 문헌의 직접 근거를 버리지 않는다."""
+def test_the_secondary_that_fills_the_most_gaps_wins_the_single_slot():
+    """보조 인용발명 자리가 하나뿐이면 공백을 가장 많이 메우는 문헌이 차지한다."""
     target = claim(importances=(5, 3, 3, 4))                    # D가 핵심, 마지막에 남도록 구성
     matches = (
         [cell("1", "A", "동일")] + [cell("1", label, "대응 없음") for label in "BCD"]
@@ -312,8 +373,54 @@ def test_a_core_gap_is_filled_by_a_third_document_too():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and chain.secondaries == ["2", "3"]  # B·C를 한 번에 메우는 2가 먼저
-    assert chain.uncovered == []
+    assert chain.primary == "1" and chain.secondaries == ["2"]   # B·C를 한 번에 메우는 2
+    assert chain.beyond_limit == ["D"] and chain.beyond_limit_documents["D"] == ["3"]
+
+
+# --- 주지관용기술 -------------------------------------------------------------
+
+def test_a_generic_gap_backed_by_several_documents_becomes_well_known_art():
+    """범용 구성 하나 때문에 설 수 있는 거절이 통째로 사라지면 안 된다.
+
+    중요도가 낮고(범용 부품·통상 인터페이스) 업로드된 문헌 **여러 건**이 그 구성을 실제로
+    언급하면, 그것은 인용발명이 아니라 주지관용기술로 다룰 수 있다. 실증 문헌을 함께 남겨
+    심사관이 다툴 수 있게 한다.
+    """
+    target = claim(importances=(5, 5, 1))
+    matches = ([cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "차이")]
+               + [cell("2", "A", "일부 유사"), cell("2", "B", "일부 유사"), cell("2", "C", "차이")])
+
+    chain = build(target, matches, all_claims=[target])
+
+    assert chain.track == "inventive_step_combination"      # 거절 이유가 선다
+    assert chain.well_known == ["C"]
+    assert chain.well_known_documents["C"] == ["1", "2"]
+    assert "주지관용기술" in chain.rationale
+
+
+def test_a_generic_gap_that_no_document_mentions_is_not_well_known_art():
+    """중요도만으로는 주지관용이 되지 않는다. 이 도구가 관용성을 말할 근거가 없다."""
+    target = claim(importances=(5, 5, 1))
+    matches = ([cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음")]
+               + [cell("2", "A", "일부 유사"), cell("2", "B", "일부 유사"), cell("2", "C", "대응 없음")])
+
+    chain = build(target, matches, all_claims=[target])
+
+    assert chain.well_known == []
+    assert chain.track == "rejection_impossible"
+    assert chain.uncovered == ["C"]
+
+
+def test_a_core_gap_is_never_treated_as_well_known_art():
+    """차별적 핵심 구성은 여러 문헌이 언급하더라도 주지관용으로 넘기지 않는다."""
+    target = claim(importances=(5, 5, 5))
+    matches = ([cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "차이")]
+               + [cell("2", "A", "일부 유사"), cell("2", "B", "일부 유사"), cell("2", "C", "차이")])
+
+    chain = build(target, matches, all_claims=[target])
+
+    assert chain.well_known == []
+    assert chain.track == "rejection_impossible"
 
 
 def test_combination_stops_when_a_document_adds_nothing():
@@ -397,6 +504,64 @@ def test_no_primary_is_named_when_nothing_is_directly_disclosed():
                   + [cell("2", label, "대응 없음") for label in "ABC"])
     assert chain.primary is None
     assert chain.track == "rejection_impossible"
+
+
+def test_no_primary_still_reports_the_correspondences_that_were_found():
+    """주 인용발명이 서지 않는다고 구성대비 결과를 '대응 없음'으로 덮어쓰지 않는다.
+
+    자격 게이트는 차별적 핵심 구성(중요도 4 이상)의 직접 개시량만 본다. 핵심 구성이
+    '일부 유사·inferred'에 머물면 그 값이 전 문헌에서 0이 되어 조합을 세울 수 없는데,
+    종전에는 그때 uncovered에 전 구성을 넣고 빈 조합으로 마감했다. 그러면 같은 문헌이
+    원문 대조까지 통과해 '실질적 동일·direct'로 개시한 구성까지 "어느 인용발명에서도
+    확인되지 않았다"로 보고되고, 보고서 본문에서 구성대비가 통째로 사라졌다.
+    """
+    target = claim(importances=(2, 5))
+    chain = build(target, [cell("1", "A", "실질적 동일"),
+                           cell("1", "B", "일부 유사", direct=False)], all_claims=[target])
+    assert chain.track == "rejection_impossible"      # 결론은 그대로 접는다
+    assert chain.primary is None and chain.secondaries == []
+    assert chain.uncovered == []                      # 확인된 대응을 공백으로 적지 않는다
+    assert chain.residual == ["B"]
+    assert chain.reference_only == ["1"]              # 채택은 아니고 보고 대상일 뿐
+    assert coverage_of(chain, "A").adopted_document == "1"
+    assert coverage_of(chain, "A").adopted_role == "미채택"
+
+
+def test_dependent_claim_reports_its_comparison_when_the_parent_built_no_combination():
+    """부모항이 조합을 세우지 못해도 종속항의 추가 한정 대비는 그대로 남아야 한다.
+
+    부모가 _no_primary_chain으로 끝나면 상속할 문헌이 없다. 종전에는 그 빈 목록으로
+    종속항 결합을 계속 돌아 merged가 {}인 채 끝났고, 추가 한정을 '실질적 동일·direct'로
+    개시한 문헌이 있어도 "대응되는 인용발명이 확인되지 않음"으로 보고됐다. 독립항에서
+    고친 것과 같은 결손이다.
+    """
+    parent_claim = claim(1, importances=(2, 5))
+    child_claim = claim(2, depends_on=1, importances=(5,))
+    parent_chain = build(parent_claim, [cell("1", "A", "실질적 동일"),
+                                        cell("1", "B", "일부 유사", direct=False)],
+                         all_claims=[parent_claim, child_claim])
+    assert parent_chain.primary is None and parent_chain.inherited == []
+
+    child = build(child_claim, [cell("1", "A", "실질적 동일", number=2)],
+                  parents={1: parent_chain}, all_claims=[parent_claim, child_claim])
+    assert child.track == "rejection_impossible"
+    assert child.primary is None and child.secondaries == []
+    assert child.uncovered == []                      # 개시된 한정을 공백으로 적지 않는다
+    assert child.reference_only == ["1"]
+    assert coverage_of(child, "A").adopted_document == "1"
+    # 이 항만으로 주 인용발명을 세우지 않았다는 사유가 결론에 남아야 한다.
+    assert "부모 청구항 1의 인용발명 조합이 서지 않아" in child.rationale
+
+
+def test_no_primary_still_names_the_labels_that_are_genuinely_missing():
+    """대응이 확인된 구성과 어디에도 없는 구성은 결론에서 구별되어야 한다."""
+    target = claim(importances=(2, 5, 3))
+    chain = build(target, [cell("1", "A", "실질적 동일"),
+                           cell("1", "B", "일부 유사", direct=False),
+                           cell("1", "C", "대응 없음")], all_claims=[target])
+    assert chain.uncovered == ["C"]
+    assert "구성 A, B에는 대응 기재가 확인되었으나" in chain.rationale
+    assert "구성 C은 어느 인용발명에서도 대응 기재가 확인되지 않았습니다" in chain.rationale
 
 
 def test_incomplete_parent_blocks_the_dependent_conclusion():

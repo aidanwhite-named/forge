@@ -83,13 +83,26 @@ def _counted_checks(match: ElementMatch) -> list:
             if not check.alternative_group or not _is_redundant_alternative(check, satisfied)]
 
 
+# 직접성 계수. absent는 "근거 원문이 없음"이므로 direct_similarity가 이미 0으로 봅니다.
+# 종전 0.8은 그 판단과 정면으로 어긋나, 발췌가 아예 없는 '동일'(0.80)이 원문으로 검증된
+# '일부 차이'(0.55)보다 높은 유사도를 받았습니다. 이 값은 보고서의 종합 유사도
+# (combined_similarity)와 문헌 적합도 양쪽에 그대로 들어갑니다.
+DIRECTNESS_FACTOR = {"direct": 1.0, "inferred": 0.85, "absent": 0.55}
+# 발췌가 없거나 원문 대조를 통과하지 못한 대응. 판정 라벨은 verify가 이미 상한을 씌우지만,
+# 유사도는 그와 별개로 **근거의 실재 여부**를 반영해야 합니다. 그러지 않으면 지어낸 발췌 위에
+# 세운 대응과 원문으로 확인된 대응이 보고서에서 같은 숫자로 나갑니다.
+UNVERIFIED_EVIDENCE_FACTOR = 0.70
+
+
 def item_similarity(match: ElementMatch | None) -> float:
-    """판정 라벨을 대체하지 않고, 같은 라벨 안에서 하위 제한 누락과 직접성만 반영합니다."""
+    """판정 라벨을 대체하지 않고, 같은 라벨 안에서 하위 제한 누락·직접성·근거 실재만 반영합니다."""
     if match is None:
         return 0.0
     base = JUDGMENT_SIMILARITY.get(match.judgment, 0.0)
     atomic = atomic_coverage(match)
-    factor = {"direct": 1.0, "inferred": 0.9, "absent": 0.8}.get(match.directness, 1.0)
+    factor = DIRECTNESS_FACTOR.get(match.directness, 1.0)
+    if not match.quote or match.verify not in VERIFY_OK:
+        factor *= UNVERIFIED_EVIDENCE_FACTOR
     if atomic is None:
         return base * factor
     return base * (0.70 + 0.30 * atomic) * factor
@@ -109,6 +122,24 @@ def direct_similarity(match: ElementMatch | None) -> float:
     if match.directness == "inferred":
         return similarity * 0.65
     return similarity
+
+
+def core_elements(claim: Claim) -> list[ClaimElement]:
+    """차별적 핵심 구성. 하나도 없으면 전 구성을 핵심으로 봅니다."""
+    return [element for element in claim.elements if is_core(element)] or list(claim.elements)
+
+
+def core_direct_score(claim: Claim, matches: dict[str, ElementMatch]) -> float:
+    """핵심 구성의 **직접** 개시량(0~1). 중요도 가중 평균입니다.
+
+    문헌 순위(score_document)와 주 인용발명 자격 게이트가 같은 정의를 쓰도록 한 곳에 둡니다.
+    종전에는 자격 게이트만 단순 평균이라, 같은 '핵심 직접 개시량'이라는 이름으로 두 곳이
+    다른 값을 쓰고 마진(PRIMARY_CANDIDATE_MARGIN)도 서로 다른 척도 위에서 비교됐습니다.
+    """
+    core = core_elements(claim)
+    weight = sum(element.importance for element in core) or 1
+    return sum(element.importance * direct_similarity(matches.get(element.label))
+               for element in core) / weight
 
 
 def rows_for(claim: Claim, matches: dict[str, ElementMatch]) -> list[dict]:
@@ -146,7 +177,8 @@ def score_document(claim: Claim, matches: dict[str, ElementMatch]) -> tuple[floa
     element_coverage = weighted(rows)
     core_coverage = sum(row["importance"] * (row["similarity"] if row["similarity"] >= CRITICAL_GAP else 0.0)
                         for row in core) / core_weight
-    core_direct = sum(row["importance"] * row["direct"] for row in core) / core_weight
+    # 주 인용발명 자격 게이트와 같은 정의를 씁니다(coverage.core_direct_score).
+    core_direct = core_direct_score(claim, matches)
     core_breadth = sum(row["importance"] for row in core if row["direct"] >= DIRECT_STRONG) / core_weight
     critical_gap = sum(row["importance"] for row in core if row["similarity"] < CRITICAL_GAP) / core_weight
     evidence_adjusted = sum(
@@ -215,6 +247,9 @@ def evidence_locations(match: ElementMatch | None) -> int:
         return 0
     locations = {check.chunk_id or check.quote for check in match.limitation_checks
                  if check.disclosed and check.quote}
+    locations.update(span.chunk_id or span.quote
+                     for check in match.limitation_checks if check.disclosed
+                     for span in check.evidence if span.quote)
     if not locations and match.quote:
         return 1
     return len(locations)
@@ -257,6 +292,20 @@ def difference_labels(claim: Claim, matches: dict[str, ElementMatch]) -> list[st
     """대응 기재는 있으나 청구항과 완전히 같다고는 볼 수 없는 구성."""
     return [element.label for element in claim.elements
             if has_correspondence(matches.get(element.label)) and not is_complete(matches.get(element.label))]
+
+
+def disclosed_limitations(match: ElementMatch | None) -> set[str]:
+    """이 문헌이 **원문 대조를 통과한 근거로** 개시한 하위 한정의 문언.
+
+    missing_limitations의 반대편입니다. 어떤 문헌이 남은 차이를 실제로 메우는지 물으려면
+    구성 단위 대응(has_correspondence)으로는 부족합니다 — 그 구성에 대응은 있어도 정작
+    빠진 그 한정은 없을 수 있고, 그때 "이 문헌에 기재가 있다"고 적으면 없는 개시를
+    단언하게 됩니다. 검증(verify)까지 요구하는 것은 has_correspondence와 같은 이유입니다.
+    """
+    if match is None or match.error:
+        return set()
+    return {check.limitation for check in match.limitation_checks
+            if check.disclosed and check.limitation and check.verify in VERIFY_OK}
 
 
 def combined_similarity(claim: Claim, chain_matches: dict[str, ElementMatch]) -> float:
@@ -419,3 +468,42 @@ def _missing_count(match: ElementMatch | None) -> int:
 
 def is_core(element: ClaimElement) -> bool:
     return element.importance >= CORE_IMPORTANCE_THRESHOLD
+
+
+# --- 주지관용기술 -------------------------------------------------------------
+# 주지관용으로 다룰 수 있는 구성의 중요도 상한. 분해 단계의 기준으로 2는 "통상의 인터페이스·
+# 입출력 구성", 1은 "어느 발명에나 나타나는 범용 부품(메모리, 프로세서, 전원부)"입니다.
+WELL_KNOWN_IMPORTANCE_MAX = 2
+# 관용성을 실증할 최소 문헌 수. 중요도 하나만으로 가르지 않기 위한 조건입니다.
+WELL_KNOWN_MIN_DOCUMENTS = 2
+
+
+def well_known_labels(claim: Claim, matrix: dict[str, dict[str, ElementMatch]],
+                      labels: list[str]) -> dict[str, list[str]]:
+    """공백 구성 중 주지관용기술로 다룰 수 있는 것과, 그 관용성을 실증하는 문헌.
+
+    **중요도만으로 가르지 않습니다.** 종전 구현은 "중요도 2 이하"라는 기준 하나로 별도 절을
+    만들었는데, 그것만으로는 무엇도 실제로 인정되지 않으면서 미개시 사실만 흐려졌습니다.
+    여기서는 업로드된 문헌 **여러 건이 같은 구성을 실제로 언급한다**는 실증을 함께 요구합니다.
+    한 문헌에만 있으면 그것은 주지관용이 아니라 그냥 인용발명이고, 어느 문헌에도 없으면 이
+    도구가 주지관용이라고 말할 근거를 가지고 있지 않습니다.
+
+    판정 라벨은 보지 않고 **원문 대조를 통과한 발췌가 있는지**만 봅니다. 대응으로 세지 않은
+    '차이'·'일부 유사'도 그 문헌이 그 구성을 다루기는 한다는 증거이기 때문입니다.
+
+    이 함수는 주지관용이라고 **단정하지 않습니다**. 최종 인정은 심사관의 판단이므로, 결론에
+    근거 문헌과 함께 드러내 다툴 수 있게 하는 것이 목적입니다.
+    """
+    by_label = {element.label: element for element in claim.elements}
+    found: dict[str, list[str]] = {}
+    for label in labels:
+        element = by_label.get(label)
+        if element is None or element.is_preamble or element.importance > WELL_KNOWN_IMPORTANCE_MAX:
+            continue
+        mentions = sorted(
+            document_id for document_id, matches in matrix.items()
+            if (match := matches.get(label)) is not None and not match.error
+            and match.quote and match.verify == "verified" and match.judgment != "대응 없음")
+        if len(mentions) >= WELL_KNOWN_MIN_DOCUMENTS:
+            found[label] = mentions
+    return found

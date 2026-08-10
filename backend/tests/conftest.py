@@ -16,6 +16,10 @@ def isolate_app_data(tmp_path, monkeypatch):
     cache_dir = tmp_path / "comparison_cache"
     cache_dir.mkdir()
     monkeypatch.setattr("app.cache.CACHE_DIR", cache_dir)
+    entailment_cache = tmp_path / "entailment_cache"
+    entailment_cache.mkdir()
+    monkeypatch.setattr("app.entailment.CACHE_DIR", entailment_cache)
+    monkeypatch.setattr("app.cache.ENTAILMENT_CACHE_DIR", entailment_cache)
     # 선행기술 결과 검증은 외부 웹을 호출합니다. 테스트에서 나가지 않도록 막습니다.
     monkeypatch.setattr("app.priorart.verify_hits", lambda hits: None)
 
@@ -30,5 +34,9 @@ def block_the_real_cli(monkeypatch):
     def forbidden(prompt, expect="claims"):
         raise AssertionError(f"테스트에서 실제 CLI를 호출했습니다 (expect={expect}).")
 
-    for module in ("compare", "claims", "priorart"):
+    for module in ("compare", "claims", "priorart", "entailment"):
         monkeypatch.setattr(f"app.{module}.run_cli", forbidden)
+    # 기존 파이프라인 단위 테스트는 비교 이후의 결정론적 조립을 검사합니다. 의미검증 자체는
+    # 전용 테스트에서 실제 함수를 좁은 응답 스텁으로 검증하고, 나머지 테스트에서는 통과시킵니다.
+    monkeypatch.setattr("app.pipeline.validate_entailment",
+                        lambda matches, documents, cache_keys=None, claims=None: [])

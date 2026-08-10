@@ -418,7 +418,20 @@ function App() {
 
   const chainText = (report: any, response: Result) => {
     const ids = [report.chain.primary, ...report.chain.secondaries].filter(Boolean);
-    return ids.length ? ids.map((id: string) => refName(id, response)).join(' + ') : '채택 인용발명 없음';
+    const names = ids.map((id: string) => refName(id, response));
+    // 주지관용기술을 함께 세운 거절 이유는 인용발명 단독과 다른 거절 이유입니다.
+    // 빼고 적으면 화면에서 둘이 구별되지 않습니다.
+    const wellKnown: string[] = report.chain.well_known || [];
+    if (wellKnown.length) names.push(`주지관용기술 (구성 ${wellKnown.join(', ')})`);
+    if (names.length) return names.join(' + ');
+    // 주 인용발명이 서지 않아도 구성대비 결과는 아래에 그대로 표시됩니다. 어느 문헌의
+    // 대비인지 밝히지 않으면 근거 발췌의 출처가 채택된 인용발명인 것처럼 읽힙니다.
+    const referenced: string[] = report.chain.reference_only || [];
+    if (referenced.length) {
+      const shown = referenced.map((id: string) => refName(id, response)).join(', ');
+      return `채택 인용발명 없음 — 아래 구성대비는 ${shown}에 대한 대비 결과이며 모두 미채택입니다`;
+    }
+    return '채택 인용발명 없음';
   };
 
   async function searchPriorArt() {

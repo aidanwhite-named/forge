@@ -4,12 +4,14 @@ import json
 import pytest
 
 from app import agy, cache, claims as claims_module, compare, pipeline, priorart
+from app.chain import build_chain
 from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimResult, Document,
                         DocumentMapping, ElementMatch, EvidenceSpan)
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
 from app.report import to_markdown
 from app.report import (_closest_related, _difference, _narrative, _reason_clause,
-                        _summary_difference, _summary_similarity, refresh_mappings)
+                        _summary_difference, _summary_similarity, build_claim_report,
+                        build_mappings, refresh_mappings)
 
 CLAIMS = "전자장치에 있어서, (A) 쓰기 요청을 큐에 저장하는 메모리 컨트롤러; (B) 상태 변경 시 알림을 전송하는 통신부"
 QUOTE_A = "메모리 컨트롤러는 데이터 쓰기 요청을 큐에 저장한 후 순차적으로 처리한다."
@@ -211,6 +213,45 @@ def test_hallucinated_quote_is_downgraded_before_selection(monkeypatch, stub_cli
     assert "추가 검색 필요" in item.narrative
     assert any("→" in note or "낮췄" in note for note in result.verify_notes)
     monkeypatch.setitem(RESPONSES, "1", RESPONSES["1"])
+
+
+def test_report_keeps_the_comparison_when_no_document_qualifies_as_primary():
+    """조합을 세우지 못했다는 이유로 구성대비 본문을 비우지 않는다.
+
+    주 인용발명 자격 게이트는 차별적 핵심 구성(중요도 4 이상)의 **직접** 개시량만 본다.
+    핵심 구성이 '일부 유사·inferred'에 머물면 그 값이 전 문헌에서 0이 되어 조합은 서지
+    않지만, 문헌별 대비 결과는 그대로 남아 있다. 종전에는 채택 문헌 목록이 비었다는 이유로
+    본문을 통째로 비워, 원문 대조를 통과한 '실질적 동일·direct' 대응까지 "대응되는 인용발명이
+    확인되지 않음 — 추가 검색 필요"로 나갔다. 구성대비를 수행하고도 하지 않은 것처럼 보고한
+    셈이고, 그 진술은 출원인에게 유리한 방향이라 검토에서 이의가 제기되지도 않는다.
+    """
+    target = Claim(number=1, elements=[
+        ClaimElement(label="A", text="쓰기 요청을 큐에 저장하는 메모리 컨트롤러", importance=2),
+        ClaimElement(label="B", text="상태 변경 시 알림을 전송하는 통신부", importance=5)])
+    matrix = {"1": {
+        "A": ElementMatch(claim_number=1, label="A", document_id="1", judgment="실질적 동일",
+                          directness="direct", quote=QUOTE_A, chunk_id="D1-P-0021",
+                          verify="verified", reason="큐에 저장한 뒤 순차 처리하므로"),
+        "B": ElementMatch(claim_number=1, label="B", document_id="1", judgment="일부 유사",
+                          directness="inferred", quote=QUOTE_B, chunk_id="D1-P-0021",
+                          verify="verified", reason="알림 전송이 기재되어 있으므로"),
+    }}
+    chain = build_chain(target, matrix, {}, [target])
+    assert chain.primary is None and chain.track == "rejection_impossible"
+
+    mappings = build_mappings([DOCUMENTS[0]], [chain])
+    report = build_claim_report(target, chain, matrix, {"1": DOCUMENTS[0]}, mappings)
+    disclosed = element(report, "A")
+    assert disclosed.corresponded is True and disclosed.status == "개시됨"
+    assert disclosed.adopted_reference == 1
+    assert "추가 검색 필요" not in disclosed.narrative
+    assert disclosed.evidence                        # 근거 발췌가 본문에 남는다
+    assert element(report, "B").status == "부분 개시"
+    assert "대응되는 기술 내용이 확인되지 않았습니다" not in report.summary_similarity
+    # 채택은 하지 않았다는 사실은 그대로 드러나야 한다.
+    assert mappings[0].role == "미채택"
+    assert "채택된 인용발명 없음" in to_markdown(pipeline.AnalysisResult(
+        job_id="job", claim_mapping=mappings, reports=[report]))
 
 
 def test_second_run_reuses_the_cache_without_calling_the_cli(stub_cli):
@@ -526,6 +567,29 @@ def test_supplement_is_written_as_one_combined_sentence():
                           "인용발명 2 (10-2020-0002) (단락 [0012])의 결합으로 해소됨")
 
 
+def test_a_remaining_limitation_names_the_over_limit_document_that_discloses_it():
+    """남은 한정을 한도 밖 문헌이 개시했다면 차이점 줄에 그 사실을 함께 적는다.
+
+    적지 않으면 "→ 차이점: 길 안내 정보를 제공함"만 남아 추가 검색 대상으로 읽히는데, 그
+    기재는 이미 업로드된 문헌 안에 있다. 상한은 거절 이유를 몇 건으로 세울지의 문제이지
+    문헌에 기재가 있느냐의 문제가 아니므로 둘을 같은 문장에 뭉치지 않는다.
+    """
+    documents = {"1": document("1", QUOTE_A, "0025")}
+    match = ElementMatch(claim_number=1, label="P0", document_id="1", judgment="일부 차이",
+                         directness="direct", quote=QUOTE_A, chunk_id="D1-P-0025",
+                         verify="verified", missing_limitations=["길 안내 정보를 제공함"])
+    mappings = [DocumentMapping(reference_number=1, filename="1.pdf", document_id="1",
+                                document_number="10-2020-0001"),
+                DocumentMapping(reference_number=3, filename="3.pdf", document_id="3",
+                                document_number="US 2009/0005961 A1")]
+
+    assert _difference(match, None, False, mappings, documents) == "길 안내 정보를 제공함"
+    assert _difference(match, None, False, mappings, documents,
+                       {"길 안내 정보를 제공함": ["3"]}, 2) == (
+        "길 안내 정보를 제공함 (인용발명 3 (US 2009/0005961 A1)에 대응 기재가 있으나 "
+        "결합 문헌 수 상한(2건)을 넘어 이 거절 이유에는 세우지 않음)")
+
+
 def test_uncovered_elements_are_offered_for_prior_art_search(monkeypatch, stub_cli):
     only_partial = {"1": {"matches": [
         {"label": "P0", "judgment": "대응 없음", "directness": "absent", "quote": "", "chunk_id": "",
@@ -568,6 +632,31 @@ def test_residual_limitation_is_offered_for_prior_art_search():
         "text": "상태 변경 시 관리자 단말에 즉시 알림을 전송하는 조건",
         "claim_context": "상태 변경 시 알림을 전송하는 통신부",
     }]
+
+
+def test_a_residual_limitation_already_found_in_an_over_limit_document_is_not_searched():
+    """이미 손에 든 문헌에 있는 기재를 웹에서 다시 찾지 않는다. 구성 전체가 그럴 때와 같다."""
+    from app.models import AnalysisResult, ChainInfo, ClaimReport, ElementCoverage
+
+    limitation = "상태 변경 시 관리자 단말에 즉시 알림을 전송하는 조건"
+    result = AnalysisResult(job_id="job", claim_mapping=[], reports=[ClaimReport(
+        claim_number=1,
+        chain=ChainInfo(
+            claim_number=1,
+            residual=["B"],
+            beyond_limit_residual={"B": {limitation: ["3"]}},
+            element_coverage=[ElementCoverage(
+                label="B",
+                residual_difference=[
+                    limitation,
+                    "일부 차이 판정에 그쳐 하위 한정까지 동일하다고 보기 어렵습니다",
+                ],
+            )],
+        ),
+    )])
+
+    # 남은 한정이 그것뿐이었으므로 이 구성은 검색 대상에서 통째로 빠진다.
+    assert pipeline.uncovered_elements(result, CLAIMS) == []
 
 
 def test_prior_art_hit_keeps_the_claim_number(monkeypatch):
@@ -625,6 +714,40 @@ def test_cache_key_changes_with_the_model(monkeypatch):
     first = cache.cache_key(claim, DOCUMENTS[0])
     monkeypatch.setattr(cache, "load_runtime_settings", lambda: {**base, "model": "m2"})
     assert cache.cache_key(claim, DOCUMENTS[0]) != first
+
+
+def test_cache_key_separates_the_narrow_dependent_context_from_the_full_one(monkeypatch):
+    """좁은 문맥에서 나온 판정이 넓은 문맥으로 볼 경로에서 재사용되면 안 된다.
+
+    같은 (청구항 × 문헌)이라도 최초 분석은 문헌 전문에 가까운 예산으로, 종속항 추가는 그보다
+    훨씬 좁은 예산으로 판정한다. 예산을 키에서 빼면 좁은 문맥에서 "대응 없음"으로 떨어진 셀이
+    넓은 문맥의 실행에서 그대로 재사용되어, 문헌에 기재가 있는데도 없다는 판정이 고착된다.
+    """
+    from app.claims import parse_claims
+    from app.compare import DEPENDENT_DOCUMENT_BUDGET_CHARS, DOCUMENT_BUDGET_CHARS
+    claim = parse_claims(CLAIMS)[0]
+    monkeypatch.setattr(cache, "load_runtime_settings",
+                        lambda: {"provider": "agy", "model": "m1", "prompt": ""})
+
+    full = cache.cache_key(claim, DOCUMENTS[0], "", DOCUMENT_BUDGET_CHARS)
+    narrow = cache.cache_key(claim, DOCUMENTS[0], "", DEPENDENT_DOCUMENT_BUDGET_CHARS)
+
+    assert full != narrow
+
+
+def test_cache_key_changes_with_the_parent_claim_text(monkeypatch):
+    """같은 문언의 종속항이라도 부모항이 다르면 "상기 …"의 대상이 달라 판정이 달라진다."""
+    from app.claims import parse_claims
+    claim = parse_claims(CLAIMS)[0]
+    monkeypatch.setattr(cache, "load_runtime_settings",
+                        lambda: {"provider": "agy", "model": "m1", "prompt": ""})
+
+    without = cache.cache_key(claim, DOCUMENTS[0], "", 0, [])
+    with_parent = cache.cache_key(claim, DOCUMENTS[0], "", 0,
+                                  [{"claim_number": 1, "preamble": "장치에 있어서,",
+                                    "elements": [{"label": "A", "text": "이미지를 수신하는 입력부"}]}])
+
+    assert without != with_parent
 
 
 def test_cache_reuses_entries_that_contain_the_removed_similarity_field():

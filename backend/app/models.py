@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field, field_validator
 Judgment = Literal["동일", "실질적 동일", "일부 차이", "일부 유사", "차이", "대응 없음"]
 Directness = Literal["direct", "inferred", "absent"]
 VerifyStatus = Literal["verified", "partial", "not_found", "empty", "short"]
+EvidenceAlignment = Literal["unverified", "exact", "recovered", "not_found"]
+SemanticStatus = Literal["not_run", "accepted", "rejected", "error"]
+SemanticRelation = Literal["explicit", "necessary_implicit", "functional_equivalent", "unsupported"]
 
 
 class DependentClaimsAdd(BaseModel):
@@ -85,6 +88,8 @@ class EvidenceSpan(BaseModel):
     quote: str = ""                           # 문헌 원문 그대로
     quote_translation: str = ""               # 외국어 문헌의 한국어 번역
     verify: VerifyStatus = "empty"
+    # PDF 텍스트와의 정렬 품질입니다. 의미상 직접성(directness)과 분리해 기록합니다.
+    alignment: EvidenceAlignment = "unverified"
 
 
 class LimitationCheck(BaseModel):
@@ -103,6 +108,12 @@ class LimitationCheck(BaseModel):
     quote_translation: str = ""
     verify: VerifyStatus = "empty"
     verify_note: str = ""                     # 위치 복구·특정 실패 기록. 개시 여부와는 무관합니다.
+    alignment: EvidenceAlignment = "unverified"
+    # 복합 한정이 여러 문단에 걸쳐 개시되는 경우의 근거 묶음. quote는 대표 발췌로 남깁니다.
+    evidence: list[EvidenceSpan] = []
+    semantic_status: SemanticStatus = "not_run"
+    semantic_relation: SemanticRelation = "unsupported"
+    semantic_note: str = ""
 
 
 def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
@@ -145,6 +156,7 @@ class ElementMatch(BaseModel):
     evidence: list[EvidenceSpan] = []
     verify: VerifyStatus = "empty"
     verify_note: str = ""
+    alignment: EvidenceAlignment = "unverified"
     downgraded_from: str = ""                 # 발췌 검증 실패로 강등된 원 판정
     # 선행 구성이 같은 문헌에 없어 상한이 걸린 경우의 사유. 보고서의 차이점에 그대로 나갑니다.
     # 이 값이 없으면 "한정은 전부 개시(2/2)인데 등급만 낮은" 결과가 이유 없이 보이게 됩니다.
@@ -228,7 +240,30 @@ class ChainInfo(BaseModel):
         if value is None:
             return []
         return [value] if isinstance(value, str) else value
-    uncovered: list[str] = []                 # 결합 후에도 대응 기재를 찾지 못한 라벨
+    # 채택하지 않았지만 구성대비 결과는 보고서에 싣는 문헌. 주 인용발명 자격을 갖춘 문헌이
+    # 없어 조합 자체를 세우지 못한 경우에만 채워집니다. 역할은 '미채택'으로 남아야 하므로
+    # chain_documents()에는 넣지 않습니다. 이 목록이 없으면 보고서가 "조합이 비었으니 볼
+    # 것도 없다"로 읽고 본문을 통째로 비워, 원문 대조까지 통과한 대응이 "대응되는 인용발명이
+    # 확인되지 않음"으로 나갑니다.
+    reference_only: list[str] = []
+    uncovered: list[str] = []                 # 채택 조합으로 대응 기재를 찾지 못한 라벨
+    # 결합 한도 때문에 채택하지 **못한** 문헌에는 검증된 대응 기재가 있는 라벨.
+    # uncovered에 함께 들어 있지만 성격이 다릅니다. uncovered 중 이 목록에 없는 것만
+    # "어느 인용발명에도 기재가 없다"는 사실 진술이고, 여기 있는 것은 "기재는 있으나 이
+    # 거절 이유에 세울 문헌 수를 넘는다"입니다. 구분하지 않으면 손에 든 문헌을 다시 찾게 됩니다.
+    beyond_limit: list[str] = []
+    beyond_limit_documents: dict[str, list[str]] = {}
+    # 같은 문제의 **하위 한정** 판. 구성 전체는 채택 조합에 대응 기재가 있는데 그중 빠진
+    # 한정 하나를 한도 밖 문헌이 개시한 경우입니다. beyond_limit이 미대응 줄을 지키는 것처럼
+    # 이 값은 차이점 줄을 지킵니다 — 없으면 "길 안내 정보를 제공함"처럼, 업로드된 문헌이
+    # 원문으로 개시한 한정이 그냥 남은 차이로 적히고 선행기술 검색 대상까지 됩니다.
+    # label → 한정 문언 → 그 한정을 개시한 한도 밖 문헌 id.
+    beyond_limit_residual: dict[str, dict[str, list[str]]] = {}
+    # 주지관용기술로 다룰 수 있다고 본 라벨과 그 관용성을 실증하는 문헌.
+    # 인정 자체는 심사관의 판단이므로 근거 문헌을 함께 남겨 다툴 수 있게 합니다.
+    well_known: list[str] = []
+    well_known_documents: dict[str, list[str]] = {}
+    combination_limit: int = 0                # 이 청구항에 적용한 결합 문헌 수 상한
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
     element_coverage: list[ElementCoverage] = []

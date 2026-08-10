@@ -76,7 +76,7 @@ def _role(document_id: str, chains: list[ChainInfo]) -> str:
 
 def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[str, ElementMatch]],
                        documents: dict[str, Document], mappings: list[DocumentMapping]) -> ClaimReport:
-    selected = chain_documents(chain)
+    selected = _reported_documents(chain)
     merged = {element.label: best_match([matrix.get(document_id, {}).get(element.label)
                                          for document_id in selected])
               for element in claim.elements}
@@ -93,8 +93,22 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         conclusion=_conclusion(claim, chain, merged),
         coverage_summary=_coverage_summary(results),
         summary_similarity=_summary_similarity(claim, results),
-        summary_difference=_summary_difference(chain, results),
+        summary_difference=_summary_difference(chain, results, mappings),
     )
+
+
+def _reported_documents(chain: ChainInfo) -> list[str]:
+    """구성대비를 본문에 실을 문헌. 채택 조합이 있으면 그것, 없으면 참고용 문헌입니다.
+
+    주 인용발명 자격을 갖춘 문헌이 없으면 조합은 비지만 문헌별 대비 결과는 그대로 남아
+    있습니다(chain._no_primary_chain). 조합이 비었다는 이유로 본문을 비우면 원문 대조까지
+    통과한 대응이 "대응되는 인용발명이 확인되지 않음"으로 나갑니다 — 구성대비를 수행하고도
+    수행하지 않은 것처럼 보고하는 것입니다.
+
+    역할 표기(_role, _chain_text)는 chain_documents를 그대로 쓰므로 여기 실리는 문헌은
+    '미채택'으로 남습니다. 대비 결과를 보이는 것과 거절 이유에 세우는 것은 다른 문제입니다.
+    """
+    return chain_documents(chain) or list(chain.reference_only)
 
 
 def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain: ChainInfo,
@@ -130,8 +144,10 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         grade=grade,
         emoji=emoji,
         narrative=_narrative(label, text, match, primary, combined, mappings, documents,
-                             _closest_related(label, matrix, mappings, documents)),
-        difference=_difference(match, primary, combined, mappings, documents),
+                             _closest_related(label, matrix, mappings, documents),
+                             _gap_note(label, chain, mappings)),
+        difference=_difference(match, primary, combined, mappings, documents,
+                               chain.beyond_limit_residual.get(label), chain.combination_limit),
         combination=combined,
         evidence=evidence,
         status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
@@ -152,9 +168,31 @@ def _corresponded(match: ElementMatch | None) -> bool:
 
 # --- 구성대비 서술 -------------------------------------------------------------
 
+def _gap_note(label: str, chain: ChainInfo, mappings: list[DocumentMapping]) -> str:
+    """채택 조합이 커버하지 못한 구성의 첫 줄. 빈 문자열이면 진짜 공백입니다.
+
+    "대응되는 인용발명이 확인되지 않음"은 사실 진술입니다. 결합 한도 때문에 뺀 문헌에 그
+    기재가 실제로 있거나 주지관용으로 넘긴 구성에까지 그렇게 적으면, 읽는 사람은 이미 손에
+    든 문헌을 다시 찾아 나서게 됩니다. 세 경우가 부르는 후속 조치가 각각 다르므로 문장도
+    각각 다르게 씁니다.
+    """
+    if label in chain.well_known:
+        names = ", ".join(_reference_name(document_id, mappings)
+                          for document_id in chain.well_known_documents.get(label, []))
+        return (f"({label}) 구성은 주지관용기술로 보아 결합에 더했음 — {names}에 같은 취지의 "
+                "기재가 있음 (주지관용 인정 여부는 별도 확인 필요)")
+    if label in chain.beyond_limit:
+        names = ", ".join(_reference_name(document_id, mappings)
+                          for document_id in chain.beyond_limit_documents.get(label, []))
+        return (f"({label}) 구성은 채택된 인용발명 조합에는 대응 기재가 없음 — {names}에 대응 "
+                f"기재가 있으나 결합 문헌 수 상한({chain.combination_limit}건)을 넘어 이 거절 "
+                "이유에는 세우지 않음")
+    return ""
+
+
 def _narrative(label: str, text: str, match: ElementMatch | None, primary: ElementMatch | None,
                combined: bool, mappings: list[DocumentMapping],
-               documents: dict[str, Document], related: str = "") -> str:
+               documents: dict[str, Document], related: str = "", gap_note: str = "") -> str:
     """구성 1개의 구성대비를 한 문장으로 조립합니다.
 
     대응 문헌이 없으면 유사도 없이 미대응 한 줄만 남깁니다. 근거가 약한 대응을 억지로
@@ -163,7 +201,7 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
     상태인지도 알 수 없게 됩니다.
     """
     if not _corresponded(match) or match is None:
-        line = f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
+        line = gap_note or f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
         return f"{line}\n(가장 가까운 기재: {related} — 청구항 한정 전체를 개시하는 근거는 아님)" if related else line
     passage = _passage(match, mappings, documents)
     if combined and primary is not None:
@@ -235,7 +273,9 @@ def _reason_clause(reason: str) -> str:
 
 
 def _difference(match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
-                mappings: list[DocumentMapping], documents: dict[str, Document]) -> str | None:
+                mappings: list[DocumentMapping], documents: dict[str, Document],
+                overflow: dict[str, list[str]] | None = None,
+                combination_limit: int = 0) -> str | None:
     if match is None or not _corresponded(match):
         return None
     # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 이 경우 하위 한정은 전부 개시로
@@ -248,10 +288,31 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
                 f"{_reference_name(match.document_id, mappings)} ({_location(match, documents)})의 "
                 "결합으로 해소됨")
     if match.missing_limitations:
-        return "; ".join(match.missing_limitations[:3])
+        return _residual_gap(match.missing_limitations[:3], mappings, overflow, combination_limit)
     if match.judgment in {"동일", "실질적 동일"} and not match.downgraded_from:
         return None
     return "세부 구현·조건에 차이가 있어 동일하다고 보기 어렵습니다."
+
+
+def _residual_gap(missing: list[str], mappings: list[DocumentMapping],
+                  overflow: dict[str, list[str]] | None, combination_limit: int) -> str:
+    """남은 한정을 적되, 결합 한도 밖 문헌이 개시한 것은 그 사실과 함께 적습니다.
+
+    한도 밖에 기재가 있는 한정을 그냥 남은 차이로 적으면, 읽는 사람은 그것을 추가 검색
+    대상으로 읽습니다. 그런데 그 기재는 이미 업로드된 문헌 안에 있습니다. 상한은 *거절 이유를
+    몇 건으로 세울지*의 문제이지 *문헌에 기재가 있느냐*의 문제가 아니므로 둘을 같은 문장에
+    뭉치지 않습니다(chain.beyond_limit이 미대응 줄에서 하는 것과 같은 구분입니다).
+    """
+    parts: list[str] = []
+    for limitation in missing:
+        sources = (overflow or {}).get(limitation)
+        if not sources:
+            parts.append(limitation)
+            continue
+        names = ", ".join(_reference_name(document_id, mappings) for document_id in sources)
+        parts.append(f"{limitation} ({names}에 대응 기재가 있으나 결합 문헌 수 "
+                     f"상한({combination_limit}건)을 넘어 이 거절 이유에는 세우지 않음)")
+    return "; ".join(parts)
 
 
 def _closest_related(label: str, matrix: dict[str, dict[str, ElementMatch]],
@@ -315,7 +376,7 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
                       documents: dict[str, Document], mappings: list[DocumentMapping]) -> list[Evidence]:
     by_id = {mapping.document_id: mapping for mapping in mappings}
     evidence: list[Evidence] = []
-    for document_id in chain_documents(chain):
+    for document_id in _reported_documents(chain):
         match = matrix.get(document_id, {}).get(label)
         if not match:
             continue
@@ -355,6 +416,10 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
             if check.disclosed and check.quote and not check.whole_element:
                 add(check.chunk_id, check.quote, check.quote_translation, check.verify,
                     limitation=check.limitation, kind=check.kind)
+                for span in check.evidence:
+                    if span.quote:
+                        add(span.chunk_id, span.quote, span.quote_translation, span.verify,
+                            limitation=check.limitation, kind=check.kind)
     return evidence
 
 
@@ -410,10 +475,23 @@ def _conclusion(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch])
         return f"{title} — 판정을 받지 못한 셀이 있어 신규성·진보성 결론을 만들지 않았습니다."
     detail = [chain.rationale] if chain.rationale else []
     detail += _equivalence_caveat(claim, chain, merged)
-    if chain.uncovered:
-        detail.append(f"미대응 구성: {', '.join(chain.uncovered)}.")
+    # 미대응 구성을 한 덩어리로 적으면 "기재가 없다"와 "기재는 있으나 한도를 넘었다"가
+    # 구별되지 않습니다. 앞의 것만 추가 검색이 필요한 항목입니다.
+    genuine = [label for label in chain.uncovered
+               if label not in chain.beyond_limit and label not in chain.well_known]
+    if genuine:
+        detail.append(f"미대응 구성: {', '.join(genuine)}.")
+    if chain.beyond_limit:
+        detail.append(f"결합 한도 밖 인용발명에만 기재가 있는 구성: {', '.join(chain.beyond_limit)}.")
+    if chain.well_known:
+        detail.append(f"주지관용기술로 다룬 구성: {', '.join(chain.well_known)}.")
     if chain.residual:
+        # 남은 차이 중 한도 밖 문헌이 메우는 것은 따로 적습니다. 뭉쳐 두면 결론 줄만 읽는
+        # 사람이 그 구성 전체를 추가 검토 대상으로 옮겨 적게 됩니다.
+        limited = [label for label in chain.residual if label in chain.beyond_limit_residual]
         detail.append(f"차이가 남는 구성: {', '.join(chain.residual)}.")
+        if limited:
+            detail.append(f"그중 결합 한도 밖 인용발명이 그 한정을 개시한 구성: {', '.join(limited)}.")
     return f"{title} — {' '.join(detail)}" if detail else title
 
 
@@ -561,19 +639,46 @@ def _topic_particle(word: str) -> str:
     return "은"
 
 
-def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
-    """구성별 차이점과 겹치지 않는 범위에서 가장 두드러진 차이를 한 줄로 정리합니다."""
+def _summary_difference(chain: ChainInfo, results: list[ClaimResult],
+                        mappings: list[DocumentMapping] | None = None) -> str:
+    """구성별 차이점과 겹치지 않는 범위에서 가장 두드러진 차이를 한 줄로 정리합니다.
+
+    커버되지 않은 구성을 한 덩어리로 적지 않습니다. "어디에서도 확인되지 않았다"는 진짜
+    공백에만 해당하고, 결합 한도 밖 문헌에 기재가 있는 구성과 주지관용으로 넘긴 구성은
+    각각 다른 후속 조치를 부릅니다 — 앞의 것은 추가 검색, 뒤의 것은 문헌 선택 재검토,
+    마지막은 주지관용 인정 여부 확인입니다.
+    """
     if chain.track == "analysis_incomplete":
         return "구성대비가 완료되지 않아 차이점을 특정할 수 없습니다."
     uncovered = [result.label for result in results
                  if not result.corresponded and not result.is_preamble]
-    if uncovered:
-        return (f"구성 {', '.join(uncovered)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
-                "추가 검색이 필요합니다.")
+    lines: list[str] = []
+    genuine = [label for label in uncovered
+               if label not in chain.beyond_limit and label not in chain.well_known]
+    limited = [label for label in uncovered if label in chain.beyond_limit]
+    well_known = [label for label in uncovered if label in chain.well_known]
+    if genuine:
+        lines.append(f"구성 {', '.join(genuine)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
+                     "추가 검색이 필요합니다.")
+    if limited:
+        lines.append(f"구성 {', '.join(limited)}은 대응 기재를 가진 인용발명이 있으나 결합 문헌 수 "
+                     f"상한({chain.combination_limit}건)을 넘어 이 조합에 세우지 않았습니다.")
+    if well_known:
+        lines.append(f"구성 {', '.join(well_known)}은 주지관용기술로 보아 결합에 더했으며, "
+                     "그 인정 여부는 별도로 확인해야 합니다.")
+    if lines:
+        return " ".join(lines)
     residual = [label for label in chain.residual if label not in chain.uncovered]
-    if residual:
-        return f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다."
-    return ""
+    if not residual:
+        return ""
+    line = f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다."
+    # 그 차이 중 일부가 한도 밖 문헌에 이미 있다면 여기서도 갈라 적습니다. 요약만 읽고
+    # 추가 검색 목록을 만드는 독자에게는 이 줄이 유일한 신호입니다.
+    limited = [label for label in residual if label in chain.beyond_limit_residual]
+    if limited:
+        line += (f" 그중 구성 {', '.join(limited)}의 남은 한정은 결합 문헌 수 "
+                 f"상한({chain.combination_limit}건) 밖 인용발명에 대응 기재가 있습니다.")
+    return line
 
 
 def _clip(text: str, limit: int = 200) -> str:
@@ -738,5 +843,21 @@ def _evidence_location(evidence: Evidence) -> str:
 
 
 def _chain_text(chain: ChainInfo, mappings: list[DocumentMapping]) -> str:
+    """이 청구항의 거절 이유가 무엇 위에 서 있는지 한 줄.
+
+    주지관용기술을 함께 세웠으면 그것도 적습니다. 조용히 빼면 "인용발명 1 + 주지관용기술"과
+    "인용발명 1 단독"이 보고서에서 구별되지 않는데, 둘은 다른 거절 이유입니다.
+    """
     names = [_reference_name(document_id, mappings) for document_id in chain_documents(chain)]
-    return " + ".join(names) if names else "채택된 인용발명 없음"
+    if chain.well_known:
+        names.append(f"주지관용기술 (구성 {', '.join(chain.well_known)})")
+    if names:
+        return " + ".join(names)
+    if chain.reference_only:
+        # 조합은 세우지 않았지만 아래 구성대비가 어느 문헌의 대비 결과인지는 밝혀야 합니다.
+        # 밝히지 않으면 근거 발췌의 출처가 채택된 인용발명인 것처럼 읽힙니다.
+        referenced = ", ".join(_reference_name(document_id, mappings)
+                               for document_id in chain.reference_only)
+        return (f"채택된 인용발명 없음 — 주 인용발명 자격을 갖춘 문헌이 없어 조합을 세우지 "
+                f"않았습니다. 아래 구성대비는 {referenced}에 대한 대비 결과이며 모두 미채택입니다.")
+    return "채택된 인용발명 없음"

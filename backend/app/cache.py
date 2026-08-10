@@ -1,6 +1,6 @@
-"""비교 판정 캐시.
+"""비교 판정과 근거 의미검증 캐시.
 
-파이프라인에서 유일하게 비싼 단계가 (청구항 × 문헌) 비교이므로 그 결과만 캐시합니다.
+파이프라인의 비싼 LLM 단계인 (청구항 × 문헌) 비교와 근거 의미검증 결과를 캐시합니다.
 키는 청구항 구성 원문·문헌 청크·프롬프트 버전·모델의 해시라서, 히스토리를 지워도
 같은 입력이면 같은 판정이 재사용됩니다. 캐시 디렉터리는 히스토리 밖에 둡니다.
 """
@@ -12,7 +12,13 @@ from .models import Claim, Document, ElementMatch
 
 CACHE_DIR = DATA_DIR / "comparison_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ENTAILMENT_CACHE_DIR = DATA_DIR / "entailment_cache"
+ENTAILMENT_KEY_PREFIX = "entailment:"
 # 프롬프트나 정규화 규칙을 바꾸면 이 값을 올려 과거 캐시를 무효화합니다.
+# v15: 한정마다 복수 문단의 근거 묶음을 요구하고 문헌 유형을 의미판정 입력에서 제거했습니다.
+#      v14 캐시에는 이 묶음이 없어 독립 entailment 검증을 온전히 수행할 수 없습니다.
+# v14: 문헌을 끝까지 훑고 가장 직접적인 실시 기재를 고르도록 발췌 선택 규칙을 넣었고,
+#      종속항 프롬프트에 부모항 문언(parent_claims)을 실었습니다. 둘 다 판정을 바꿉니다.
 # v13: "동일"·"실질적 동일"에 대상 대응 조건을 걸었습니다. 동작을 가리키는 낱말이 같아도
 #      그 동작이 걸리는 대상이 다르면 등가가 아닙니다. 종전 프롬프트는 "용어만 다르며
 #      기술적 의미와 작동 관계가 같음"이라고만 해서, 같은 분야에서 비슷한 목적을 가진
@@ -25,10 +31,22 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # v7: 단건·일괄 경로가 같은 스키마(requirements + limitation_checks)를 요구하도록 통합했습니다.
 # 두 경로는 이 키를 공유하므로, 버전을 올리지 않으면 느슨한 스키마로 만든 셀이 엄격한
 # 경로의 재실행에서 그대로 재사용되어 불일치가 캐시에 영구 고착됩니다.
-PROMPT_VERSION = "compare-v13-operand-correspondence"
+PROMPT_VERSION = "compare-v15-evidence-bundle-type-neutral"
 
 
-def cache_key(claim: Claim, document: Document, guideline: str = "") -> str:
+def cache_key(claim: Claim, document: Document, guideline: str = "",
+              context_budget: int = 0, parents: list[dict] | None = None) -> str:
+    """이 판정을 만들어 낸 프롬프트를 식별합니다.
+
+    context_budget은 문헌 한 건을 프롬프트에 실을 문자 예산입니다. **반드시 키에 넣어야
+    합니다.** 같은 (청구항 × 문헌)이라도 최초 분석은 문헌 전문에 가까운 예산으로, 종속항
+    추가는 그보다 훨씬 좁은 예산으로 판정합니다. 이 값을 빼면 좁은 문맥에서 "대응 없음"으로
+    떨어진 셀이 넓은 문맥으로 다시 볼 경로에서 그대로 재사용되어, 문헌에 기재가 있는데도
+    없다는 판정이 캐시에 고착됩니다.
+
+    parents는 종속항 프롬프트에 실리는 부모항 문언입니다. 같은 문언의 종속항이라도 부모항이
+    다르면 "상기 …"의 대상이 달라져 판정이 달라지므로 함께 넣습니다.
+    """
     settings = load_runtime_settings()
     payload = {
         "version": PROMPT_VERSION,
@@ -36,6 +54,8 @@ def cache_key(claim: Claim, document: Document, guideline: str = "") -> str:
         "model": settings["model"],
         # 판단 지침을 바꾸면 판정이 달라지므로 키에 포함합니다.
         "guideline": (guideline or "").strip(),
+        "context_budget": int(context_budget),
+        "parents": parents or [],
         # search_terms는 프롬프트에 그대로 들어가 판정을 바꾸므로 키에 포함합니다.
         "claim": [{"label": element.label, "text": element.text,
                    "limitations": [limitation.model_dump() for limitation in element.limitations],
@@ -69,9 +89,10 @@ def store(key: str, matches: list[ElementMatch]) -> None:
 
 def clear() -> int:
     removed = 0
-    for path in CACHE_DIR.glob("*.json"):
-        path.unlink(missing_ok=True)
-        removed += 1
+    for directory in (CACHE_DIR, ENTAILMENT_CACHE_DIR):
+        for path in directory.glob("*.json"):
+            path.unlink(missing_ok=True)
+            removed += 1
     return removed
 
 
@@ -85,7 +106,10 @@ def discard(keys) -> int:
     """
     removed = 0
     for key in set(keys or ()):
-        path = CACHE_DIR / f"{key}.json"
+        if key.startswith(ENTAILMENT_KEY_PREFIX):
+            path = ENTAILMENT_CACHE_DIR / f"{key.removeprefix(ENTAILMENT_KEY_PREFIX)}.json"
+        else:
+            path = CACHE_DIR / f"{key}.json"
         if path.exists():
             path.unlink(missing_ok=True)
             removed += 1

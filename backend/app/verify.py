@@ -79,6 +79,7 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
         document = documents.get(match.document_id)
         if document is None:
             match.verify, match.verify_note = "not_found", "인용발명 문서를 찾을 수 없습니다."
+            match.alignment = "not_found"
             _cap(match, notes, "문서 없음", f"문서 ID {match.document_id}")
             continue
         if match.document_id not in corpus_cache:
@@ -89,6 +90,8 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
         for check in match.limitation_checks:
             if not check.disclosed:
                 continue
+            for span in check.evidence:
+                _verify_span(span, document, corpus)
             check.verify = _status(check.quote, corpus)
             cited_check = chunk_text(document, check.chunk_id) if check.chunk_id else ""
             if check.verify == "verified" and not (
@@ -96,6 +99,7 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
                 check.chunk_id = _find_chunk_id(document, check.quote)
                 cited_check = chunk_text(document, check.chunk_id) if check.chunk_id else ""
             if check.verify == "verified":
+                check.alignment = "exact"
                 # 원문 대조를 통과한 근거는 청크 위치를 특정하지 못하더라도 개시로 인정합니다.
                 # 대표 발췌에 이미 적용하는 규칙(아래 locator_verified 분기)과 같은 규칙입니다.
                 #
@@ -112,12 +116,22 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             recovered = _recover(check.quote, cited_check)
             if recovered:
                 check.quote, check.verify = recovered, "verified"
-                # 문구를 복구했더라도 모델이 적은 표현 자체는 원문이 아니었으므로, 구성 전체의
-                # 직접성은 보수적으로 inferred로 낮춘다. 하위 제한은 복구된 실제 문장으로만 센다.
-                if match.directness == "direct":
-                    match.directness = "inferred"
+                check.alignment = "recovered"
+                check.verify_note = "PDF 추출문에서 가장 가까운 실제 문장으로 정렬했습니다."
+                continue
+            # 대표 발췌가 깨졌더라도 같은 한정을 위한 근거 묶음에 검증된 문장이 있으면 개시
+            # 여부를 뒤집지 않습니다. 의미상 충족 여부는 독립 entailment 검증이 전체 묶음으로 봅니다.
+            supporting = next((span for span in check.evidence if span.verify == "verified"), None)
+            if supporting is not None:
+                check.quote = supporting.quote
+                check.quote_translation = supporting.quote_translation
+                check.chunk_id = supporting.chunk_id
+                check.verify = "verified"
+                check.alignment = supporting.alignment
+                check.verify_note = "대표 발췌 대신 검증된 근거 묶음의 문장을 사용했습니다."
                 continue
             check.disclosed = False
+            check.alignment = "not_found"
             failed_limitations.append(check.limitation)
         # 검증이 check.disclosed를 뒤집으므로 누락 목록은 여기서 다시 계산합니다. 점검 결과가
         # 없는 셀은 모델이 적어 준 목록뿐이라 그대로 둡니다.
@@ -127,12 +141,23 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             _cap(match, notes, f"하위 제한 근거 미검증 {len(failed_limitations)}건", document.filename)
 
         for span in match.evidence:
-            span.verify = _status(span.quote, corpus)
-            if span.verify == "verified" and not chunk_text(document, span.chunk_id):
-                span.chunk_id = _find_chunk_id(document, span.quote)
+            _verify_span(span, document, corpus)
+
+        # 복합 한정의 근거 묶음만 있고 구성 대표 발췌가 비어 있으면, 검증된 첫 한정 근거를
+        # 보고서·점수 계산용 대표 발췌로 올립니다. 의미 판정은 아래 별도 단계가 담당합니다.
+        if not match.quote:
+            representative = next((check for check in match.limitation_checks
+                                   if check.disclosed and check.verify == "verified" and check.quote), None)
+            if representative is not None:
+                match.quote = representative.quote
+                match.quote_translation = representative.quote_translation
+                match.chunk_id = representative.chunk_id
+                match.verify = "verified"
+                match.alignment = representative.alignment
 
         if not match.quote:
             match.verify = "empty"
+            match.alignment = "not_found"
             if match.directness == "direct":
                 match.directness = "inferred"
                 match.verify_note = "직접 개시로 판정되었으나 발췌가 없어 추론 근거로 낮췄습니다."
@@ -140,6 +165,7 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             continue
         if len(match.quote) < MIN_QUOTE_LEN:
             match.verify, match.verify_note = "short", "발췌가 너무 짧아 근거로 확인할 수 없습니다."
+            match.alignment = "not_found"
             _cap(match, notes, "발췌 과소", document.filename)
             continue
 
@@ -159,6 +185,7 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             else:
                 match.verify_note = ("발췌 원문은 문헌 전체에서 확인되었으나 단일 청크 위치를 "
                                      "자동으로 특정하지 못했습니다.")
+                match.alignment = "exact"
                 # 인용문 자체가 원문 대조를 통과했다면 위치 메타데이터 오류만으로 판정과
                 # 직접성을 강등하지 않습니다. 위치 점수만 빠져 문헌 적합도에는 소폭 반영됩니다.
                 continue
@@ -166,6 +193,7 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             invalid = match.chunk_id
             match.verify_note = f"인용한 chunk_id({invalid})가 문헌에 존재하지 않습니다."
             match.chunk_id = ""
+            match.alignment = "not_found"
             _cap(match, notes, "chunk_id 불일치 및 발췌 미검증", document.filename)
             match.directness = "inferred" if match.directness == "direct" else match.directness
             continue
@@ -174,15 +202,34 @@ def _verify_matches(matches: list[ElementMatch], documents: dict[str, Document])
             if recovered:
                 match.quote, match.verify = recovered, "verified"
                 match.verify_note = "대표 발췌를 인용한 청크의 정확한 원문으로 복구했습니다."
-                # 복구한 문장은 구성 전체가 아니라 일부만 뒷받침할 수 있으므로 직접 개시로 올리지 않습니다.
-                if match.directness == "direct":
-                    match.directness = "inferred"
-                    _cap(match, notes, "발췌 복구", document.filename)
+                match.alignment = "recovered"
                 continue
             match.verify_note = "발췌가 원문과 일치하지 않아 직접 개시로 인정하지 않았습니다."
+            match.alignment = "not_found"
             match.directness = "inferred" if match.verify == "partial" else "absent"
             _cap(match, notes, "발췌 불일치", document.filename)
+        else:
+            match.alignment = "exact"
     return notes
+
+
+def _verify_span(span, document: Document, corpus: str) -> bool:
+    """근거 묶음의 한 문장을 검증합니다. 추출 복구 여부는 의미상 직접성과 분리합니다."""
+    span.verify = _status(span.quote, corpus)
+    cited = chunk_text(document, span.chunk_id) if span.chunk_id else ""
+    if span.verify == "verified":
+        if not (cited and is_verbatim(span.quote, cited)):
+            span.chunk_id = _find_chunk_id(document, span.quote)
+        span.alignment = "exact"
+        return True
+    recovered = _recover(span.quote, cited)
+    if recovered:
+        span.quote = recovered
+        span.verify = "verified"
+        span.alignment = "recovered"
+        return True
+    span.alignment = "not_found"
+    return False
 
 
 def _status(quote: str, corpus: str) -> str:

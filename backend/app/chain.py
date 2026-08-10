@@ -6,10 +6,10 @@
 from .claims import ancestry
 from .coverage import (
     PRIMARY_CANDIDATE_MARGIN,
-    best_match, combined_similarity, difference_labels, direct_similarity, has_correspondence,
-    ineligible_reason, is_better_match, is_core, is_eligible_supplement,
-    no_correspondence_labels, residual_difference, rows_for, score_document,
-    supplement_gain, supplement_needed_labels, supplement_reason,
+    best_match, combined_similarity, core_direct_score, core_elements, difference_labels,
+    disclosed_limitations, has_correspondence, ineligible_reason, is_better_match,
+    is_eligible_supplement, no_correspondence_labels, residual_difference, rows_for, score_document,
+    supplement_gain, supplement_needed_labels, supplement_reason, well_known_labels,
 )
 from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
                      NoveltyScreen, SupplementCandidate)
@@ -18,19 +18,21 @@ from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMa
 NOVELTY_DIRECT = {"동일", "실질적 동일"}
 # 완전 미대응을 메우는 이득에 주는 우선순위. 남은 결합 여유를 품질 개선에 먼저 쓰지 않게 합니다.
 GAP_PRIORITY = 3.0
-# 보완 문헌을 하나 더 끌어오기 위해 요구하는 최소 이득. 결합 문헌 수에 상한을 두는 대신
-# 이 문턱으로 멈춥니다.
-#
-# 상한을 상수로 두면(종전 2건) 세 번째 문헌이 어느 구성의 **유일한** 검증 근거를 가지고
-# 있어도 통째로 버려지고, 그 구성은 "어느 인용발명에도 대응이 없다"로 보고됩니다. 실제로
-# 그런 문헌이 업로드되어 있는데도 그렇게 적으면 사실과 다른 보고가 됩니다. 문헌은 새로
-# 기여하는 것이 있을 때만 늘어나므로, 이득이 마르면 결합은 저절로 멈춥니다.
+# 보완 문헌을 하나 더 끌어오기 위해 요구하는 최소 이득. 상한에 닿기 전에도 새로 기여하는
+# 것이 없으면 여기서 멈춥니다.
 MIN_SUPPLEMENT_GAIN = 0.05
-# 종속항에서 **공백을 메우지 않는** 보완 문헌의 최대 건수. 공백을 메우는 추가에는 상한이
-# 없습니다(막으면 실제로 개시된 구성이 미대응으로 보고됨). 근거 품질만 올리는 추가는
-# 커버리지를 바꾸지 않으면서 결합 문헌 수만 늘리는데, 종속항 하나에 인용발명 서너 건을
-# 세운 거절 이유는 실무에서 그 자체로 설득력을 잃습니다.
-MAX_QUALITY_SUPPLEMENTS = 1
+# 독립항 거절 이유 하나에 세울 인용발명 수의 상한. 주 인용발명 1 + 보조 인용발명 1입니다.
+# 여기에 주지관용기술을 더할 수 있으므로, 실무에서 성립하는 네 형태
+# (인용발명 1 / 1 + 주지관용 / 2 / 2 + 주지관용)를 그대로 표현합니다.
+#
+# 상한을 두면 세 번째 문헌이 어느 구성의 유일한 검증 근거를 가지고 있을 때 그것이 버려집니다.
+# 그 사실을 감추면 "어느 인용발명에도 대응이 없다"는 거짓 보고가 되므로, 버리는 대신
+# beyond_limit에 그 구성과 문헌을 남깁니다. 상한은 **거절 이유를 몇 건으로 세울지**의 문제이지
+# 문헌에 기재가 있느냐의 문제가 아니므로, 둘을 같은 칸에 적지 않습니다.
+MAX_COMBINED_DOCUMENTS = 2
+# 종속항이 부모항 조합에 **새로 더할 수 있는** 문헌 수. 종속항의 추가 한정은 대개 한 줄이라,
+# 그것 하나를 위해 문헌을 여러 건 더 끌어오면 거절 이유가 실무에서 설득력을 잃습니다.
+MAX_DEPENDENT_ADDITIONS = 1
 
 
 Matrix = dict[str, dict[str, ElementMatch]]   # document_id → label → 판정
@@ -163,20 +165,19 @@ def _directly_disclosed(match: ElementMatch | None) -> bool:
 def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainInfo:
     eligible = _eligible_primaries(claim, matrix, chain.candidates)
     if not eligible:
-        chain.track = "rejection_impossible"
-        chain.uncovered = [element.label for element in claim.elements]
-        chain.rationale = "주 인용발명 자격을 갖춘 문헌이 없어 거절 이유를 구성하기 어렵습니다."
-        return _finalize(claim, chain, {}, matrix)
+        return _no_primary_chain(claim, matrix, chain)
 
     # 자격 게이트를 통과한 후보 중 단독 적합도 1위를 주 인용발명으로 확정합니다.
     chain.primary = eligible[0]
     chain.track = "inventive_step_combination"
+    chain.combination_limit = MAX_COMBINED_DOCUMENTS
     merged = dict(matrix[chain.primary])
     # 보완 검토 대상은 미커버 구성보다 넓습니다. '일부 차이'로 커버된 구성도 여기 들어옵니다.
     chain.supplement_needed = supplement_needed_labels(claim, merged)
 
-    # 새로 기여하는 문헌이 있는 한 계속 결합합니다. 이득이 문턱 아래로 떨어지면 멈춥니다.
-    while len(chain.secondaries) + 1 < len(matrix):
+    # 상한 안에서, 새로 기여하는 문헌이 있는 한 결합합니다. 이득이 문턱 아래로 떨어지면
+    # 상한에 닿기 전에도 멈춥니다.
+    while len(chain.secondaries) + 1 < min(len(matrix), MAX_COMBINED_DOCUMENTS):
         targets = supplement_needed_labels(claim, merged)
         if not targets:
             break
@@ -192,14 +193,126 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
     # 대응은 있으나 하위 한정이나 구현 방식에 차이가 남는 구성입니다.
     chain.residual = difference_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
+    _apply_gap_policy(claim, chain, matrix, merged)
+    return _finalize(claim, chain, merged, matrix)
+
+
+def _no_primary_chain(claim: Claim, matrix: Matrix, chain: ChainInfo, cause: str = "") -> ChainInfo:
+    """세울 조합이 없는 상태. 결론만 접고 구성대비는 그대로 보고합니다.
+
+    이 게이트가 답하는 것은 **거절 이유를 세울 수 있는가**이지, 문헌에 대응 기재가 있는가가
+    아닙니다. 종전에는 여기서 uncovered에 전 구성을 넣고 빈 조합(merged={})으로 마감했는데,
+    그러면 두 가지가 한꺼번에 무너집니다. 하나는 원문 대조까지 통과한 '실질적 동일·direct'
+    대응이 있는 구성까지 "어느 인용발명에서도 확인되지 않았다"고 단정하는 것이고, 다른 하나는
+    보고서 본문에서 구성대비 결과가 통째로 사라지는 것입니다(report.build_claim_report는
+    채택 문헌 목록으로 본문을 만듭니다). 실제로 세 문헌이 같은 구성을 '실질적 동일·direct·
+    검증됨'으로 개시한 분석이 "구성 A, B은 제시된 인용발명 어디에서도 대응 기재가 확인되지
+    않아 추가 검색이 필요합니다"로 나갔습니다.
+
+    미판정을 '대응 없음'으로 흘려보내지 않는 것(_incomplete_chain)과 같은 이유로, 확인된
+    대응을 없는 것으로 적지 않습니다. 채택은 하지 않으므로 primary·secondaries는 비운 채
+    두고, 구성별로 가장 강한 대응만 모아 보고용으로 씁니다. 그 대응을 가진 문헌은
+    reference_only에 남으므로 역할은 '미채택' 그대로입니다.
+
+    cause는 왜 조합을 세우지 못했는지입니다. 독립항은 자격 게이트를 통과한 문헌이 없어서고,
+    종속항은 부모항이 세운 조합이 없어서입니다. 결론이 같아도 다음에 해야 할 일이 다르므로
+    사유를 뭉뚱그리지 않습니다.
+    """
+    chain.track = "rejection_impossible"
+    # 동률일 때 항상 같은 문헌이 뽑히도록 문헌 순서를 고정합니다(_best_secondary와 같은 이유).
+    reference = {element.label: best_match([matrix[document_id].get(element.label)
+                                            for document_id in sorted(matrix)])
+                 for element in claim.elements}
+    chain.uncovered = no_correspondence_labels(claim, reference)
+    chain.residual = difference_labels(claim, reference)
+    chain.combined_similarity = combined_similarity(claim, reference)
+    corresponded = [element.label for element in claim.elements
+                    if element.label not in chain.uncovered]
+    chain.reference_only = sorted({match.document_id for label in corresponded
+                                   if (match := reference.get(label)) is not None})
+    reasons = [cause or "차별적 핵심 구성을 직접 개시한 인용발명이 없어 주 인용발명을 세우지 못했습니다."]
+    if corresponded:
+        reasons.append(f"구성 {', '.join(corresponded)}에는 대응 기재가 확인되었으나, "
+                       "주 인용발명이 서지 않아 인용발명 조합을 확정하지 않았습니다.")
     blocking = blocking_labels(claim, chain.uncovered)
     if blocking:
-        chain.track = "rejection_impossible"
-        chain.rationale = (f"결합 후에도 구성 {', '.join(blocking)}의 청구항 한정 전체를 충족하는 기재가 "
-                           "어느 인용발명에서도 확인되지 않아 거절 이유를 구성하기 어렵습니다.")
-    else:
+        reasons.append(f"구성 {', '.join(blocking)}은 어느 인용발명에서도 대응 기재가 확인되지 않았습니다.")
+    chain.rationale = " ".join(reasons)
+    return _finalize(claim, chain, reference, matrix)
+
+
+# --- 결합 한도 밖의 기재와 주지관용 ------------------------------------------
+
+def _apply_gap_policy(claim: Claim, chain: ChainInfo, matrix: Matrix,
+                      merged: dict[str, ElementMatch]) -> None:
+    """남은 공백을 세 가지로 갈라 트랙과 결론 문장을 정합니다.
+
+      - 결합 한도 밖 문헌에 검증된 대응 기재가 있는 구성 → beyond_limit
+      - 주지관용기술로 다룰 수 있는 구성 → well_known (거절 이유는 그대로 성립)
+      - 나머지 → 진짜 공백. 이때만 "어느 인용발명에서도 확인되지 않았다"고 적습니다.
+
+    셋을 한 칸에 뭉치면 보고서가 사실과 다른 진술을 하게 됩니다. 상한 때문에 뺀 문헌의 기재를
+    "없다"고 적으면 이미 손에 든 문헌을 다시 찾게 되고, 주지관용으로 충분한 범용 구성 하나
+    때문에 거절 이유 전체가 "구성 곤란"으로 떨어지면 실제로 설 수 있는 거절이 사라집니다.
+    """
+    adopted = {chain.primary, *chain.secondaries}
+    overflow: dict[str, list[str]] = {}
+    for label in chain.uncovered:
+        sources = sorted(document_id for document_id, matches in matrix.items()
+                         if document_id not in adopted and has_correspondence(matches.get(label)))
+        if sources:
+            overflow[label] = sources
+    chain.beyond_limit = [label for label in chain.uncovered if label in overflow]
+    chain.beyond_limit_documents = overflow
+    chain.beyond_limit_residual = _residual_overflow(chain, matrix, merged, adopted)
+
+    blocking = blocking_labels(claim, chain.uncovered)
+    well_known = well_known_labels(claim, matrix, blocking)
+    chain.well_known = [label for label in blocking if label in well_known]
+    chain.well_known_documents = well_known
+
+    blocking = [label for label in blocking if label not in well_known]
+    if not blocking:
         chain.rationale = _combination_rationale(chain)
-    return _finalize(claim, chain, merged, matrix)
+        return
+    chain.track = "rejection_impossible"
+    genuine = [label for label in blocking if label not in overflow]
+    limited = [label for label in blocking if label in overflow]
+    reasons: list[str] = []
+    if genuine:
+        reasons.append(f"구성 {', '.join(genuine)}의 청구항 한정 전체를 충족하는 기재가 "
+                       "어느 인용발명에서도 확인되지 않았습니다.")
+    if limited:
+        reasons.append(f"구성 {', '.join(limited)}에는 대응 기재를 가진 인용발명이 있으나, "
+                       f"결합 문헌 수 상한({chain.combination_limit}건)을 넘어 이 거절 이유에 "
+                       "세우지 않았습니다.")
+    chain.rationale = " ".join(reasons) + " 이대로는 거절 이유를 구성하기 어렵습니다."
+
+
+def _residual_overflow(chain: ChainInfo, matrix: Matrix, merged: dict[str, ElementMatch],
+                       adopted: set[str | None]) -> dict[str, dict[str, list[str]]]:
+    """대응은 되었는데 **남은 차이**를 한도 밖 문헌이 메우는 경우를 한정 단위로 찾습니다.
+
+    beyond_limit이 지키는 것은 "(X) 구성에 대응되는 인용발명이 확인되지 않음" 줄이고, 이쪽이
+    지키는 것은 "→ 차이점: …" 줄입니다. 둘은 같은 사실을 서로 다른 자리에서 부정합니다 —
+    구성 전체가 빠졌든 한정 하나가 빠졌든, 업로드된 문헌에 원문이 있는데 없다고 적으면 심사관은
+    이미 손에 든 문헌을 다시 찾아 나서게 됩니다. 실측에서 전제부의 "길 안내 정보를 제공함"이
+    그렇게 적혔습니다. 그 한정을 원문으로 개시한 내비게이션 특허가 업로드되어 있었지만 결합
+    상한(2건) 밖이었고, 보고서는 그 사실을 적지 않은 채 남은 차이로만 적었습니다.
+
+    구성 단위 대응(has_correspondence)이 아니라 **그 한정 자체**를 개시했는지로 봅니다.
+    구성에 대응이 있다는 것만으로는 정작 빠진 그 한정이 있다는 뜻이 아닙니다.
+    """
+    overflow: dict[str, dict[str, list[str]]] = {}
+    for label in chain.residual:
+        missing = (merged.get(label).missing_limitations if merged.get(label) else []) or []
+        for limitation in missing:
+            sources = sorted(document_id for document_id, matches in matrix.items()
+                             if document_id not in adopted
+                             and limitation in disclosed_limitations(matches.get(label)))
+            if sources:
+                overflow.setdefault(label, {})[limitation] = sources
+    return overflow
 
 
 def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore]) -> list[str]:
@@ -208,12 +321,12 @@ def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore
     다만 전체 점수가 낮아도 핵심 구성을 원문으로 직접 개시한 문헌은 남깁니다.
     평균 점수에 희석되어 유효한 후보가 탈락하지 않게 하기 위한 예외입니다.
     """
-    core_labels = [element.label for element in claim.elements if is_core(element)] \
-        or [element.label for element in claim.elements]
-    core_direct = {
-        document_id: sum(direct_similarity(matches.get(label)) for label in core_labels) / (len(core_labels) or 1)
-        for document_id, matches in matrix.items()
-    }
+    core_labels = [element.label for element in core_elements(claim)]
+    # 문헌 순위(score_document)와 **같은 정의**를 씁니다. 종전에는 여기만 중요도 가중이 아닌
+    # 단순 평균이라, 같은 이름의 지표가 두 곳에서 다른 값이었고 마진도 다른 척도 위에서
+    # 비교됐습니다.
+    core_direct = {document_id: core_direct_score(claim, matches)
+                   for document_id, matches in matrix.items()}
     if not core_direct:
         return []
     top = max(core_direct.values())
@@ -299,6 +412,16 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
 
     inherited = [document_id for document_id in [parent.primary, *parent.secondaries] if document_id]
     inherited += [document_id for document_id in parent.inherited if document_id not in inherited]
+    if not inherited:
+        # 부모항이 조합을 세우지 못했으면(_no_primary_chain) 상속할 것이 없습니다. 그렇다고
+        # 빈 조합으로 진행하면 merged가 {}인 채 끝나, 이 항의 추가 한정을 실제로 개시한 문헌이
+        # 있어도 "대응되는 인용발명이 확인되지 않음"으로 나갑니다 — 독립항에서 고친 것과 같은
+        # 결손입니다. 이 항만으로 주 인용발명을 세우지는 않습니다. 종속항 행렬에는 "…에 있어서"
+        # 뒤의 추가 한정만 들어 있어서, 그것 하나로 문헌을 채택하면 부모 구성을 개시하지 않은
+        # 문헌이 이 항의 거절 근거로 서게 됩니다(build_chain의 신규성 게이트 주석과 같은 이유).
+        return _no_primary_chain(claim, matrix, chain,
+                                 f"부모 청구항 {parent.claim_number}의 인용발명 조합이 서지 않아 "
+                                 "상속할 조합이 없습니다.")
     chain.inherited = inherited
     chain.primary = parent.primary
     chain.secondaries = [document_id for document_id in inherited if document_id != parent.primary]
@@ -321,31 +444,25 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
     # 구성을 실제로 개시한 문헌은 '실질적 동일·direct·검증됨'이었는데도 미채택으로 남았습니다.
     # README가 독립항에 대해 "보완 검토 대상 ≠ 미커버"라고 정한 것과 같은 이유입니다.
     #
-    # 다만 **공백을 메우지 않는 추가는 1건까지**입니다(MAX_QUALITY_SUPPLEMENTS).
-    # 공백을 메우는 추가는 제한하지 않습니다 — 그것을 막으면 실제로 개시된 구성이 다시
-    # "어느 인용발명에도 대응이 없다"로 보고되기 때문입니다. 반면 근거 품질만 올리는 추가는
-    # 커버리지를 바꾸지 않으면서 결합 문헌 수만 늘립니다. 종속항 하나에 인용발명 서너 건을
-    # 세운 거절 이유는 실무에서 그 자체로 설득력을 잃으므로, 이쪽만 예산을 둡니다.
-    #
-    # 예산이 떨어지면 대상을 공백으로 좁혀 계속 돕니다. 루프를 끊으면 품질 개선 후보가
-    # 공백 메우기 후보보다 먼저 뽑혔다는 이유만으로 남은 공백이 방치됩니다.
+    # 다만 **새로 더하는 문헌은 1건까지**입니다(MAX_DEPENDENT_ADDITIONS). 종속항의 추가 한정은
+    # 대개 한 줄인데 그것 하나를 위해 문헌을 여러 건 끌어오면 거절 이유가 실무에서 설득력을
+    # 잃습니다. 공백을 메우는 후보와 근거 품질만 올리는 후보가 함께 있으면 _best_secondary가
+    # GAP_PRIORITY 가중으로 공백 쪽을 먼저 고릅니다. 상한 때문에 빠진 문헌의 기재는 버리지
+    # 않고 beyond_limit에 남깁니다.
     added: list[str] = []
-    quality_budget = MAX_QUALITY_SUPPLEMENTS
-    while len(chain.secondaries) + 1 < len(matrix):
+    chain.combination_limit = MAX_DEPENDENT_ADDITIONS
+    while len(added) < MAX_DEPENDENT_ADDITIONS and len(chain.secondaries) + 1 < len(matrix):
         gaps = no_correspondence_labels(claim, merged)
-        targets = supplement_needed_labels(claim, merged) if quality_budget > 0 else gaps
+        targets = supplement_needed_labels(claim, merged)
         if not targets:
             break
         candidate = _best_secondary(claim, matrix, merged, targets, gaps,
                                     exclude={chain.primary, *chain.secondaries})
         if candidate is None:
             break
-        following = _merge(claim, merged, matrix[candidate])
-        if len(no_correspondence_labels(claim, following)) >= len(gaps):
-            quality_budget -= 1          # 공백은 그대로이고 근거 품질만 올린 추가
         added.append(candidate)
         chain.secondaries.append(candidate)
-        merged = following
+        merged = _merge(claim, merged, matrix[candidate])
     chain.added = added
 
     chain.uncovered = no_correspondence_labels(claim, merged)
@@ -353,16 +470,15 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
     chain.combined_similarity = combined_similarity(claim, merged)
     parents = ancestry(all_claims, claim.number)
     inherited_text = f"청구항 {', '.join(str(number) for number in parents)}의 인용발명 조합을 상속" if parents else "부모항 조합을 상속"
-    blocking = blocking_labels(claim, chain.uncovered)
-    if blocking:
-        chain.track = "rejection_impossible"
-        chain.rationale = (f"{inherited_text}했으나 추가 한정 {', '.join(blocking)}에 대응하는 기재를 "
-                           "어느 인용발명에서도 확인하지 못해 거절 이유를 구성하기 어렵습니다.")
+    _apply_gap_policy(claim, chain, matrix, merged)
+    if chain.track == "rejection_impossible":
+        chain.rationale = f"{inherited_text}했으나 추가 한정에 대해 {chain.rationale}"
     elif chain.added:
         chain.rationale = (f"{inherited_text}하고, 추가 한정을 개시하는 인용발명 "
-                           f"{len(chain.added)}건을 결합했습니다.")
+                           f"{len(chain.added)}건을 결합했습니다.{_well_known_clause(chain)}")
     else:
-        chain.rationale = f"{inherited_text}했으며 추가 문헌 없이 종속항 한정까지 커버됩니다."
+        chain.rationale = (f"{inherited_text}했으며 추가 문헌 없이 종속항 한정까지 "
+                           f"커버됩니다.{_well_known_clause(chain)}")
     return _finalize(claim, chain, merged, matrix)
 
 
@@ -461,20 +577,36 @@ def _importance(claim: Claim, label: str) -> int:
     return 3
 
 
+def _well_known_clause(chain: ChainInfo) -> str:
+    """주지관용으로 다룬 구성이 있으면 그 사실과 실증 문헌 수를 덧붙입니다.
+
+    조용히 메우면 보고서만 보고는 그 구성이 인용발명에 개시된 것인지 주지관용으로 넘어간
+    것인지 구별할 수 없습니다. 주지관용 인정은 심사관의 판단이므로 반드시 드러냅니다.
+    """
+    if not chain.well_known:
+        return ""
+    counts = {len(chain.well_known_documents.get(label, [])) for label in chain.well_known}
+    evidence = f"인용발명 {min(counts)}건 이상에 같은 취지의 기재가 있음" if counts else ""
+    return (f" 구성 {', '.join(chain.well_known)}은 해당 기술분야의 주지관용기술로 보아 결합에 "
+            f"더했습니다({evidence}). 주지관용 인정 여부는 별도로 확인해야 합니다.")
+
+
 def _combination_rationale(chain: ChainInfo) -> str:
     if not chain.secondaries:
         if chain.supplement_needed or chain.residual:
             labels = chain.residual or chain.supplement_needed
             return ("주 인용발명 단독으로 모든 구성에 대응 기재는 확인되지만, "
                     f"구성 {', '.join(labels)}은 완전 개시되지 않아 차이점 판단이 필요합니다. "
-                    "다른 문헌에서도 이 차이를 완전히 해소하는 더 강한 직접 근거는 확인하지 못했습니다.")
-        return "주 인용발명 단독으로 모든 필수 구성이 직접·완전하게 개시됩니다."
+                    "다른 문헌에서도 이 차이를 완전히 해소하는 더 강한 직접 근거는 확인하지 못했습니다."
+                    + _well_known_clause(chain))
+        return ("주 인용발명 단독으로 모든 필수 구성이 직접·완전하게 개시됩니다."
+                + _well_known_clause(chain))
     base = ("주 인용발명이 완전히 개시하지 않은 구성을 보완 인용발명이 직접 개시하여 결합했습니다. "
             "이 결합은 구성 커버리지만으로 조립한 것이고, 결합의 동기·용이성·결합 방해 요소·"
             "작용효과는 평가하지 않았으므로 진보성 결론이 아닙니다.")
     if chain.residual:
         base += f" 결합 후에도 구성 {', '.join(chain.residual)}에는 차이가 남습니다."
-    return base
+    return base + _well_known_clause(chain)
 
 
 def matrix_for(matches: list[ElementMatch]) -> Matrix:

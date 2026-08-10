@@ -77,8 +77,9 @@ _SECTION_RE = re.compile(
 # 비교 대상에서 제외할 섹션. 근거로 인용되어도 기술적 개시로 볼 수 없는 부분입니다.
 _EXCLUDED_SECTIONS = {"references", "bibliography", "acknowledgment", "acknowledgement",
                       "acknowledgments", "acknowledgements", "참고문헌", "감사의글", "부록", "appendix"}
-_PATENT_HINTS = ("claims", "what is claimed", "특허청구범위", "청구범위", "발명의 상세한 설명",
-                 "detailed description", "prior art", "int. cl", "patent application publication")
+_PATENT_STRONG_HINTS = ("what is claimed", "특허청구범위", "청구범위", "int. cl",
+                        "patent application publication")
+_PATENT_WEAK_HINTS = ("claims", "발명의 상세한 설명", "detailed description", "prior art")
 _PAPER_HINTS = ("abstract", "introduction", "references", "doi", "arxiv", "et al.")
 
 # 2단 조판 판별·복원 상수. 전부 페이지 좌표(pt) 기준이며 단위는 추출기가 만든 '줄'입니다.
@@ -209,14 +210,24 @@ def _mostly_increasing(numbers: list[int]) -> bool:
 
 
 def classify(text: str, paragraph_pattern: re.Pattern | None = None) -> str:
-    """단락번호와 공보 서지 어휘를 우선 보고, 그 다음 논문 어휘를 봅니다."""
+    """단락번호와 공보 서지 어휘를 우선하되 논문의 일반 문구 한 단어로 특허가 되지 않게 합니다.
+
+    논문 면책문구의 ``jurisdictional claims``와 관련연구의 ``prior art``는 흔합니다. 종전처럼
+    약한 힌트 하나만으로 특허로 분류하면 참고문헌 제외 규칙과 날짜 추출 경로가 달라집니다.
+    강한 공보 표지 또는 약한 힌트 두 개 이상일 때만 특허로 봅니다. 문헌 유형은 구성대비
+    프롬프트에는 전달하지 않습니다.
+    """
     normalized = text.lower()
     if paragraph_pattern is not None:
         return "patent"
-    if any(hint in normalized for hint in _PATENT_HINTS):
+    if any(hint in normalized for hint in _PATENT_STRONG_HINTS):
         return "patent"
-    if sum(hint in normalized for hint in _PAPER_HINTS) >= 2:
+    paper_hits = sum(hint in normalized for hint in _PAPER_HINTS)
+    patent_hits = sum(hint in normalized for hint in _PATENT_WEAK_HINTS)
+    if paper_hits >= 2:
         return "paper"
+    if patent_hits >= 2:
+        return "patent"
     return "technical"
 
 

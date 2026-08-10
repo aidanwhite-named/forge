@@ -2,14 +2,20 @@
 import fitz
 import pytest
 
-from app.pdf import extract_dates, extract_pdf, document_corpus, page_text
+from app.pdf import classify, extract_dates, extract_pdf, document_corpus, page_text
 from app.verify import is_verbatim
 
 # 단 판별에는 최소 낱말 수가 필요하므로, 대비할 문장 뒤에 채움 줄을 붙여 실제 공보 밀도를 흉내낸다.
 LEFT = (["a communication server in", "communication with the server", "and a plurality of devices"]
         + [f"left filler line number {index} of the specification" for index in range(12)])
 RIGHT = (["bus 1012 may include an", "Accelerated Graphics Port", "or another suitable bus"]
-         + [f"right filler line number {index} of the specification" for index in range(12)])
+        + [f"right filler line number {index} of the specification" for index in range(12)])
+
+
+def test_a_paper_disclaimer_containing_jurisdictional_claims_is_not_a_patent():
+    text = ("Abstract Introduction DOI 10.3390/example References. "
+            "The publisher stays neutral with regard to jurisdictional claims in published maps.")
+    assert classify(text) == "paper"
 
 
 def two_column_pdf(path, left=LEFT, right=RIGHT) -> str:
