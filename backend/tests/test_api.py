@@ -52,6 +52,18 @@ def finish_dependent(job_id: str):
     return main.jobs.get(job_id, {})
 
 
+def test_lifespan_recovers_interrupted_jobs(monkeypatch):
+    logs: list[tuple[str, str]] = []
+    monkeypatch.setattr(main, "recover_interrupted_jobs", lambda: 1)
+    monkeypatch.setattr(main, "jobs", {"job-1": {"status": "interrupted"}})
+    monkeypatch.setattr(main, "write_log", lambda job_id, message: logs.append((job_id, message)))
+
+    with TestClient(main.app) as lifespan_client:
+        assert lifespan_client.get("/api/health").status_code == 200
+
+    assert logs == [("job-1", "job marked interrupted after server restart")]
+
+
 def test_completed_job_is_marked_completed(monkeypatch):
     monkeypatch.setattr(main, "analyze", fake_result)
     job_id, response = start_job()

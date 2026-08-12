@@ -36,7 +36,8 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
             analysis_prompt: str = "", progress=None,
             decomposition: dict | None = None,
             cache_keys: set[str] | None = None,
-            priority_date: str = "") -> AnalysisResult:
+            priority_date: str = "",
+            pinned_decomposition: dict | None = None) -> AnalysisResult:
     """cache_keys를 주면 이 분석이 사용한 판정 캐시 키를 담아 돌려줍니다.
 
     캐시 항목에는 문헌 원문 발췌가 들어 있어서, 분석을 지울 때 그 항목도 함께 지워야
@@ -46,7 +47,10 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     if not claims:
         raise RuntimeError("청구항을 인식하지 못했습니다.")
     guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or ""
-    validation = list(assign_importance(claims, decomposition, claims_text))
+    validation = list(assign_importance(
+        claims, decomposition, claims_text,
+        pinned_decomposition=pinned_decomposition,
+    ))
     validation += input_quality_warnings(claims)
     validation += _date_eligibility_warnings(documents, priority_date)
     by_id = {document.id: document for document in documents}

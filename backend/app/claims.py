@@ -257,11 +257,13 @@ def _pinned_decomposition() -> dict | None:
 
 
 def assign_importance(claims: list[Claim], decomposition: dict | None = None,
-                      claims_text: str = "") -> list[str]:
+                      claims_text: str = "", *,
+                      pinned_decomposition: dict | None = None) -> list[str]:
     """구성요소 중요도·하위 한정·검색어를 받습니다. 실패해도 기본값 3으로 진행합니다.
 
     decomposition은 이 분해 결과를 읽고 쓰는 저장소입니다. 이미 분해된 청구항은 그대로
-    되살리고 남은 것만 LLM에 물어봅니다.
+    되살리고 남은 것만 LLM에 물어봅니다. pinned_decomposition은 회귀 실행처럼 환경변수와
+    무관하게 사건별 분해를 고정해야 할 때만 사용합니다.
 
     저장하는 이유는 호출 한 번을 아끼는 데 있지 않습니다. 이 분해 결과(limitations,
     search_terms)가 비교 캐시 키에 그대로 들어가는데(cache.cache_key), 같은 청구항을 다시
@@ -273,13 +275,17 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None,
     # 우선순위: 고정 파일 > 이 작업이 이미 쓰던 분해 > 입력 해시 캐시 > LLM.
     # 고정 파일이 가장 앞인 이유는 그것이 실험 통제 장치이기 때문입니다 — 켜 두었으면 다른
     # 어떤 경로도 그것을 밀어내서는 안 됩니다.
-    pinned = _pinned_decomposition()
+    # 인자로 받은 것이 환경변수보다 앞섭니다. 회귀 하니스는 한 프로세스에서 여러 사건을
+    # 돌리는데, 환경변수는 import 시점에 한 번만 읽히므로 두 번째 사건부터 듣지 않습니다.
+    explicitly_pinned = pinned_decomposition is not None
+    source = ("회귀 사건의 고정 분해" if explicitly_pinned
+              else f"고정 파일({DECOMPOSITION_FILE})")
+    pinned = pinned_decomposition if explicitly_pinned else _pinned_decomposition()
     restored = {claim.number for claim in claims
                 if _restore_elements(claim, pinned, strict_version=False)}
     if restored:
         notes.append(f"청구항 {', '.join(str(number) for number in sorted(restored))}의 구성 분해를 "
-                     f"고정 파일({DECOMPOSITION_FILE})에서 읽었습니다. 이 보고서의 분해는 자동 "
-                     "생성된 것이 아닙니다.")
+                     f"{source}에서 읽었습니다. 이 보고서의 분해는 자동 생성된 것이 아닙니다.")
     restored |= {claim.number for claim in claims
                  if claim.number not in restored and _restore_elements(claim, decomposition)}
 

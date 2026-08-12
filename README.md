@@ -169,4 +169,15 @@ npm run build
 
 `backend/tests/test_chain.py`가 선정 알고리즘의 회귀 테스트입니다 — 신규성 게이트, 증분 기반 보조 문헌 선정, 종속항 결합 한도, 동일 입력의 동일 출력을 고정합니다.
 
+동결한 실제 사건을 다시 채점하려면 회귀 하니스를 사용합니다. 사건 원문과 문헌 추출본은
+민감할 수 있으므로 `cases/`에 로컬로만 두며 Git에는 포함되지 않습니다.
+
+```powershell
+python backend/tools/regress.py --score-only        # 저장된 최신 관측만 채점
+python backend/tools/regress.py --case smart-window
+python backend/tools/regress.py --runs 3            # 캐시를 우회해 판정 안정성 측정
+```
+
+`expected.json`의 `adjudicated`가 `false`인 사건은 통과로 세지 않고 미채점으로 명시합니다.
+
 보안상 업로드는 PDF 확장자·파일 크기·개수·전체 크기를 검증하고, 파일명은 경로 요소를 제거해 저장합니다. 원문 PDF는 해당 분석의 `history/{job_id}/sources/` 안에만 보존되고 히스토리를 삭제할 때 함께 삭제됩니다. 기본 로그에는 PDF 원문·청구항 원문·CLI 원문 응답을 기록하지 않습니다.

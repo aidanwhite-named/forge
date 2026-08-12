@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -20,7 +21,18 @@ from .pdf import extract_pdf
 from .pipeline import analyze, extend_with_dependent_claims, summarize_matrix, uncovered_elements
 from .report import to_markdown
 
-app = FastAPI(title="Patent Evidence Analyzer")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    recovered = recover_interrupted_jobs()
+    if recovered:
+        for job_id, record in jobs.items():
+            if record.get("status") == "interrupted":
+                write_log(job_id, "job marked interrupted after server restart")
+    yield
+
+
+app = FastAPI(title="Patent Evidence Analyzer", lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5374"], allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
 # 작업이 아직 돌고 있어 결과를 건드리면 안 되는 상태. 후속 작업 엔드포인트가 **같은 집합**을
@@ -190,14 +202,6 @@ def sweep_job_records() -> None:
             jobs.pop(job_id, None)
             agy.finish_job(job_id)
             drop_job_state(job_id)
-
-@app.on_event("startup")
-def _on_startup() -> None:
-    recovered = recover_interrupted_jobs()
-    if recovered:
-        for job_id, record in jobs.items():
-            if record.get("status") == "interrupted":
-                write_log(job_id, "job marked interrupted after server restart")
 
 @app.get("/api/health")
 def health(): return {"status": "ok", "llm": "agy-cli", "model": AGY_MODEL}

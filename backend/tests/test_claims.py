@@ -224,3 +224,22 @@ def test_a_pinned_decomposition_is_ignored_when_the_claim_text_differs(tmp_path,
     parsed = claims.parse_claims("전혀 다른 청구항 문언을 가진 제어부")
     claims.assign_importance(parsed)
     assert called == ["elements"]                        # 고정 분해를 쓰지 않고 새로 물었다
+
+
+def test_an_explicit_pinned_decomposition_takes_priority_over_the_environment(tmp_path,
+                                                                              monkeypatch):
+    """회귀 하니스의 사건별 분해가 프로세스 전역 고정 파일과 섞이면 안 된다."""
+    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION - 1, text="사건별 분해")
+    pinned = json.loads(path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        claims, "_pinned_decomposition",
+        lambda: pytest.fail("명시적으로 전달한 분해 대신 환경 고정 파일을 읽었습니다."),
+    )
+    monkeypatch.setattr(claims, "run_cli",
+                        lambda *a, **k: pytest.fail("고정 분해가 있는데 LLM을 불렀습니다."))
+
+    parsed = claims.parse_claims("쓰기 요청을 큐에 저장하는 저장부")
+    notes = claims.assign_importance(parsed, pinned_decomposition=pinned)
+
+    assert [item.text for item in parsed[0].elements[0].limitations] == ["사건별 분해"]
+    assert any("회귀 사건의 고정 분해" in note for note in notes)
