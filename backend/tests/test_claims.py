@@ -1,6 +1,11 @@
+import json
+
+import pytest
+
+from app import claims
 from app import claims as claims_module
-from app.claims import (ancestry, assign_importance, input_quality_warnings,
-                        parse_claims)
+from app.claims import (DECOMPOSITION_VERSION, ancestry, assign_importance,
+                        input_quality_warnings, parse_claims)
 
 
 def test_multiline_element_stays_one_component_and_keeps_its_label():
@@ -130,6 +135,41 @@ def test_an_edited_claim_is_decomposed_again(monkeypatch):
     assert calls == ["elements", "elements"]
 
 
+def test_a_version_one_decomposition_is_recomputed_under_the_atomic_split_rules(monkeypatch):
+    """구형 분해의 core/qualifier 중복을 새 비교 캐시에 그대로 고착시키지 않는다."""
+    calls: list[str] = []
+
+    def fake(prompt, expect="claims"):
+        calls.append(prompt)
+        return {"elements": [{
+            "claim_number": 1, "label": "E", "importance": 5,
+            "limitations": [
+                {"text": "프로세싱 시간 정보를 업데이트함", "kind": "core"},
+                {"text": "업데이트 시점을 비디오 편집 수행 중으로 한정함", "kind": "qualifier"},
+            ],
+        }]}
+
+    monkeypatch.setattr(claims_module, "run_cli", fake)
+    legacy = {"version": 1, "claims": {"1": [{
+        "label": "E", "text": "비디오 편집 중 프로세싱 시간 정보를 업데이트함",
+        "importance": 5,
+        "limitations": [{
+            "text": "비디오 편집 중 프로세싱 시간 정보를 업데이트함", "kind": "core",
+        }],
+    }]}}
+    parsed = parse_claims("(E) 비디오 편집 중 프로세싱 시간 정보를 업데이트함")
+
+    assert assign_importance(parsed, legacy) == []
+
+    assert len(calls) == 1
+    assert "같은 조건을 core와 qualifier에 중복" in calls[0]
+    assert "여러 대안에 공통인 문구는 각 대안에 되풀이하지" in calls[0]
+    assert legacy["version"] == claims_module.DECOMPOSITION_VERSION
+    assert [item.text for item in parsed[0].elements[0].limitations] == [
+        "프로세싱 시간 정보를 업데이트함", "업데이트 시점을 비디오 편집 수행 중으로 한정함",
+    ]
+
+
 def test_a_failed_decomposition_is_not_stored(monkeypatch):
     """분해를 못 받아 기본값으로 진행한 결과를 저장하면 그 빈 분해가 계속 재사용된다."""
     def failing(prompt, expect="claims"):
@@ -140,3 +180,47 @@ def test_a_failed_decomposition_is_not_stored(monkeypatch):
     warnings = assign_importance(parse_claims("(A) 쓰기 요청을 큐에 저장하는 것"), store)
     assert warnings and "기본값" in warnings[0]
     assert store == {}
+
+
+# --- 고정 분해 (실험 통제) --------------------------------------------------------
+# 분해는 매 실행 LLM이 새로 만들기 때문에 같은 청구항이 실행마다 다르게 쪼개집니다. 프롬프트
+# 한 곳만 바꾼 효과를 재려면 분해를 붙들어 둘 수 있어야 합니다.
+
+def _pinned_file(tmp_path, version: int, text: str = "큐에 저장함"):
+    payload = {"version": version, "claims": {"1": [
+        {"label": "A", "text": "쓰기 요청을 큐에 저장하는 저장부", "importance": 5,
+         "is_sub": False, "search_terms": ["queue"],
+         "limitations": [{"text": text, "kind": "core", "alternative_group": ""}]}]}}
+    path = tmp_path / "pinned.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_pinned_decomposition_is_used_even_across_a_version_bump(tmp_path, monkeypatch):
+    """실험은 대개 버전을 올린 뒤에 한다. 버전으로 막으면 비교 대상 분해를 쓸 수 없다."""
+    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION - 1)
+    monkeypatch.setattr(claims, "DECOMPOSITION_FILE", str(path))
+    monkeypatch.setattr(claims, "run_cli",
+                        lambda *a, **k: pytest.fail("고정 분해가 있는데 LLM을 불렀습니다."))
+
+    parsed = claims.parse_claims("쓰기 요청을 큐에 저장하는 저장부")
+    notes = claims.assign_importance(parsed)
+
+    assert [item.text for item in parsed[0].elements[0].limitations] == ["큐에 저장함"]
+    assert any("고정 파일" in note for note in notes)      # 보고서에 드러나야 한다
+
+
+def test_a_pinned_decomposition_is_ignored_when_the_claim_text_differs(tmp_path, monkeypatch):
+    """버전 검사는 건너뛰어도 구성 원문 대조는 남는다. 다른 청구항에 씌우면 안 된다."""
+    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION)
+    monkeypatch.setattr(claims, "DECOMPOSITION_FILE", str(path))
+    called: list[str] = []
+
+    def fake(prompt, expect="claims"):
+        called.append(expect)
+        return {"elements": []}
+
+    monkeypatch.setattr(claims, "run_cli", fake)
+    parsed = claims.parse_claims("전혀 다른 청구항 문언을 가진 제어부")
+    claims.assign_importance(parsed)
+    assert called == ["elements"]                        # 고정 분해를 쓰지 않고 새로 물었다

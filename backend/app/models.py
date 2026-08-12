@@ -145,7 +145,17 @@ class ElementMatch(BaseModel):
     claim_number: int
     label: str
     document_id: str
+    # judgment는 **모델이 고르지 않습니다.** limitation_checks에서 coverage.derive_judgment가
+    # 산출합니다. 모델에게는 아래 두 가지 좁은 질문만 묻고, 그 답과 한정별 개시 여부로
+    # 등급이 정해집니다. 라벨을 자유롭게 받던 종전에는 같은 근거에서도 실행마다 등급이
+    # 흔들렸고, 그 값 하나가 유사도·문헌 순위·신규성 게이트를 전부 좌우했습니다.
     judgment: Judgment = "대응 없음"
+    # 청구항 문언과 문헌 표기의 관계. 한정이 전부 개시된 경우에만 동일/실질적 동일을 가릅니다.
+    terminology: Literal["identical", "equivalent"] = "equivalent"
+    # 문헌이 그 구성을 다른 목적으로 사용하는지. 참이면 한정이 전부 개시되어도 '일부 유사'에서
+    # 멈춥니다. 판정 라벨 정의의 "문헌이 그 구성을 다른 목적으로 사용함"에 해당하며, 한정별
+    # 개시 여부만으로는 표현할 수 없어 따로 받습니다.
+    different_purpose: bool = False
     directness: Directness = "absent"
     reason: str = ""
     quote: str = ""
@@ -161,6 +171,26 @@ class ElementMatch(BaseModel):
     # 선행 구성이 같은 문헌에 없어 상한이 걸린 경우의 사유. 보고서의 차이점에 그대로 나갑니다.
     # 이 값이 없으면 "한정은 전부 개시(2/2)인데 등급만 낮은" 결과가 이유 없이 보이게 됩니다.
     antecedent_note: str = ""
+    # 구성 간 정합성 상한을 적용하기 직전의 등급. downgraded_from은 의미검증 등 다른 단계의
+    # 강등까지 함께 기록하므로, 결합 문헌이 선행 구성을 보완했을 때 정확한 직전 등급으로만
+    # 복원하려면 별도 필드가 필요합니다.
+    antecedent_capped_from: str = ""
+    # 같은 문헌에는 없던 선행 구성을 채택 조합의 다른 문헌이 보완한 경우 그 문헌 ID.
+    # 보고서가 두 문헌의 발췌를 한 문장에 함께 제시할 때 사용합니다.
+    antecedent_resolved_by: list[str] = []
+    # --- 표본 합의 계측 -------------------------------------------------------
+    # COMPARE_SAMPLES를 3으로 두는 근거는 "같은 셀이 실행마다 다른 판정을 낸다"입니다. 그런데
+    # 종전에는 그 불안정성을 **실행 뒤에 확인할 방법이 없었습니다.** compare._merge_votes가
+    # sample_agreement를 만들기는 했지만 `vote is winner` 항등 비교라 언제나 "1/3"이었고,
+    # _build_matches가 그 키를 읽지도 않아 계산 즉시 버려졌습니다. 3배 비용을 내면서 그 효과를
+    # 관측할 수 없는 상태였습니다. 아래 세 값은 judgment.json까지 실려, 표본 수를 몇으로 둘지와
+    # 조기 종료가 실제로 얼마나 먹을지를 데이터로 답할 수 있게 합니다.
+    sample_count: int = 0                     # 이 셀을 합친 표본 수(0=합의 경로를 타지 않음)
+    sample_agreement: float = 0.0             # 전 표본이 같은 disclosed를 낸 한정의 비율(0~1)
+    # 앞선 두 표본이 **모든** 한정에서 일치한 셀. 그때는 세 번째 표본이 다수결을 바꿀 수 없어
+    # (2표가 이미 과반) 조기 종료 후보가 됩니다. 다만 세 번째 표본은 대표 발췌·근거 묶음을
+    # 바꿀 수 있으므로 이 값이 참이라고 결과가 동일하다는 뜻은 아닙니다 — 절감 상한일 뿐입니다.
+    sample_early_exit: bool = False
     # 판정을 **받지 못한** 셀. "대응 없음"(받아본 결과 대응이 없었다)과 반드시 구분합니다.
     # 이 값이 차 있으면 그 청구항은 법적 결론을 만들지 않습니다.
     error: str = ""
@@ -192,6 +222,11 @@ class SupplementCandidate(BaseModel):
     eligible: bool = False                    # 보완 근거로 쓸 자격이 있는지
     rejected_reason: str = ""                 # 자격 미달 사유
     adopted: bool = False                     # 최종 결합에서 이 구성의 근거로 채택되었는지
+    # 표본 합의 계측치(ElementMatch에서 그대로 옮김). 이 행은 (구성 × 문헌) 전수를 담으므로
+    # 셀 단위 일치율을 감사 데이터에서 집계할 수 있는 유일한 자리입니다.
+    sample_count: int = 0
+    sample_agreement: float = 0.0
+    sample_early_exit: bool = False
 
 
 class ElementCoverage(BaseModel):
@@ -323,6 +358,11 @@ class ClaimResult(BaseModel):
     emoji: str = ""
     narrative: str = ""                       # 결정론적으로 조립한 구성대비 서술 한 문장
     difference: str | None = None
+    # 채택된 셀에 실제로 남은 누락 한정. difference는 이것을 문장으로 옮긴 것이므로, 둘이
+    # 어긋나면 보고서가 스스로를 반박합니다(report.report_invariants가 이 값으로 확인합니다).
+    # 실측에서 "1/5 개시"인데 차이점 줄에는 지시 관계 사유만 있고 빠진 네 한정이 한 줄도
+    # 없던 보고서가 나갔습니다.
+    missing_limitations: list[str] = []
     combination: bool = False                 # 두 건 이상의 인용발명을 결합해 대응시켰는지
     evidence: list[Evidence] = []
     status: str = ""

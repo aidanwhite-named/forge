@@ -68,6 +68,7 @@ def test_a_single_column_page_is_left_alone(tmp_path):
 
 @pytest.mark.parametrize("header, expected", [
     ("US 2019 / 0236835 A1 EXTENDED REALITY VIRTUAL ASSISTANT", "US 2019/0236835 A1"),
+    ("US 2010/01 78024 A1 DYNAMIC REAL-TIME PLAYBACK", "US 2010/0178024 A1"),
     ("US 11,456,887 VIRTUAL MEETING FACILITATOR", "US 11,456,887"),
 ])
 def test_document_numbers_survive_the_spacing_the_extractor_adds(header, expected):
@@ -80,6 +81,13 @@ def test_a_chinese_publication_number_and_dates_are_extracted():
     text = "CN 119359955 A 申请公布日 2025.01.24 申请日 2024年09月18日"
     assert extract_document_number(text) == "CN 119359955 A"
     assert extract_dates(text, "patent") == ("2025-01-24", "2024-09-18")
+
+
+def test_a_google_patents_chinese_publication_wins_over_its_later_application_number():
+    from app.pdf import extract_document_number
+    text = ("CN1874517A - Control method for decoding MPEG2 video. "
+            "Application CN 200610042993 events. Publication of CN1874517A")
+    assert extract_document_number(text) == "CN 1874517 A"
 
 
 def test_labeled_korean_publication_number_wins_over_pct_us_number():

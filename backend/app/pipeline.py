@@ -14,24 +14,29 @@ LLM은 구성대비와 좁은 근거 의미검증만 답하고, 인용발명 조
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from . import agy, cache
+from . import agy, cache, eligibility
 from .agy import AnalysisCancelled
 from .chain import build_chain, matrix_for
 from .claims import ancestry, assign_importance, input_quality_warnings, parse_claims
 from .compare import (DEPENDENT_DOCUMENT_BUDGET_CHARS, DOCUMENT_BUDGET_CHARS,
-                      compare_claims_documents, compare_document, parent_context)
-from .config import COMPARE_MAX_WORKERS, load_runtime_settings
-from .consistency import enforce_antecedents
+                      batch_budget as compare_batch_budget,
+                      compare_claims_documents, compare_document, compare_document_claims,
+                      parent_context)
+from .config import (COMPARE_CLAIM_BATCH, COMPARE_MAX_WORKERS, COMPARE_SAMPLES,
+                     load_runtime_settings)
+from .consistency import cross_document_notes, enforce_antecedents
 from .entailment import validate_entailment
 from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
-from .report import build_claim_report, build_mappings, refresh_mappings
+from .report import (build_claim_report, build_mappings, refresh_mappings,
+                     report_invariants)
 from .verify import verify_matches
 
 
 def analyze(job_id: str, claims_text: str, documents: list[Document],
             analysis_prompt: str = "", progress=None,
             decomposition: dict | None = None,
-            cache_keys: set[str] | None = None) -> AnalysisResult:
+            cache_keys: set[str] | None = None,
+            priority_date: str = "") -> AnalysisResult:
     """cache_keys를 주면 이 분석이 사용한 판정 캐시 키를 담아 돌려줍니다.
 
     캐시 항목에는 문헌 원문 발췌가 들어 있어서, 분석을 지울 때 그 항목도 함께 지워야
@@ -41,9 +46,9 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     if not claims:
         raise RuntimeError("청구항을 인식하지 못했습니다.")
     guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or ""
-    validation = list(assign_importance(claims, decomposition))
+    validation = list(assign_importance(claims, decomposition, claims_text))
     validation += input_quality_warnings(claims)
-    validation += _date_eligibility_warnings(documents)
+    validation += _date_eligibility_warnings(documents, priority_date)
     by_id = {document.id: document for document in documents}
 
     matches, cached_claims, compare_warnings = _compare_all(claims, documents, guideline,
@@ -56,6 +61,10 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     # 인과관계를 실제로 뒷받침하는지는 좁은 독립 검증으로 다시 확인합니다. 청구항을 함께 넘겨
     # 앞 구성에서 물려받은 지시 대상을 이 구성의 요구사항으로 세지 않게 합니다.
     verify_notes += validate_entailment(matches, by_id, cache_keys, claims)
+    # 의미검증은 문헌별로 따로 호출되므로 서로의 판단을 보지 못합니다. 같은 한정이
+    # 문헌 간에 갈린 곳을 찾아 남깁니다(되돌리지는 않습니다).
+    verify_notes += cross_document_notes(
+        matches, {document.id: document.filename for document in documents})
 
     chains: dict[int, ChainInfo] = {}
     for claim in _processing_order(claims):
@@ -77,6 +86,8 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     for document in documents:
         if document.ocr_required:
             validation.append(f"{document.filename}에서 텍스트를 거의 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+    # 본문과 결론이 같은 자료를 보고 있는지 조립 직후에 맞춰 봅니다.
+    verify_notes += report_invariants(reports)
 
     return AnalysisResult(
         job_id=job_id, claim_mapping=mappings, reports=reports,
@@ -106,7 +117,11 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
         raise RuntimeError("추가할 종속항을 인식하지 못했습니다.")
     guideline = (analysis_prompt or "").strip() or load_runtime_settings().get("prompt") or ""
     validation = list(existing.validation)
-    validation += assign_importance(new_claims, decomposition)
+    validation += assign_importance(
+        new_claims, decomposition,
+        # 분해 캐시 키는 **이번에 분해하는 항의 원문**이어야 합니다. 전체 청구항
+        # 원문을 넣으면 종속항을 하나 더할 때마다 키가 달라져 캐시가 늘 미스입니다.
+        "\n".join(claim.raw for claim in new_claims))
     validation += input_quality_warnings(new_claims)
 
     matches: list[ElementMatch] = []
@@ -182,14 +197,27 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
     cells: dict[tuple[int, str], list[ElementMatch]] = {}
     cached_claims: set[int] = set()
     tasks: list[tuple[Claim, Document]] = []
+    groups = _claim_groups(claims)
+    # 묶음은 캐시를 보기 **전에** 확정합니다. 그래야 조회 시점에 적는 cohort와 나중에 실제로
+    # 나가는 프롬프트가 같아집니다.
+    cohorts = {claim.number: [item.number for item in group]
+               for group in groups for claim in group if len(group) > 1}
     for claim in claims:
         claim_cached = bool(documents)
         parents = parent_context(claim, all_claims)
         for document in documents:
-            key = cache.cache_key(claim, document, guideline, DOCUMENT_BUDGET_CHARS, parents)
+            # 문헌 축 일괄 판정과 단건 판정은 프롬프트가 다르므로 키가 갈립니다. 더 좁게 물어본
+            # 단건 쪽을 먼저 찾고, 없으면 일괄 판정을 씁니다.
+            keys = [cache.cache_key(claim, document, guideline, DOCUMENT_BUDGET_CHARS, parents,
+                                    mode="single", samples=COMPARE_SAMPLES)]
+            if claim.number in cohorts:
+                keys.append(cache.cache_key(claim, document, guideline, DOCUMENT_BUDGET_CHARS,
+                                            parents, mode="document-batch",
+                                            samples=COMPARE_SAMPLES,
+                                            cohort=cohorts[claim.number]))
             if cache_keys is not None:
-                cache_keys.add(key)
-            cell = cache.load(key)
+                cache_keys.update(keys)
+            cell = next((found for key in keys if (found := cache.load(key)) is not None), None)
             if cell is None:
                 claim_cached = False
                 tasks.append((claim, document))
@@ -199,11 +227,86 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
             cached_claims.add(claim.number)
     if progress and cells:
         progress(f"판정 캐시에서 {len(cells)}셀 재사용")
-    warnings = _compare_cells(tasks, guideline, progress, cells, all_claims=all_claims)
+    tasks, warnings = _compare_by_document(tasks, guideline, progress, cells, cache_keys,
+                                           all_claims, groups)
+    warnings += _compare_cells(tasks, guideline, progress, cells, all_claims=all_claims)
     # 완료 순서가 아니라 (청구항, 문헌) 순서로 펼칩니다. 동시에 돌려도 매트릭스는 같습니다.
     matches = [match for claim in claims for document in documents
                for match in cells.get((claim.number, document.id), [])]
     return matches, cached_claims, warnings
+
+
+def _claim_groups(claims: list[Claim]) -> list[list[Claim]]:
+    """청구항을 **고정 규칙**으로 묶습니다. 캐시 상태를 보지 않습니다.
+
+    종전 구현은 '이번에 판정이 없는 청구항'만 모아 묶었습니다. 그러면 같은 분석을 두 번
+    돌릴 때 캐시가 얼마나 남아 있느냐에 따라 묶음이 달라지고, 묶음이 달라지면 프롬프트가
+    달라집니다(형제 청구항이 컨텍스트에 실립니다). 판정이 실행마다 흔들릴 뿐 아니라, 키에
+    적은 cohort와 실제 프롬프트가 어긋나 서로 다른 프롬프트의 판정이 한 키를 공유합니다.
+    """
+    if COMPARE_CLAIM_BATCH <= 1:
+        return [[claim] for claim in claims]
+    return [claims[index:index + COMPARE_CLAIM_BATCH]
+            for index in range(0, len(claims), COMPARE_CLAIM_BATCH)]
+
+
+def _compare_by_document(tasks: list[tuple[Claim, Document]], guideline: str, progress,
+                         cells: dict[tuple[int, str], list[ElementMatch]],
+                         cache_keys: set[str] | None,
+                         all_claims: list[Claim] | None,
+                         groups: list[list[Claim]]
+                         ) -> tuple[list[tuple[Claim, Document]], list[str]]:
+    """미판정 셀을 **문헌 축**으로 묶어 호출 수와 문헌 반복 전송을 줄입니다.
+
+    같은 문헌이 여러 청구항의 프롬프트에 반복해 실리는 것이 이 파이프라인 토큰 비용의
+    대부분입니다. 문헌 하나에 여러 청구항을 함께 실으면 그 반복이 청구항 수만큼 줄어듭니다.
+
+    확보하지 못한 셀은 그대로 돌려주어 호출부가 단건으로 메웁니다. 일괄 응답에서 셀 하나가
+    빠졌다고 전부를 버리지 않는 것은 종속항 경로에서 이미 검증된 규율입니다.
+
+    COMPARE_CLAIM_BATCH가 1이면 이 경로는 아무것도 하지 않고 전 작업을 그대로 돌려줍니다.
+    """
+    if COMPARE_CLAIM_BATCH <= 1 or not tasks:
+        return tasks, []
+    missing = {(claim.number, document.id) for claim, document in tasks}
+    documents = {document.id: document for _, document in tasks}
+
+    warnings: list[str] = []
+    resolved: set[tuple[int, str]] = set()
+    for group in groups:
+        if len(group) < 2:
+            # 청구항 하나짜리 묶음은 단건 호출과 같은 비용인데 프롬프트만 다릅니다.
+            continue
+        cohort = [claim.number for claim in group]
+        for document in documents.values():
+            # 묶음 안에 아직 판정이 없는 셀이 하나라도 있으면 **묶음 전체**를 한 번에 묻습니다.
+            # 이미 받아 둔 셀만 빼고 물으면 프롬프트가 캐시 상태를 따라 달라집니다.
+            if not any((number, document.id) in missing for number in cohort):
+                continue
+            if progress:
+                progress(f"{document.filename} × 청구항 "
+                         f"{', '.join(str(number) for number in cohort)} 일괄 구성대비")
+            found, call_warnings = compare_document_claims(
+                group, document, guideline, DOCUMENT_BUDGET_CHARS, all_claims)
+            warnings += call_warnings
+            for claim in group:
+                cell = found.get(claim.number)
+                if not cell or (claim.number, document.id) not in missing:
+                    continue
+                cells[(claim.number, document.id)] = cell
+                key = cache.cache_key(claim, document, guideline, DOCUMENT_BUDGET_CHARS,
+                                      parent_context(claim, all_claims),
+                                      mode="document-batch", samples=COMPARE_SAMPLES,
+                                      cohort=cohort)
+                if cache_keys is not None:
+                    cache_keys.add(key)
+                cache.store(key, cell)
+                resolved.add((claim.number, document.id))
+    leftover = [(claim, document) for claim, document in tasks
+                if (claim.number, document.id) not in resolved]
+    if progress and leftover:
+        progress(f"일괄 구성대비에서 확보하지 못한 {len(leftover)}셀을 단건으로 대비합니다")
+    return leftover, warnings
 
 
 def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress,
@@ -239,9 +342,12 @@ def _compare_cells(tasks: list[tuple[Claim, Document]], guideline: str, progress
             agy.bind_job(job_id)
         cell, cell_warnings = compare_document(claim, document, guideline, budget, all_claims)
         if not cell_warnings:
+            # 이 경로는 항상 단건 프롬프트 + COMPARE_SAMPLES 표본입니다. 일괄 경로가 쓰는
+            # 키와 섞이지 않도록 mode를 함께 적습니다.
             cache.store(cache.cache_key(claim, document, guideline,
                                         budget or DOCUMENT_BUDGET_CHARS,
-                                        parent_context(claim, all_claims)), cell)
+                                        parent_context(claim, all_claims),
+                                        mode="single", samples=COMPARE_SAMPLES), cell)
         with lock:
             results[(claim.number, document.id)] = cell
             warnings_by_cell[(claim.number, document.id)] = cell_warnings
@@ -284,16 +390,33 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
     이 경로의 셀은 종속항 문맥 예산으로 판정되므로 캐시 키에도 그 값을 넣습니다. 최초 분석
     경로(문헌 전문에 가까운 예산)와 키를 공유하면, 좁은 문맥에서 나온 판정이 넓은 문맥으로
     다시 볼 실행에서 그대로 재사용됩니다.
+
+    캐시는 **두 종류를 따로** 조회합니다. 같은 셀이라도 일괄 프롬프트가 낸 1표본 판정과
+    단건 프롬프트가 낸 다표본 합의는 다른 산출물이라 한 키를 공유할 수 없습니다
+    (cache.cache_key의 mode). 더 강한 단건 판정을 먼저 찾고, 없을 때만 일괄 판정을 씁니다.
     """
     cached_claims: set[int] = set()
-    misses_by_claim: dict[int, list[Document]] = {}
     claims_by_number = {claim.number: claim for claim in claims}
     parents_by_claim = {claim.number: parent_context(claim, all_claims) for claim in claims}
+
+    def single_key(claim: Claim, document: Document) -> str:
+        return cache.cache_key(claim, document, guideline, DEPENDENT_DOCUMENT_BUDGET_CHARS,
+                               parents_by_claim[claim.number], mode="single",
+                               samples=COMPARE_SAMPLES)
+
+    def batch_key(claim: Claim, document: Document, budget: int, cohort: list) -> str:
+        # 일괄 호출은 CLI를 1회만 부릅니다(compare_claims_documents). 예산도 문헌 수로 나눈
+        # 실제 값을 적고, 그 프롬프트에 함께 실린 청구항·문헌을 cohort로 남깁니다 — 같은 셀이라도
+        # 누구와 묶였는지가 다르면 다른 프롬프트입니다.
+        return cache.cache_key(claim, document, guideline, budget,
+                               parents_by_claim[claim.number], mode="batch", samples=1,
+                               cohort=cohort)
+
+    misses_by_claim: dict[int, list[Document]] = {}
     for claim in claims:
         claim_cached = bool(documents)
         for document in documents:
-            key = cache.cache_key(claim, document, guideline, DEPENDENT_DOCUMENT_BUDGET_CHARS,
-                                  parents_by_claim[claim.number])
+            key = single_key(claim, document)
             if cache_keys is not None:
                 cache_keys.add(key)
             cell = cache.load(key)
@@ -310,6 +433,31 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
     missing_documents = [document for document in documents if document.id in missing_ids]
     if not missing_claims or not missing_documents:
         return cached_claims, []
+
+    # 일괄 예산과 cohort는 이번 호출에 실제로 실리는 청구항·문헌으로 정해지므로, 미판정 셀을
+    # 확정한 뒤에야 키를 만들 수 있습니다.
+    budget = compare_batch_budget(len(missing_documents))
+    cohort = _batch_cohort(missing_claims, missing_documents)
+    remaining: dict[int, list[Document]] = {}
+    for claim_number, missing_documents_for_claim in misses_by_claim.items():
+        claim = claims_by_number[claim_number]
+        for document in missing_documents_for_claim:
+            key = batch_key(claim, document, budget, cohort)
+            if cache_keys is not None:
+                cache_keys.add(key)
+            cell = cache.load(key)
+            if cell is None:
+                remaining.setdefault(claim_number, []).append(document)
+            else:
+                matches += cell
+    misses_by_claim = remaining
+    if not misses_by_claim:
+        return cached_claims, []
+    missing_claims = [claim for claim in claims if claim.number in misses_by_claim]
+    missing_ids = {item.id for values in misses_by_claim.values() for item in values}
+    missing_documents = [document for document in documents if document.id in missing_ids]
+    budget = compare_batch_budget(len(missing_documents))
+    cohort = _batch_cohort(missing_claims, missing_documents)
 
     total = sum(len(values) for values in misses_by_claim.values())
     if progress:
@@ -329,9 +477,7 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
             cell = batch_cells.get((claim_number, document.id))
             if cell:
                 matches += cell
-                cache.store(cache.cache_key(claim, document, guideline,
-                                            DEPENDENT_DOCUMENT_BUDGET_CHARS,
-                                            parents_by_claim[claim_number]), cell)
+                cache.store(batch_key(claim, document, budget, cohort), cell)
             else:
                 still_missing.setdefault(claim_number, []).append(document)
 
@@ -353,19 +499,26 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
     return cached_claims, warnings
 
 
+def _batch_cohort(claims: list[Claim], documents: list[Document]) -> list[str]:
+    """한 일괄 프롬프트에 함께 실리는 청구항·문헌. 캐시 키에 적어 묶음이 다른 판정을 가릅니다."""
+    return ([f"claim:{claim.number}" for claim in claims]
+            + [f"doc:{document.id}" for document in documents])
+
+
 def _processing_order(claims: list[Claim]) -> list[Claim]:
     """독립항을 먼저, 종속항은 부모항이 확정된 뒤에 처리합니다."""
     return sorted(claims, key=lambda claim: (len(ancestry(claims, claim.number)), claim.number))
 
 
-def _date_eligibility_warnings(documents: list[Document]) -> list[str]:
-    dated = [f"{document.filename}={document.publication_date or document.filing_date}"
-             for document in documents if document.publication_date or document.filing_date]
-    detail = f" 확인된 공개·제출일: {', '.join(dated)}." if dated else ""
-    return [
-        "이 보고서는 기술적 구성대비를 수행합니다. 선행기술 적격성과 적용 조문을 확정하려면 "
-        f"대상 청구항의 우선일과 적용 법역을 별도로 확인해야 합니다.{detail}"
-    ]
+def _date_eligibility_warnings(documents: list[Document], priority_date: str = "") -> list[str]:
+    """날짜만으로 가를 수 있는 것을 갈라 보고서에 남깁니다(eligibility.py).
+
+    종전에는 추출한 날짜를 한 줄로 **나열만** 했습니다. 그러면 후공개 선출원과 통상
+    선행기술이 같은 칸에 들어가고, 대상 우선일 이후에 나온 문헌도 주 인용발명으로 뽑혀
+    나갔습니다. 여기서도 자동으로 탈락시키지는 않습니다 — 적격성은 적용 법역과 신규성·
+    진보성 구분까지 봐야 정해지고, 날짜 추출이 실패하는 경우도 흔하기 때문입니다.
+    """
+    return eligibility.warnings(documents, priority_date)
 
 
 def uncovered_elements(result: AnalysisResult, claims_text: str) -> list[dict]:

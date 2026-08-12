@@ -51,6 +51,18 @@ const PRIOR_ART_VERIFY: Record<string, [string, string]> = {
   unchecked: ['unchecked', '❔ 미확인'],
 };
 
+// 등급 이모지 → 배지 색 톤. 구성 라벨 (A)~(Z) 동그라미를 등급 이모지와 같은 색으로 칠해,
+// 이모지를 따로 읽지 않아도 구성 목록을 훑는 것만으로 등급이 보이게 합니다.
+// 색은 backend/app/coverage.py의 REPORT_GRADES가 붙이는 이모지를 그대로 따릅니다.
+const GRADE_TONE: Record<string, string> = {
+  '🔵': 'tone-identical',    // 동일
+  '🟢': 'tone-substantial',  // 실질적 동일
+  '🟠': 'tone-variation',    // 기술 사상 동일, 세부 구현 방식의 단순 변경
+  '🟡': 'tone-partial',      // 핵심 기능 유사하나 목적/효과에 일부 차이
+  '⚪': 'tone-none',         // 대응 안됨
+  '⚠️': 'tone-unjudged',     // 판정 불가
+};
+
 const formatLogDate = (value?: string) => {
   if (!value) return '수정 시각 없음';
   const date = new Date(value);
@@ -60,6 +72,9 @@ const formatLogDate = (value?: string) => {
 function App() {
   const [tab, setTab] = useState<Tab>('analysis');
   const [claims, setClaims] = useState('');
+  // 대상 청구항의 출원일·우선일. 비워 두면 백엔드가 선행기술 적격성 분류를 보류하고
+  // 구성대비만 수행합니다(eligibility.py). 추정해서 채우지 않습니다.
+  const [priorityDate, setPriorityDate] = useState('');
   const [dependentClaims, setDependentClaims] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [result, setResult] = useState<Result | null>(null);
@@ -189,11 +204,17 @@ function App() {
       });
       const response = await fetch(API + '/settings/models?' + query);
       const data = await response.json();
-      setModels(response.ok && Array.isArray(data.models) ? data.models : []);
+      const nextModels = response.ok && Array.isArray(data.models) ? data.models : [];
+      setModels(nextModels);
+      if (nextModels.length && !nextModels.includes(next.model)) {
+        setSettings(current => current.provider === next.provider
+          ? {...current, model: nextModels[0]}
+          : current);
+      }
       if (refresh) {
-        setMessage(data.models?.length
-          ? `모델 ${data.models.length}개를 불러왔습니다.`
-          : '모델 목록을 불러오지 못했습니다. 모델명을 직접 입력하세요.');
+        setMessage(nextModels.length
+          ? `모델 ${nextModels.length}개를 불러왔습니다.`
+          : '모델 목록을 불러오지 못했습니다. 현재 설정된 모델을 유지합니다.');
       }
     } catch {
       setModels([]);
@@ -220,15 +241,6 @@ function App() {
   async function resetPrompt() {
     await saveSettings({...settings, prompt: ''});
     setMessage('분석 지침 프롬프트를 기본값으로 되돌렸습니다.');
-  }
-
-  async function clearCache() {
-    if (!confirm('저장된 판정 캐시를 모두 지울까요? 다음 분석은 전부 다시 판정합니다.')) return;
-    const response = await fetch(API + '/cache', {method: 'DELETE'});
-    const data = await response.json();
-    setMessage(response.ok
-      ? `판정 캐시 ${data.removed}건을 지웠습니다.`
-      : '판정 캐시를 지우지 못했습니다.');
   }
 
   async function testSettings() {
@@ -268,6 +280,7 @@ function App() {
       const form = new FormData();
       form.append('claims', claims);
       form.append('analysis_prompt', settings.prompt || '');
+      form.append('priority_date', priorityDate.trim());
       files.forEach(file => form.append('pdf_files', file));
       uploadController.current = new AbortController();
       const startResponse = await fetch(`${API}/jobs/${prepared.job_id}/start`, {
@@ -593,6 +606,21 @@ function App() {
                 onChange={event => setClaims(event.target.value)}
                 placeholder="(A), (B), (C)로 구성요소를 구분해 입력하세요."
               />
+              <div className="field-row">
+                <label htmlFor="priority-date">대상 출원일·우선일</label>
+                <input
+                  id="priority-date"
+                  type="date"
+                  value={priorityDate}
+                  disabled={generating}
+                  onChange={event => setPriorityDate(event.target.value)}
+                />
+                <small>
+                  선택 입력. 넣으면 각 인용발명을 통상 선행기술·후공개 선출원·후행 문헌·날짜
+                  불명으로 갈라 보고서에 표시합니다. 비워 두면 적격성을 가리지 않고 구성대비만
+                  수행합니다.
+                </small>
+              </div>
             </div>
 
             <div className="card upload-card">
@@ -732,14 +760,18 @@ function App() {
                     {report.claims.map((claim: any, index: number) => (
                       <article key={claim.label || index} className="card claim">
                         <div className="claim-head">
-                          <span className="badge">{claim.is_preamble ? '전제부'
-                            : (claim.label || String.fromCharCode(65 + index))}</span>
+                          <span className={`badge ${GRADE_TONE[claim.emoji] || 'tone-none'}`}
+                                title={claim.grade || claim.status || ''}>
+                            {claim.is_preamble ? '전제부'
+                              : (claim.label || String.fromCharCode(65 + index))}</span>
                           {/* 백분율 대신 셀 수 있는 값을 보여 준다. 분자·분모가 그대로 보여야
                               아래 근거와 대조해 검증할 수 있다. */}
                           <strong>{claim.total_limitations
                             ? `한정 ${claim.disclosed_limitations}/${claim.total_limitations}`
                             : '—'}</strong>
-                          <span className="quality">{claim.emoji} {claim.grade || claim.status}</span>
+                          {/* 등급 색은 왼쪽 라벨 배지가 지고 있으므로 이모지는 붙이지 않습니다.
+                              같은 정보를 색과 이모지로 두 번 말하면 읽는 눈만 늘어납니다. */}
+                          <span className="quality">{claim.grade || claim.status}</span>
                           {claim.evidence_locations > 0 && (
                             <span className="reference-chip">근거 {claim.evidence_locations}곳</span>
                           )}
@@ -855,30 +887,22 @@ function App() {
             </label>
             <label>모델
               <select
-                value={models.includes(settings.model) ? settings.model : '__custom__'}
-                onChange={event => setSettings({...settings, model: event.target.value === '__custom__' ? '' : event.target.value})}
+                value={settings.model}
+                onChange={event => setSettings({...settings, model: event.target.value})}
               >
+                {!models.includes(settings.model) && settings.model && (
+                  <option value={settings.model}>{settings.model}</option>
+                )}
                 {models.map(model => <option key={model} value={model}>{model}</option>)}
-                <option value="__custom__">직접 입력</option>
               </select>
               <button className="ghost" onClick={() => loadModels(settings, true)}>새로고침</button>
             </label>
-            {!models.includes(settings.model) && (
-              <label>모델명
-                <input value={settings.model} onChange={event => setSettings({...settings, model: event.target.value})} />
-              </label>
-            )}
             <label>분석 지침
               <textarea className="prompt-input" value={settings.prompt} onChange={event => setSettings({...settings, prompt: event.target.value})} />
             </label>
             <div className="action">
-              <span className="hint">
-                판정 캐시에는 업로드한 문헌의 원문 발췌가 남습니다. 저장물을 완전히 비우려면
-                여기서 지우세요.
-              </span>
               <button onClick={testSettings}>연결 테스트</button>
               <button onClick={resetPrompt}>기본값</button>
-              <button className="danger" onClick={clearCache}>판정 캐시 비우기</button>
               <button className="primary" onClick={() => saveSettings()}>저장</button>
             </div>
             {message && <div className="notice">{message}</div>}

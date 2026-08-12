@@ -4,9 +4,13 @@
 글자 수나 특정 어휘로 구성의 성격을 추정하는 휴리스틱은 두지 않습니다.
 그런 판정은 사건마다 달라져 코드로 고정하면 설명할 수 없는 결과가 나옵니다.
 """
+import json
 import re
+from pathlib import Path
 
+from . import cache
 from .agy import run_cli
+from .config import DECOMPOSITION_FILE, FORCE_REDECOMPOSE
 from .models import Claim, ClaimElement, Limitation
 
 _CLAIM_HEADER = re.compile(
@@ -45,6 +49,12 @@ limitations에는 해당 구성에서 독립적으로 입증해야 하는 구조
 - qualifier: 그 동작을 한정하는 기준·조건·파라미터·수치·명칭(무엇을 기준으로, 얼마 이상일 때,
   어떤 이름의 처리부가).
 
+**core 하나에 독립적으로 확인할 수 있는 두 동작을 합치지 마십시오.** "A를 획득하고 B를 획득함"
+처럼 문헌에서 각각 따로 확인할 수 있는 동작은 core 두 개로 나눕니다. 합쳐 두면 한쪽만 개시한
+문헌이 그 구성 전체를 미개시로 받아, 절반을 실제로 개시한 문헌과 아무것도 개시하지 않은 문헌이
+같은 판정이 됩니다. 반대로 한 동작을 조건·시점·목적별로 쪼개 여러 core로 만들지도 마십시오 —
+그것은 qualifier입니다.
+
 **core 항목에 qualifier 문구를 섞어 쓰지 마십시오.** 예를 들어 "수요 지표가 임계값 미만이면
 콘텐츠를 외부 저장소로 이전한다"는 구성은 core "콘텐츠를 내부 저장소에서 외부 저장소로
 이전하여 보관함"과 qualifier "이전 여부를 수요 지표와 임계값의 비교로 결정함"으로 나눕니다.
@@ -52,12 +62,27 @@ limitations에는 해당 구성에서 독립적으로 입증해야 하는 구조
 "~에 따라", "~을 이용하여", "~와 결합하여", "동적으로" 같은 조건은 생략하지 말고 qualifier로
 적으십시오.
 
-**반대 방향의 잘못이 더 위험합니다.** 그 구성의 변별점 자체가 조건에 있다면 그것은
-qualifier가 아니라 core입니다. 분류한 뒤 core 항목만 이어 읽어 보십시오. 그 분야의 어떤
-장치·방법이든 만족하는 문장이 된다면 분류가 잘못된 것이며, 변별점을 담은 항목을 core로
-옮겨야 합니다. 예를 들어 "조회수·체류 시간·완주율 중 적어도 하나를 포함하는 지표를
-산출함"에서 지표의 종류를 qualifier로 빼면 core가 "지표를 산출함"만 남아, 아무 통계나
-기록하는 문헌이 전부 대응하게 됩니다. 이때는 지표의 종류까지 core입니다.
+**같은 조건을 core와 qualifier에 중복해서 적지 마십시오.** 특히 시간·시점·트리거·판단 기준을
+나타내는 "~하는 도중", "~에 근거하여", "~에 따라", "업데이트된 ~을 기준으로"는 core에서
+제외하고 qualifier에 한 번만 적으십시오. 예를 들어 "편집 중 처리시간 정보를 업데이트함"은
+core "처리시간 정보를 업데이트함"과 qualifier "업데이트 시점을 편집 수행 중으로 한정함"으로,
+"업데이트된 처리시간에 근거하여 버퍼 개수를 조정함"은 core "버퍼 개수를 조정함"과 qualifier
+"조정 기준을 업데이트된 처리시간으로 한정함"으로 나눕니다. core에 조건을 포함한 문장 전체를
+적고 qualifier에 같은 조건을 다시 적으면, 조건 하나의 미개시가 동작과 조건 두 항목을 동시에
+실패시켜 실제보다 낮은 판정이 됩니다.
+
+core에는 기본 동작과 그 동작의 필수 대상·입력·출력의 **정체성**을 남기십시오. 반면 그 동작을
+언제·무엇을 기준으로·어떤 용도로 수행하는지는 발명의 변별점이어도 qualifier입니다. qualifier가
+빠지면 "일부 차이" 이하로 내려가므로 변별력이 사라지는 것이 아닙니다. 예를 들어
+"조회수·체류 시간·완주율 중 적어도 하나를 포함하는 지표를 산출함"에서는 산출 대상인 지표의
+종류가 동작의 정체성이므로 core 대안으로 남기지만, "처리시간 정보에 근거하여 편집용 버퍼
+개수를 결정함"에서는 core "버퍼 개수를 결정함", qualifier "결정 기준을 처리시간 정보로
+한정함", qualifier "결정된 버퍼의 용도를 편집용으로 한정함"으로 나눕니다.
+
+여러 대안에 공통인 문구는 각 대안에 되풀이하지 마십시오. "디코딩·비디오·인코딩·디스플레이·
+전송 처리시간 중 적어도 하나에 근거하여 편집용 버퍼 개수를 결정함"은 처리시간 종류만 대안
+묶음으로 만들고, "이에 근거함"과 "편집용"은 각각 공통 qualifier 한 항목으로 한 번만 둡니다.
+공통 목적 하나가 없다는 이유로 대안 다섯 개가 동시에 실패하면 같은 차이를 중복 계상한 것입니다.
 
 **선택적 한정은 alternative_group으로 묶으십시오.** "A, B 또는 C 중 적어도 하나", "~중 어느
 하나", "또는"으로 열거된 항목은 서로 대안이므로 **하나만 개시되면 그 묶음 전체가 충족**됩니다.
@@ -210,11 +235,29 @@ def ancestry(claims: list[Claim], number: int) -> list[int]:
     return chain
 
 
-# 저장된 분해 결과의 형식 버전. 필드 구성을 바꾸면 올려서 과거 기록을 무시합니다.
-DECOMPOSITION_VERSION = 1
+# 저장된 분해 결과의 형식 버전. 필드 구성뿐 아니라 원자 한정 분해 규칙이 바뀌어도 올립니다.
+# v4: core 하나에 독립적으로 확인 가능한 두 동작을 합치지 않도록 원자성을 요구합니다. 같은
+#     청구항이 실행마다 다르게 분해되어(입력 획득 + 출력 획득 → core 1개로 병합) 판정과
+#     문헌 선정까지 흔들린 사례가 있었습니다.
+# v3: 공통 목적·용도 문구를 선택지마다 반복하지 않고, 동작·기준·용도·대안을 분리합니다.
+# v2: 시점·트리거·판단 기준을 core에 섞고 qualifier에 다시 적던 중복 분해를 금지합니다.
+#     같은 조건 하나가 빠졌다는 이유로 핵심 동작까지 함께 미개시가 되는 판정을 바로잡습니다.
+DECOMPOSITION_VERSION = 4
 
 
-def assign_importance(claims: list[Claim], decomposition: dict | None = None) -> list[str]:
+def _pinned_decomposition() -> dict | None:
+    """FORGE_DECOMPOSITION_FILE로 고정한 분해. 없거나 읽을 수 없으면 None입니다."""
+    if not DECOMPOSITION_FILE:
+        return None
+    try:
+        value = json.loads(Path(DECOMPOSITION_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) and value.get("claims") else None
+
+
+def assign_importance(claims: list[Claim], decomposition: dict | None = None,
+                      claims_text: str = "") -> list[str]:
     """구성요소 중요도·하위 한정·검색어를 받습니다. 실패해도 기본값 3으로 진행합니다.
 
     decomposition은 이 분해 결과를 읽고 쓰는 저장소입니다. 이미 분해된 청구항은 그대로
@@ -226,9 +269,34 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None) ->
     무효가 됩니다. 그러면 취소 후 재시도가 처음부터 다시 돌고, "같은 입력이면 같은 결과"도
     성립하지 않습니다. 분해를 고정해야 캐시가 실제로 동작합니다.
     """
-    restored = {claim.number for claim in claims if _restore_elements(claim, decomposition)}
+    notes: list[str] = []
+    # 우선순위: 고정 파일 > 이 작업이 이미 쓰던 분해 > 입력 해시 캐시 > LLM.
+    # 고정 파일이 가장 앞인 이유는 그것이 실험 통제 장치이기 때문입니다 — 켜 두었으면 다른
+    # 어떤 경로도 그것을 밀어내서는 안 됩니다.
+    pinned = _pinned_decomposition()
+    restored = {claim.number for claim in claims
+                if _restore_elements(claim, pinned, strict_version=False)}
+    if restored:
+        notes.append(f"청구항 {', '.join(str(number) for number in sorted(restored))}의 구성 분해를 "
+                     f"고정 파일({DECOMPOSITION_FILE})에서 읽었습니다. 이 보고서의 분해는 자동 "
+                     "생성된 것이 아닙니다.")
+    restored |= {claim.number for claim in claims
+                 if claim.number not in restored and _restore_elements(claim, decomposition)}
+
+    shared_key = ""
+    if claims_text and not FORCE_REDECOMPOSE:
+        shared_key = cache.decomposition_key(claims_text, DECOMPOSITION_VERSION)
+        shared = cache.load_decomposition(shared_key)
+        restored |= {claim.number for claim in claims
+                     if claim.number not in restored and _restore_elements(claim, shared)}
+
     pending = [claim for claim in claims if claim.number not in restored]
     warnings = _request_importance(pending) if pending else []
+    # 분해를 받지 못한 청구항이 있으면 그 실행의 분해는 온전하지 않으므로 공유 캐시에 넣지
+    # 않습니다. 빈 분해가 고착되면 이후 모든 실행이 그것을 재사용합니다.
+    if shared_key and not warnings and claims_text:
+        cache.store_decomposition(shared_key, dump_decomposition(claims))
+    warnings = notes + warnings
     if decomposition is not None:
         # 분해를 받지 못한 청구항(기본값으로 진행)은 저장하지 않습니다. 저장하면 그 빈
         # 분해가 고정되어 다음 실행에서도 계속 재사용됩니다.
@@ -251,13 +319,20 @@ def dump_decomposition(claims: list[Claim], existing: dict | None = None) -> dic
     return {"version": DECOMPOSITION_VERSION, "claims": stored}
 
 
-def _restore_elements(claim: Claim, decomposition: dict | None) -> bool:
+def _restore_elements(claim: Claim, decomposition: dict | None,
+                      strict_version: bool = True) -> bool:
     """저장된 분해를 청구항에 되씌웁니다. 하나라도 어긋나면 아무것도 바꾸지 않습니다.
 
     구성 원문까지 대조합니다. 청구항 문언이 바뀌었는데 라벨만 보고 예전 분해를 씌우면,
     보고서에는 새 문언이 실리고 판정은 옛 한정을 기준으로 내려집니다.
+
+    strict_version=False는 **고정 분해 파일 전용**입니다. 실험은 대개 분해 버전을 올린 뒤에
+    하는데, 버전으로 막으면 정작 비교 대상인 이전 분해를 쓸 수 없습니다. 구성 원문 대조는
+    이때도 그대로 하므로 다른 청구항의 분해가 잘못 씌워지지는 않습니다.
     """
-    if not decomposition or decomposition.get("version") != DECOMPOSITION_VERSION:
+    if not decomposition:
+        return False
+    if strict_version and decomposition.get("version") != DECOMPOSITION_VERSION:
         return False
     stored = (decomposition.get("claims") or {}).get(str(claim.number))
     if not isinstance(stored, list) or len(stored) != len(claim.elements) or not claim.elements:
@@ -294,7 +369,6 @@ def _request_importance(claims: list[Claim]) -> list[str]:
     ]
     if not payload:
         return []
-    import json
     try:
         raw = run_cli(IMPORTANCE_PROMPT + json.dumps(payload, ensure_ascii=False), expect="elements")
     except RuntimeError as exc:

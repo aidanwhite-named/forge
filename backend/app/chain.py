@@ -4,12 +4,14 @@
 재실행마다 결론이 흔들려 판정 캐시도 감사 기록도 의미가 없어집니다.
 """
 from .claims import ancestry
+from .consistency import antecedents
 from .coverage import (
-    PRIMARY_CANDIDATE_MARGIN,
+    JUDGMENT_RANK, PRIMARY_CANDIDATE_RATIO,
     best_match, combined_similarity, core_direct_score, core_elements, difference_labels,
     disclosed_limitations, has_correspondence, ineligible_reason, is_better_match,
-    is_eligible_supplement, no_correspondence_labels, residual_difference, rows_for, score_document,
-    supplement_gain, supplement_needed_labels, supplement_reason, well_known_labels,
+    is_complete, is_eligible_supplement, judgment_at_rank, no_correspondence_labels,
+    residual_difference, rows_for, score_document, supplement_gain, supplement_needed_labels,
+    supplement_reason, well_known_labels,
 )
 from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
                      NoveltyScreen, SupplementCandidate)
@@ -318,8 +320,19 @@ def _residual_overflow(chain: ChainInfo, matrix: Matrix, merged: dict[str, Eleme
 def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore]) -> list[str]:
     """차별적 핵심 구성의 직접 개시량이 최고 문헌에 크게 못 미치면 후보에서 제외합니다.
 
-    다만 전체 점수가 낮아도 핵심 구성을 원문으로 직접 개시한 문헌은 남깁니다.
-    평균 점수에 희석되어 유효한 후보가 탈락하지 않게 하기 위한 예외입니다.
+    다만 전체 점수가 낮아도 **다른 후보가 갖지 못한** 핵심 구성을 원문으로 직접 개시한
+    문헌은 남깁니다. 평균 점수에 희석되어 유효한 후보가 탈락하지 않게 하기 위한 예외입니다.
+
+    두 가지가 종전 구현과 다릅니다.
+
+    1. 임계를 절대 차가 아니라 **비율**로 잡습니다(PRIMARY_CANDIDATE_RATIO). core_direct는
+       최고 문헌도 0.5 안팎이라, 0.20을 빼면 임계가 최고점의 60% 수준으로 내려앉았습니다.
+    2. 예외를 **고유 기여**로 좁힙니다. 종전에는 핵심 구성을 하나라도 직접 개시하면 무조건
+       되살렸는데, 핵심 구성 중에는 후보 대부분이 함께 개시하는 것이 있습니다. 실측 사건에서
+       핵심 구성 (C)를 4문헌 중 3문헌이 '실질적 동일·direct·검증됨'으로 개시했고, 그래서 이
+       예외가 임계와 무관하게 세 문헌을 전부 되살렸습니다. 모두가 가진 것을 가졌다는 사실은
+       주 인용발명 자격의 근거가 되지 못합니다. 이미 통과한 후보들이 **직접 개시하지 못한**
+       핵심 구성을 이 문헌이 개시할 때만 되살립니다.
     """
     core_labels = [element.label for element in core_elements(claim)]
     # 문헌 순위(score_document)와 **같은 정의**를 씁니다. 종전에는 여기만 중요도 가중이 아닌
@@ -331,17 +344,24 @@ def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore
         return []
     top = max(core_direct.values())
     if top <= 0.0:
-        # 어느 문헌도 핵심 구성을 직접 개시하지 못한 상태. 마진(0.20)만 놓고 보면 0점 문헌이
+        # 어느 문헌도 핵심 구성을 직접 개시하지 못한 상태. 비율 임계만 놓고 보면 0점 문헌이
         # 전부 자격을 얻어 무관한 문헌이 "주 인용발명"으로 보고서에 찍힙니다.
         return []
     eligible = [score.document_id for score in scores
-                if core_direct.get(score.document_id, 0.0) >= top - PRIMARY_CANDIDATE_MARGIN]
+                if core_direct.get(score.document_id, 0.0) >= top * PRIMARY_CANDIDATE_RATIO]
+
+    def directly_covered(document_id: str) -> set[str]:
+        return {label for label in core_labels
+                if _directly_disclosed(matrix.get(document_id, {}).get(label))}
+
+    covered = {label for document_id in eligible for label in directly_covered(document_id)}
     for score in scores:
         if score.document_id in eligible:
             continue
-        matches = matrix[score.document_id]
-        if any(_directly_disclosed(matches.get(label)) for label in core_labels):
+        unique = directly_covered(score.document_id) - covered
+        if unique:
             eligible.append(score.document_id)
+            covered |= unique
     order = {score.document_id: index for index, score in enumerate(scores)}
     return sorted(eligible, key=lambda document_id: order.get(document_id, len(order)))
 
@@ -386,8 +406,74 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
 
 def _merge(claim: Claim, current: dict[str, ElementMatch], addition: dict[str, ElementMatch]) -> dict[str, ElementMatch]:
     """구성별로 더 강한 판정을 채택합니다. 결합 후 커버리지는 여기서만 정해집니다."""
-    return {element.label: best_match([current.get(element.label), addition.get(element.label)])
-            for element in claim.elements}
+    merged = {element.label: best_match([current.get(element.label), addition.get(element.label)])
+              for element in claim.elements}
+    return _restore_combination_antecedents(claim, merged)
+
+
+def _restore_combination_antecedents(
+        claim: Claim, merged: dict[str, ElementMatch]) -> dict[str, ElementMatch]:
+    """다른 채택 문헌이 선행 구성을 **완전히** 개시했을 때만 문헌 단독 상한을 풉니다.
+
+    consistency.enforce_antecedents는 단일 문헌이 앞 구성을 놓친 상태에서 뒤 구성만 완전 개시로
+    세는 것을 막습니다. 그러나 진보성 결합에서는 문헌 A가 앞 구성을, 문헌 B가 뒤 구성을
+    나누어 개시할 수 있습니다. 결합 뒤에도 단독문헌 상한을 그대로 두면 정상적인 보완을
+    선택하고도 등급과 차이점에는 "같은 문헌에 없음"이 남습니다.
+
+    **fail-closed입니다.** 이 함수가 하는 일은 "두 문헌을 합치면 지시 대상이 성립한다"는 주장인데,
+    그 주장이 참인지 확인할 교차문헌 검증 단계가 아직 없습니다. 확인할 수 없는 것은 풀지 않는
+    쪽이 기본값이어야 하므로, 상한을 푸는 조건을 다음 두 가지로 좁힙니다.
+
+      1. 선행 구성이 결합 안에서 **완전 개시**(is_complete)일 것. 종전에는 has_correspondence만
+         요구했는데, 그것은 '일부 유사'·'일부 차이'도 통과시킵니다. 상한이 걸린 이유가 "지시
+         대상이 이 문헌에 세워지지 않았다"인데, 부분적으로만 개시된 대상은 결합에서도 그
+         대상을 세우지 못합니다. 그런 상태에서 상한을 풀면 결합 커버리지를 과대평가합니다.
+      2. 복원 상한은 **선행 구성 중 가장 약한 판정을 넘지 못할 것.** 어떤 구성도 자기가
+         참조하는 대상보다 더 완전하게 개시되었다고 볼 수 없습니다. enforce_antecedents가
+         같은 문헌 안에서 쓰는 규칙(limit = min(선행 구성 판정))을 결합 범위로 그대로 옮긴
+         것이라, 두 방향이 같은 기준 위에서 움직입니다.
+
+    조건을 채우지 못하면 상한과 antecedent_note를 그대로 둡니다. 그러면 보고서는 "같은
+    인용발명에서 선행 구성의 대응이 확인되지 않아 완전 개시로 보지 않았다"고 계속 적습니다.
+
+    원본 matrix 셀은 감사용 단독 판정이므로 수정하지 않고, 결합 결과의 깊은 사본만 복원합니다.
+    """
+    restored = dict(merged)
+    for label, source_labels in antecedents(claim).items():
+        match = restored.get(label)
+        if (match is None or not match.antecedent_note or not match.antecedent_capped_from
+                or not source_labels
+                # 조건 1. 부분 개시된 선행 구성으로는 지시 대상이 세워지지 않습니다.
+                or not all(is_complete(restored.get(source)) for source in source_labels)):
+            continue
+        support_documents = sorted({restored[source].document_id for source in source_labels
+                                    if restored.get(source) is not None
+                                    and restored[source].document_id != match.document_id})
+        if not support_documents:
+            continue
+        # 조건 2. 참조하는 대상보다 더 완전하게 복원하지 않습니다.
+        limit = min(JUDGMENT_RANK.get(restored[source].judgment, 0) for source in source_labels)
+        target = min(JUDGMENT_RANK.get(match.antecedent_capped_from, 0), limit)
+        if target <= JUDGMENT_RANK.get(match.judgment, 0):
+            continue
+        copy = match.model_copy(deep=True)
+        copy.judgment = judgment_at_rank(target)
+        if copy.downgraded_from == copy.antecedent_capped_from:
+            copy.downgraded_from = ""
+        copy.antecedent_note = ""
+        copy.antecedent_capped_from = ""
+        copy.antecedent_resolved_by = support_documents
+        restored[label] = copy
+    return restored
+
+
+def merge_selected(claim: Claim, matrix: Matrix, document_ids: list[str]) -> dict[str, ElementMatch]:
+    """채택 문헌들을 선정 단계와 보고서 단계에서 같은 규칙으로 병합합니다."""
+    merged: dict[str, ElementMatch] = {}
+    for document_id in document_ids:
+        addition = matrix.get(document_id, {})
+        merged = _merge(claim, merged, addition) if merged else dict(addition)
+    return merged
 
 
 # --- 종속항 결합 -------------------------------------------------------------
@@ -557,6 +643,9 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         eligible=not reason,
         rejected_reason=reason,
         adopted=bool(adopted and adopted.document_id == document_id),
+        sample_count=match.sample_count if match else 0,
+        sample_agreement=match.sample_agreement if match else 0.0,
+        sample_early_exit=bool(match and match.sample_early_exit),
     )
 
 

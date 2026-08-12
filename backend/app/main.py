@@ -222,7 +222,8 @@ def prepare_job():
 @app.post("/api/jobs/{job_id}/start", status_code=202)
 async def start_job(job_id: str, claims: str = Form(...),
                     pdf_files: list[UploadFile] = File(...),
-                    analysis_prompt: str = Form("")):
+                    analysis_prompt: str = Form(""),
+                    priority_date: str = Form("")):
     """Stage uploads, then run the report in a cancellable worker thread."""
     job_id = safe_job_id(job_id)
     record = jobs.get(job_id)
@@ -267,7 +268,7 @@ async def start_job(job_id: str, claims: str = Form(...),
         set_job_status(job_id, status="running", stage="구성대비 준비 중")
         worker = threading.Thread(
             target=_run_async_analysis,
-            args=(job_id, claims, documents, effective_prompt, work),
+            args=(job_id, claims, documents, effective_prompt, work, priority_date.strip()),
             name=f"forge-{job_id[:8]}", daemon=True,
         )
         record["_worker"] = worker
@@ -296,7 +297,7 @@ async def start_job(job_id: str, claims: str = Form(...),
 
 
 def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
-                        analysis_prompt: str, work: Path) -> None:
+                        analysis_prompt: str, work: Path, priority_date: str = "") -> None:
     agy.bind_job(job_id)
     try:
         agy.raise_if_cancelled(job_id)
@@ -309,10 +310,10 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
         decomposition: dict = {}
         cache_keys: set[str] = set()
         result = analyze(job_id, claims, documents, analysis_prompt, progress, decomposition,
-                         cache_keys)
+                         cache_keys, priority_date)
         agy.raise_if_cancelled(job_id)
         _persist_initial_analysis(job_id, result, claims, documents, analysis_prompt, work,
-                                  decomposition, cache_keys)
+                                  decomposition, cache_keys, priority_date)
         # A cancellation that lands during persistence must not leave a searchable report.
         if agy.is_cancelled(job_id):
             shutil.rmtree(HISTORY_DIR / job_id, ignore_errors=True)
@@ -341,7 +342,8 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
 def _persist_initial_analysis(job_id: str, result: AnalysisResult, claims: str,
                               documents: list[Document], analysis_prompt: str,
                               work: Path, decomposition: dict | None = None,
-                              cache_keys: set[str] | None = None) -> None:
+                              cache_keys: set[str] | None = None,
+                              priority_date: str = "") -> None:
     """최초 분석에만 필요한 것(원문 PDF 보존·구성분해)을 남기고 나머지는 공통 경로에 맡깁니다."""
     history = HISTORY_DIR / job_id
     history.mkdir(parents=True, exist_ok=True)
@@ -351,7 +353,8 @@ def _persist_initial_analysis(job_id: str, result: AnalysisResult, claims: str,
     for index, document in enumerate(documents, 1):
         shutil.copy2(work / f"{index}.pdf", history / document.source_file)
     _persist_analysis(job_id, result, claims, documents, analysis_prompt,
-                      created_at=datetime.now(timezone.utc).isoformat())
+                      created_at=datetime.now(timezone.utc).isoformat(),
+                      priority_date=priority_date)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -675,7 +678,7 @@ def _load_analysis_context(job_id: str) -> tuple[AnalysisResult, str, list[Docum
 
 def _persist_analysis(job_id: str, result: AnalysisResult, claims_text: str,
                       documents: list[Document], analysis_prompt: str,
-                      created_at: str | None = None) -> None:
+                      created_at: str | None = None, priority_date: str | None = None) -> None:
     """결과·리포트·감사 데이터와 원 입력 메타데이터를 히스토리에 한 벌로 남깁니다.
 
     최초 분석과 종속항 추가가 **같은 경로**를 씁니다. 종전에는 같은 6개 파일을 두 함수가
@@ -702,6 +705,10 @@ def _persist_analysis(job_id: str, result: AnalysisResult, claims_text: str,
         claims=claims_text or meta.get("claims", ""),
         claims_summary=(claims_text or meta.get("claims", ""))[:200],
         analysis_prompt=analysis_prompt,
+        # 종속항 추가·재실행에서도 같은 기준으로 적격성을 가려야 하므로 남깁니다. 빈 값으로는
+        # 덮어쓰지 않습니다(체크포인트가 우선일을 지워 버리면 후속 실행이 기준을 잃습니다).
+        priority_date=(priority_date if priority_date is not None
+                       else meta.get("priority_date", "")) or meta.get("priority_date", ""),
         documents=[document.filename for document in documents],
     )
     write_json(history / "meta.json", meta)

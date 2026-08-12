@@ -29,11 +29,19 @@ UNCORRESPONDED_GRADE = ("대응 안됨", "⚪")
 CORE_IMPORTANCE_THRESHOLD = 4     # 이 이상이면 차별적 핵심 구성
 DIRECT_STRONG = 0.55              # 직접 근거가 이 이상이면 유효한 직접 개시
 CRITICAL_GAP = 0.35               # 이 미만이면 핵심 공백
-PRIMARY_CANDIDATE_MARGIN = 0.20   # 최고 문헌 대비 이만큼 못 미치면 주 인용발명 후보 제외
+# 주 인용발명 후보로 남기려면 최고 문헌의 핵심 직접 개시량 대비 이 **비율** 이상이어야 합니다.
+#
+# 종전에는 절대 차(0.20)였습니다. 그런데 core_direct는 실측에서 최고 문헌도 0.5 안팎이라
+# 임계가 최고점의 60% 수준으로 내려앉아, 사실상 0점 문헌만 걸러졌습니다. 한 실측 사건에서는
+# 4문헌 중 3문헌이 그대로 통과했고 결국 main_score 1위가 뽑혔습니다 — 게이트가 있는 척만
+# 하는 상태였습니다. 비율로 두면 점수 분포가 좁든 넓든 같은 뜻("최고 문헌에 크게 못 미침")을
+# 유지합니다.
+PRIMARY_CANDIDATE_RATIO = 0.75
 
 # --- 대응의 우열 -------------------------------------------------------------
 # 판정 라벨·직접성·검증 상태의 서열. 점수 하나로 뭉개지 않고 차원별로 비교합니다.
 JUDGMENT_RANK = {"대응 없음": 0, "차이": 1, "일부 유사": 2, "일부 차이": 3, "실질적 동일": 4, "동일": 5}
+_JUDGMENT_BY_RANK = {rank: judgment for judgment, rank in JUDGMENT_RANK.items()}
 DIRECTNESS_RANK = {"absent": 0, "inferred": 1, "direct": 2}
 VERIFY_RANK = {"not_found": 0, "empty": 0, "short": 1, "partial": 2, "verified": 3}
 FULL_JUDGMENTS = {"동일", "실질적 동일"}      # 하위 한정까지 개시된 것으로 볼 수 있는 판정
@@ -42,6 +50,57 @@ VERIFY_OK = {"verified", "partial"}          # 발췌가 원문에 실재한다�
 NO_CORRESPONDENCE_JUDGMENTS = {"대응 없음", "차이"}
 # 보완 이득 가중치. 판정 단계 상승을 가장 크게, 나머지는 근거 품질 개선으로 봅니다.
 GAIN_WEIGHTS = {"judgment": 1.00, "directness": 0.35, "evidence": 0.25, "missing": 0.20}
+
+
+def judgment_at_rank(rank: int) -> str:
+    """서열값을 판정 라벨로 되돌립니다.
+
+    상한을 씌우는 단계가 네 곳(verify·consistency·entailment·chain)이고, 종전에는 각자
+    같은 역인덱스를 다시 만들었습니다. verify는 JUDGMENT_RANK를 import하지 않고 같은 표를
+    한 벌 더 들고 있어서, 라벨을 하나 바꾸면 다섯 곳을 함께 고쳐야 했습니다.
+    """
+    return _JUDGMENT_BY_RANK[rank]
+
+
+def counted_checks(checks: list) -> list:
+    """대안 묶음을 **한 항목으로 접은** 점검 목록. 커버율·근거 품질의 분모입니다.
+
+    "A, B 또는 C 중 적어도 하나"는 요구사항 하나이지 셋이 아닙니다. 개별 대안을 각각 세면
+    선택지를 넉넉히 나열한 청구항일수록 분모만 커져, 문언을 충족한 문헌이 오히려 낮게
+    나옵니다. 그래서 한 묶음은 언제나 정확히 한 자리를 차지하고, 개시 여부는 그 묶음의
+    아무 대안이나 개시되었는지로 정합니다.
+
+    종전에는 **충족된 묶음에서 미개시 대안만** 뺐습니다. 그러면 같은 묶음에서 모델이 대안을
+    몇 개 개시로 표시했느냐에 따라 분모가 흔들려, 보고서에 (1,1)·(2,2)·(3,3)이 제각각
+    찍혔습니다. 비율은 셋 다 1.0이라 점수와 선정에는 영향이 없었지만, 같은 청구항을
+    충족한 두 문헌이 서로 다른 개시 수를 달고 나갔습니다.
+    """
+    counted: list = []
+    seen: set[str] = set()
+    for check in checks:
+        group = check.alternative_group
+        if not group:
+            counted.append(check)
+            continue
+        if group in seen:
+            continue
+        seen.add(group)
+        # 묶음의 대표는 개시된 대안이 있으면 그것, 없으면 첫 대안입니다. 대표의 disclosed가
+        # 곧 묶음의 충족 여부가 되므로 아래 disclosed_count가 따로 묶음을 다시 볼 필요가 없습니다.
+        counted.append(next((item for item in checks
+                             if item.alternative_group == group and item.disclosed), check))
+    return counted
+
+
+def disclosed_count(checks: list) -> tuple[int, int]:
+    """(개시가 확인된 하위 한정 수, 분모). 대안 묶음은 양쪽에서 한 자리만 차지합니다.
+
+    커버율(atomic_coverage)과 보고서 정량 지표(limitation_counts)가 **같은 셈법**을 쓰도록
+    한 곳에 둡니다. 종전에는 두 함수와 counted_checks가 각자 대안 묶음 처리를 다시 적어,
+    같은 뜻의 계산이 세 벌 있었습니다.
+    """
+    counted = counted_checks(checks)
+    return sum(1 for check in counted if check.disclosed), len(counted)
 
 
 def atomic_coverage(match: ElementMatch) -> float | None:
@@ -56,31 +115,71 @@ def atomic_coverage(match: ElementMatch) -> float | None:
     알 수 없습니다. 누락이 있으면 _build_matches가 이미 판정을 '일부 차이' 이하로 강등하고
     quality_key도 누락 수를 세므로, 여기서 추정값을 지어내지 않아도 벌점은 반영됩니다.
     """
-    if not match.limitation_checks:
-        return None
-    # 대안 묶음은 통째로 한 항목처럼 셉니다. 개별 대안을 각각 세면 선택지가 많은 청구항일수록
-    # 분모만 커져, 문언을 충족했는데도 커버율이 낮게 나옵니다.
-    satisfied = {check.alternative_group for check in match.limitation_checks
-                 if check.disclosed and check.alternative_group}
-    counted = [check for check in match.limitation_checks
-               if not check.alternative_group or not _is_redundant_alternative(check, satisfied)]
+    disclosed, total = disclosed_count(match.limitation_checks)
+    return disclosed / total if total else None
+
+
+def _satisfied_groups(checks: list) -> set[str]:
+    return {check.alternative_group for check in checks
+            if check.disclosed and check.alternative_group}
+
+
+def _is_disclosed(check, satisfied: set[str]) -> bool:
+    return bool(check.disclosed or (check.alternative_group and check.alternative_group in satisfied))
+
+
+# --- 판정 등급 산출 -----------------------------------------------------------
+# 등급은 **코드가 계산합니다.** 종전에는 LLM이 6개 라벨 중 하나를 직접 골랐는데, 그 값 하나가
+# JUDGMENT_SIMILARITY·JUDGMENT_RANK·has_correspondence·chain._directly_disclosed를 전부
+# 좌우하면서도 근거에 묶여 있지 않았습니다. 같은 문헌·같은 발췌에서도 실행마다 '실질적 동일'과
+# '대응 없음' 사이를 오갔고, 그 흔들림이 그대로 결론까지 갔습니다.
+#
+# 재료는 이미 전부 있습니다. limitation_checks의 core/qualifier별 개시 여부는 항목마다 발췌를
+# 요구하고 독립 의미검증(entailment.py)까지 거치므로 라벨보다 훨씬 단단히 묶여 있습니다.
+# 남는 두 가지 — 용어가 같은가(동일/실질적 동일), 문헌이 그 구성을 다른 목적으로 쓰는가 —
+# 만 모델에게 좁게 묻고, 나머지는 이 함수가 정합니다.
+#
+# 이 함수는 compare(최초 판정)와 entailment(재심 후 재산출) 양쪽이 함께 씁니다. 두 곳이 각자
+# 사다리를 들고 있으면 같은 조건에서 다른 등급이 나옵니다(실제로 그랬습니다 — entailment만
+# directness를 absent로 내려 문헌이 보조 자격을 잃었습니다).
+TERMINOLOGY_VALUES = {"identical", "equivalent"}
+
+
+def derive_judgment(checks: list, *, has_evidence: bool, terminology: str = "equivalent",
+                    different_purpose: bool = False) -> str:
+    """한정별 개시 여부에서 판정 등급을 산출합니다.
+
+    core는 그 구성이 실제로 무엇을 하는가이고 qualifier는 그 동작을 한정하는 조건이므로,
+    core가 대응 여부를 가르고 qualifier가 등급을 가릅니다(compare.py [요구사항의 두 종류]).
+
+      core 0개 개시  → 관련 원문이 있으면 "차이", 원문도 없으면 "대응 없음"
+      core 일부 개시 → "일부 유사"
+      core 전부 개시 → different_purpose면 "일부 유사"
+                       qualifier 누락이 있으면 "일부 차이"
+                       전부 개시면 terminology에 따라 "동일" 또는 "실질적 동일"
+
+    has_evidence는 원문 대조에 걸 수 있는 발췌가 하나라도 있는지입니다. "차이"와 "대응 없음"의
+    차이가 정확히 이것이라(compare.py: "관련 원문도 제시할 수 없다면 '차이'가 아니라 '대응 없음'"),
+    이 구분을 등급 산출에서 잃으면 보고서가 "가장 가까운 기재"를 붙일 근거를 잃습니다.
+    """
+    counted = counted_checks(checks)
     if not counted:
-        return None
-    disclosed = sum(1 for check in counted if check.disclosed or check.alternative_group in satisfied)
-    return disclosed / len(counted)
-
-
-def _is_redundant_alternative(check, satisfied: set[str]) -> bool:
-    """충족된 묶음에서 개시되지 않은 대안. 분모에서 뺍니다."""
-    return check.alternative_group in satisfied and not check.disclosed
-
-
-def _counted_checks(match: ElementMatch) -> list:
-    """커버율·근거 품질을 셀 때 분모가 되는 하위 한정. 충족된 묶음의 잉여 대안은 뺍니다."""
-    satisfied = {check.alternative_group for check in match.limitation_checks
-                 if check.disclosed and check.alternative_group}
-    return [check for check in match.limitation_checks
-            if not check.alternative_group or not _is_redundant_alternative(check, satisfied)]
+        # 점검 자체가 없으면 등급을 세울 근거가 없습니다. compare._requirements가 구성 원문
+        # 한 줄이라도 core로 만들어 주므로 정상 경로에서는 오지 않습니다.
+        return "대응 없음"
+    satisfied = _satisfied_groups(checks)
+    # core를 선언하지 않은 분해 결과에서는 전체 한정이 그 역할을 합니다.
+    gate = [check for check in counted if check.kind == "core"] or counted
+    disclosed_gate = sum(1 for check in gate if _is_disclosed(check, satisfied))
+    if disclosed_gate == 0:
+        return "차이" if has_evidence else "대응 없음"
+    if disclosed_gate < len(gate):
+        return "일부 유사"
+    if different_purpose:
+        return "일부 유사"
+    if any(not _is_disclosed(check, satisfied) for check in counted):
+        return "일부 차이"
+    return "동일" if terminology == "identical" else "실질적 동일"
 
 
 # 직접성 계수. absent는 "근거 원문이 없음"이므로 direct_similarity가 이미 0으로 봅니다.
@@ -134,7 +233,7 @@ def core_direct_score(claim: Claim, matches: dict[str, ElementMatch]) -> float:
 
     문헌 순위(score_document)와 주 인용발명 자격 게이트가 같은 정의를 쓰도록 한 곳에 둡니다.
     종전에는 자격 게이트만 단순 평균이라, 같은 '핵심 직접 개시량'이라는 이름으로 두 곳이
-    다른 값을 쓰고 마진(PRIMARY_CANDIDATE_MARGIN)도 서로 다른 척도 위에서 비교됐습니다.
+    다른 값을 쓰고 임계(PRIMARY_CANDIDATE_RATIO)도 서로 다른 척도 위에서 비교됐습니다.
     """
     core = core_elements(claim)
     weight = sum(element.importance for element in core) or 1
@@ -225,16 +324,9 @@ def limitation_counts(match: ElementMatch | None) -> tuple[int, int]:
     한정이 빠질 때마다 실제로 움직입니다. 대안 묶음은 하나로 셉니다 — 선택지를 넉넉히 나열한
     청구항일수록 분모만 커지면, 문언을 충족하는 문헌이 오히려 낮게 나옵니다.
     """
-    if match is None or not match.limitation_checks:
+    if match is None:
         return 0, 0
-    counted = _counted_checks(match)
-    if not counted:
-        return 0, 0
-    satisfied = {check.alternative_group for check in match.limitation_checks
-                 if check.disclosed and check.alternative_group}
-    disclosed = sum(1 for check in counted
-                    if check.disclosed or check.alternative_group in satisfied)
-    return disclosed, len(counted)
+    return disclosed_count(match.limitation_checks)
 
 
 def evidence_locations(match: ElementMatch | None) -> int:

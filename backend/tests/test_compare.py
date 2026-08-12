@@ -1,8 +1,8 @@
 from app import compare
 from app.compare import (BATCH_COMPARE_PROMPT, COMPARE_PROMPT, _build_matches, compare_document,
                          select_chunks_for_claims)
-from app.coverage import atomic_coverage, has_correspondence
-from app.models import Chunk, Claim, ClaimElement, Document
+from app.coverage import atomic_coverage, derive_judgment, has_correspondence
+from app.models import Chunk, Claim, ClaimElement, Document, LimitationCheck
 
 
 def test_prompts_do_not_request_unused_per_element_similarity_text():
@@ -168,7 +168,10 @@ def test_an_unsatisfied_alternative_set_is_still_missing():
     match = _build_matches(raw, target, document)[0][0]
 
     assert len(match.missing_limitations) == 2
-    assert match.judgment == "차이"
+    # 발췌도 evidence도 없으므로 "차이"가 아니라 "대응 없음"이다. 프롬프트의 근거 규칙이
+    # "관련 원문도 제시할 수 없다면 '차이'가 아니라 '대응 없음'"이라고 정한 것과 같다.
+    # 종전에는 모델이 낸 라벨을 강등하는 방식이라 근거가 하나도 없어도 "차이"에서 멈췄다.
+    assert match.judgment == "대응 없음"
 
 
 def test_batch_match_requires_every_atomic_limitation_check():
@@ -190,7 +193,10 @@ def test_batch_match_requires_every_atomic_limitation_check():
 
     matches, warnings = _build_matches(raw, target, document)
 
-    assert matches[0].judgment == "일부 차이"
+    # 두 한정이 모두 core인데 하나만 개시되었으므로 "core가 일부만 개시됨" = 일부 유사이다.
+    # 종전 경로는 "core가 하나라도 개시되었는가"만 봐서 부분 개시 core를 전부 개시 core와
+    # 같이 취급했고, 그래서 qualifier만 빠진 경우와 구별되지 않았다.
+    assert matches[0].judgment == "일부 유사"
     assert matches[0].missing_limitations == ["가우시안 스플랫을 동적으로 로딩함"]
     assert len(matches[0].limitation_checks) == 2
     assert warnings
@@ -220,7 +226,9 @@ def test_zero_disclosed_limitations_cannot_be_reported_as_partial_disclosure():
     match.verify = "verified"
 
     assert match.judgment == "차이"
-    assert match.downgraded_from == "일부 차이"
+    # downgraded_from은 비어 있다. 등급을 산출하게 된 뒤로 compare 단계에는 "강등할 원 판정"이
+    # 존재하지 않는다 — 모델이 라벨을 내지 않기 때문이다. 이후 단계(의미검증)의 강등만 기록된다.
+    assert match.downgraded_from == ""
     assert has_correspondence(match) is False
 
 
@@ -256,8 +264,9 @@ def test_single_path_sends_requirements_and_requires_the_checks(monkeypatch):
 
     assert '"requirements"' in captured["prompt"]
     assert "첫째 조건" in captured["prompt"]
-    # 점검 결과가 없으면 미개시로 처리되고 판정도 강등된다(일괄 경로와 동일).
-    assert matches[0].judgment == "차이" and matches[0].downgraded_from == "동일"
+    # 점검 결과가 없으면 미개시로 처리되고, 등급도 그 결과로 산출된다(일괄 경로와 동일).
+    # 발췌는 있으므로 "대응 없음"이 아니라 "차이"에서 멈춘다.
+    assert matches[0].judgment == "차이" and matches[0].downgraded_from == ""
     assert matches[0].missing_limitations == ["첫째 조건", "둘째 조건"]
     assert warnings and "하위 제한" in warnings[0]
 
@@ -296,7 +305,8 @@ def test_document_text_is_fenced_as_untrusted_and_the_guideline_is_subordinate(m
 
     assert "비신뢰 데이터" in prompt
     # 불변 규칙이 사용자 지침보다 앞에 오고, 비신뢰 문헌은 맨 뒤에 온다.
-    assert prompt.index("[판정 라벨]") < prompt.index("사용자가 넣은 지침") < prompt.index("CONTEXT:")
+    # 규칙 블록의 첫 머리를 기준으로 잡는다. 개별 절 제목은 규칙이 바뀌면 함께 바뀐다.
+    assert prompt.index("[요구사항의 두 종류]") < prompt.index("사용자가 넣은 지침") < prompt.index("CONTEXT:")
 
 
 # --- 발췌를 첫 적중에서 끝내지 않기 -------------------------------------------
@@ -438,3 +448,227 @@ def test_an_independent_claim_prompt_has_no_parent_block(monkeypatch):
     compare.compare_document(target, document, all_claims=[target])
 
     assert '"parent_claims"' not in captured["p"]
+
+
+# --- 판정 등급 산출 ------------------------------------------------------------
+
+def _checks(*specs) -> list[LimitationCheck]:
+    """(kind, disclosed) 쌍으로 점검 목록을 만든다. quote는 개시된 항목에만 붙인다."""
+    return [LimitationCheck(index=index, kind=kind, limitation=f"한정 {index}", disclosed=disclosed,
+                            quote="원문 발췌" if disclosed else "")
+            for index, (kind, disclosed) in enumerate(specs)]
+
+
+def test_the_grade_ladder_is_derived_from_core_and_qualifier_disclosure():
+    """등급은 모델이 고르지 않고 한정별 개시 여부에서 산출된다."""
+    full = _checks(("core", True), ("qualifier", True))
+    assert derive_judgment(full, has_evidence=True) == "실질적 동일"
+    assert derive_judgment(full, has_evidence=True, terminology="identical") == "동일"
+    # 용어 관계는 **전부 개시일 때만** 등급을 가른다.
+    partial = _checks(("core", True), ("qualifier", False))
+    assert derive_judgment(partial, has_evidence=True, terminology="identical") == "일부 차이"
+    # core가 일부만 개시되면 qualifier 상태와 무관하게 '일부 유사'다.
+    assert derive_judgment(_checks(("core", True), ("core", False), ("qualifier", True)),
+                           has_evidence=True) == "일부 유사"
+
+
+def test_a_different_purpose_caps_a_fully_disclosed_element_at_partial_similarity():
+    """"문헌이 그 구성을 다른 목적으로 사용함"은 한정별 boolean으로 표현할 수 없어 따로 받는다."""
+    full = _checks(("core", True), ("qualifier", True))
+    assert derive_judgment(full, has_evidence=True, different_purpose=True) == "일부 유사"
+    assert derive_judgment(full, has_evidence=True, terminology="identical",
+                           different_purpose=True) == "일부 유사"
+
+
+def test_evidence_presence_separates_a_difference_from_no_correspondence():
+    """core 미개시일 때 '차이'와 '대응 없음'을 가르는 것은 제시된 원문의 유무뿐이다."""
+    none_disclosed = _checks(("core", False), ("qualifier", False))
+    assert derive_judgment(none_disclosed, has_evidence=True) == "차이"
+    assert derive_judgment(none_disclosed, has_evidence=False) == "대응 없음"
+
+
+def test_a_satisfied_alternative_group_does_not_drag_the_grade_down():
+    """대안 묶음은 하나만 개시되면 충족이므로, 나머지 대안 때문에 등급이 내려가면 안 된다."""
+    checks = [
+        LimitationCheck(index=0, kind="core", limitation="가", disclosed=True,
+                        quote="원문 발췌", alternative_group="묶음"),
+        LimitationCheck(index=1, kind="core", limitation="나", disclosed=False,
+                        alternative_group="묶음"),
+    ]
+    assert derive_judgment(checks, has_evidence=True) == "실질적 동일"
+
+
+def test_the_model_cannot_set_the_grade_directly():
+    """응답에 judgment를 넣어도 무시하고 한정별 개시 여부로 산출한다."""
+    target = Claim(number=1, elements=[ClaimElement(
+        label="A", text="구성 A",
+        limitations=[{"text": "동작을 수행함", "kind": "core"},
+                     {"text": "조건으로 한정함", "kind": "qualifier"}])])
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="원문 발췌 문장입니다")])
+    raw = [{"label": "A", "judgment": "동일", "directness": "direct",
+            "quote": "원문 발췌 문장입니다", "chunk_id": "D1-P-0001",
+            "limitation_checks": [
+                {"index": 0, "disclosed": True, "quote": "원문 발췌 문장입니다", "chunk_id": "D1-P-0001"},
+                {"index": 1, "disclosed": False, "quote": "", "chunk_id": ""}]}]
+
+    match = _build_matches(raw, target, document)[0][0]
+
+    # 모델은 "동일"이라고 했지만 qualifier가 미개시이므로 "일부 차이"가 산출된다.
+    assert match.judgment == "일부 차이"
+    assert match.terminology == "equivalent" and match.different_purpose is False
+
+
+# --- 자기일관성 샘플링 ----------------------------------------------------------
+
+def _sampling_claim() -> Claim:
+    return Claim(number=1, elements=[ClaimElement(
+        label="A", text="구성 A",
+        limitations=[{"text": "동작을 수행함", "kind": "core"},
+                     {"text": "조건으로 한정함", "kind": "qualifier"}])])
+
+
+def _sample(core: bool, qualifier: bool, quote: str = "원문 발췌 문장입니다") -> dict:
+    return {"label": "A", "directness": "direct", "quote": quote, "chunk_id": "D1-P-0001",
+            "limitation_checks": [
+                {"index": 0, "disclosed": core, "quote": quote if core else "",
+                 "chunk_id": "D1-P-0001" if core else ""},
+                {"index": 1, "disclosed": qualifier, "quote": quote if qualifier else "",
+                 "chunk_id": "D1-P-0001" if qualifier else ""}]}
+
+
+def _response(core: bool, qualifier: bool) -> list[dict]:
+    """표본 하나. consensus는 표본들의 리스트를 받고, 표본 하나는 match 배열이다."""
+    return [_sample(core, qualifier)]
+
+
+def test_a_limitation_is_disclosed_when_the_majority_of_samples_say_so():
+    """한정별 개시 여부에만 투표한다. 등급은 그 결과의 함수이므로 따로 투표하지 않는다."""
+    claim = _sampling_claim()
+    merged = compare.consensus([_response(True, True), _response(True, False),
+                                _response(True, True)], claim)
+
+    checks = {check["index"]: check["disclosed"] for check in merged[0]["limitation_checks"]}
+    assert checks == {0: True, 1: True}      # core 3/3, qualifier 2/3
+
+
+def test_a_tie_counts_as_undisclosed():
+    """근거가 반반이면 개시로 인정하지 않는다. 인정하는 쪽이 청구항을 죽이는 방향이다."""
+    claim = _sampling_claim()
+    merged = compare.consensus([_response(True, True), _response(True, False)], claim)
+
+    checks = {check["index"]: check["disclosed"] for check in merged[0]["limitation_checks"]}
+    assert checks == {0: True, 1: False}     # qualifier 1/2는 동률이므로 미개시
+
+
+def test_sampling_collapses_a_split_vote_into_one_grade():
+    """실행마다 다른 답을 내던 셀이 하나의 등급으로 모인다."""
+    claim = _sampling_claim()
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="원문 발췌 문장입니다")])
+    # 한 표본은 전부 개시(→실질적 동일), 두 표본은 core만 개시(→일부 차이).
+    split = [_response(True, True), _response(True, False), _response(True, False)]
+
+    merged = compare.consensus(split, claim)
+    match = _build_matches(merged, claim, document)[0][0]
+
+    assert match.judgment == "일부 차이"
+    assert match.limitation_checks[0].disclosed is True
+    assert match.limitation_checks[1].disclosed is False
+
+
+def test_a_single_sample_passes_through_untouched():
+    """샘플링을 끈 설정에서 이 경로는 아무것도 바꾸지 않아야 한다."""
+    claim = _sampling_claim()
+    only = _response(True, False)
+    assert compare.consensus([only], claim) == only
+
+
+def test_compare_document_asks_repeatedly_and_survives_a_failed_sample(monkeypatch):
+    """표본 하나가 실패해도 나머지로 다수결을 낸다. 전부 실패했을 때만 미판정이다."""
+    claim = _sampling_claim()
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="원문 발췌 문장입니다")])
+    calls: list[int] = []
+
+    def flaky(prompt, expect="matches"):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("agy CLI가 JSON을 반환하지 않았습니다")
+        return {"matches": [_sample(True, len(calls) == 1)]}
+
+    monkeypatch.setattr(compare, "run_cli", flaky)
+    matches, warnings = compare.compare_document(claim, document, samples=3)
+
+    assert len(calls) == 3 and not warnings
+    # 성공한 두 표본 중 qualifier는 1/2 동률이므로 미개시 → 일부 차이.
+    assert matches[0].judgment == "일부 차이"
+
+
+def test_every_sample_failing_is_reported_as_unjudged(monkeypatch):
+    """미판정은 '대응 없음'과 다르다. 전부 실패하면 error를 세워 결론을 만들지 않게 한다."""
+    claim = _sampling_claim()
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="본문")])
+
+    def always_fails(prompt, expect="matches"):
+        raise RuntimeError("CLI 실행 실패")
+
+    monkeypatch.setattr(compare, "run_cli", always_fails)
+    matches, warnings = compare.compare_document(claim, document, samples=3)
+
+    assert warnings and matches[0].error
+
+
+# --- 표본 합의 계측 -----------------------------------------------------------
+# 이 네 테스트는 계기 자체를 지킵니다. 종전 sample_agreement는 `vote is winner` 항등 비교라
+# 완전 일치든 완전 불일치든 언제나 "1/3"을 냈고, _build_matches가 읽지도 않아 버려졌습니다.
+# 값이 늘 상수여도 아무 테스트가 실패하지 않았던 것이 이 필드가 오래 죽어 있던 이유입니다.
+
+def test_sample_agreement_separates_unanimous_cells_from_split_cells():
+    claim = _sampling_claim()
+    unanimous = compare.consensus([_response(True, True)] * 3, claim)[0]
+    split = compare.consensus([_response(True, True), _response(False, False),
+                               _response(True, False)], claim)[0]
+    assert unanimous["sample_agreement"] == 1.0
+    assert split["sample_agreement"] == 0.0          # 두 한정 모두 표본이 갈림
+    assert unanimous["sample_count"] == split["sample_count"] == 3
+
+
+def test_early_exit_flag_marks_only_cells_whose_first_two_samples_agree():
+    claim = _sampling_claim()
+    # 앞의 두 표본이 모든 한정에서 일치 → 세 번째는 다수결을 바꿀 수 없다.
+    agreed = compare.consensus([_response(True, False), _response(True, False),
+                                _response(False, True)], claim)[0]
+    # 첫 한정에서 앞의 두 표본이 갈림 → 세 번째가 결과를 정한다.
+    contested = compare.consensus([_response(True, True), _response(False, True),
+                                   _response(True, True)], claim)[0]
+    assert agreed["sample_early_exit"] is True
+    assert contested["sample_early_exit"] is False
+    assert agreed["limitation_checks"][0]["disclosed"] is True
+    assert agreed["limitation_checks"][1]["disclosed"] is False
+
+
+def test_sample_metrics_reach_the_element_match():
+    """계측치가 ElementMatch까지 실려야 judgment.json에서 집계할 수 있다."""
+    claim = _sampling_claim()
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="원문 발췌 문장입니다")])
+    merged = compare.consensus([_response(True, True)] * 3, claim)
+    match = _build_matches(merged, claim, document)[0][0]
+    assert match.sample_count == 3
+    assert match.sample_agreement == 1.0
+    assert match.sample_early_exit is True
+
+
+def test_batch_and_single_judgments_do_not_share_a_cache_key():
+    """같은 셀이라도 일괄 1표본과 단건 다표본은 다른 산출물이므로 키가 달라야 한다."""
+    from app import cache
+    claim = _sampling_claim()
+    document = Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", text="원문 발췌 문장입니다")])
+    single = cache.cache_key(claim, document, "", 30000, [], mode="single", samples=3)
+    batch = cache.cache_key(claim, document, "", 30000, [], mode="batch", samples=1)
+    same_numbers = cache.cache_key(claim, document, "", 30000, [], mode="batch", samples=3)
+    assert single != batch                 # 종전에는 이 둘이 같은 파일을 놓고 서로를 덮어썼다
+    assert single != same_numbers          # 예산·표본이 같아도 프롬프트가 다르면 다른 키

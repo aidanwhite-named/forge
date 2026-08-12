@@ -9,7 +9,8 @@ LLM이 쓴 마크다운을 정규식으로 되돌려 고치는 코드가 필요 
 """
 import re
 
-from .chain import chain_documents
+from .chain import chain_documents, merge_selected
+from .consistency import antecedents
 from .coverage import (JUDGMENT_RANK, best_match, evidence_locations, limitation_counts,
                        report_grade)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
@@ -77,9 +78,7 @@ def _role(document_id: str, chains: list[ChainInfo]) -> str:
 def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[str, ElementMatch]],
                        documents: dict[str, Document], mappings: list[DocumentMapping]) -> ClaimReport:
     selected = _reported_documents(chain)
-    merged = {element.label: best_match([matrix.get(document_id, {}).get(element.label)
-                                         for document_id in selected])
-              for element in claim.elements}
+    merged = merge_selected(claim, matrix, selected)
     results = [_element_result(claim, element.label, merged.get(element.label), chain, matrix,
                                documents, mappings)
                for element in claim.elements]
@@ -93,7 +92,7 @@ def build_claim_report(claim: Claim, chain: ChainInfo, matrix: dict[str, dict[st
         conclusion=_conclusion(claim, chain, merged),
         coverage_summary=_coverage_summary(results),
         summary_similarity=_summary_similarity(claim, results),
-        summary_difference=_summary_difference(chain, results, mappings),
+        summary_difference=_summary_difference(chain, results),
     )
 
 
@@ -130,8 +129,9 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
     corresponded = _corresponded(match)
     grade, emoji = report_grade(match)
     evidence = _collect_evidence(label, chain, matrix, documents, mappings)
-    combined = bool(corresponded and match and chain.primary
-                    and match.document_id != chain.primary and _usable(primary))
+    bridge = _antecedent_bridge(claim, label, match, chain, matrix)
+    combined = bool(corresponded and match and chain.primary and (
+        (match.document_id != chain.primary and _usable(primary)) or bridge is not None))
     disclosed, total = limitation_counts(match)
     return ClaimResult(
         label=label,
@@ -141,13 +141,16 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         disclosed_limitations=disclosed,
         total_limitations=total,
         evidence_locations=evidence_locations(match) if corresponded else 0,
+        missing_limitations=list(match.missing_limitations) if match else [],
         grade=grade,
         emoji=emoji,
-        narrative=_narrative(label, text, match, primary, combined, mappings, documents,
-                             _closest_related(label, matrix, mappings, documents),
-                             _gap_note(label, chain, mappings)),
-        difference=_difference(match, primary, combined, mappings, documents,
-                               chain.beyond_limit_residual.get(label), chain.combination_limit),
+        narrative=_narrative(
+            label, text, match, primary, combined, mappings, documents,
+            _closest_related(label, matrix, mappings, documents),
+            _gap_note(label, chain, mappings), bridge=bridge),
+        difference=_difference(
+            match, primary, combined, mappings, documents,
+            chain.beyond_limit_residual.get(label), chain.combination_limit, bridge=bridge),
         combination=combined,
         evidence=evidence,
         status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
@@ -192,7 +195,8 @@ def _gap_note(label: str, chain: ChainInfo, mappings: list[DocumentMapping]) -> 
 
 def _narrative(label: str, text: str, match: ElementMatch | None, primary: ElementMatch | None,
                combined: bool, mappings: list[DocumentMapping],
-               documents: dict[str, Document], related: str = "", gap_note: str = "") -> str:
+               documents: dict[str, Document], related: str = "", gap_note: str = "",
+               bridge: ElementMatch | None = None) -> str:
     """구성 1개의 구성대비를 한 문장으로 조립합니다.
 
     대응 문헌이 없으면 유사도 없이 미대응 한 줄만 남깁니다. 근거가 약한 대응을 억지로
@@ -204,6 +208,11 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
         line = gap_note or f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
         return f"{line}\n(가장 가까운 기재: {related} — 청구항 한정 전체를 개시하는 근거는 아님)" if related else line
     passage = _passage(match, mappings, documents)
+    if bridge is not None:
+        return (f"{passage}는 구성이 기재되어 있으나 참조되는 선행 구성은 같은 문헌에서 "
+                f"확인되지 않고, {_passage(bridge, mappings, documents)}는 그 선행 "
+                f"구성이 기재되어 있어 이를 결합하면 청구항의 \"{_clip(text)}\" 구성과 "
+                "부분적으로 대응됩니다.")
     if combined and primary is not None:
         missing = "; ".join(primary.missing_limitations[:2]) or "청구항이 요구하는 세부 구성"
         return (f"{_passage(primary, mappings, documents)}는 구성이 기재되어 있으나 {missing}에 대한 "
@@ -275,23 +284,69 @@ def _reason_clause(reason: str) -> str:
 def _difference(match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
                 mappings: list[DocumentMapping], documents: dict[str, Document],
                 overflow: dict[str, list[str]] | None = None,
-                combination_limit: int = 0) -> str | None:
+                combination_limit: int = 0,
+                bridge: ElementMatch | None = None) -> str | None:
     if match is None or not _corresponded(match):
         return None
-    # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 이 경우 하위 한정은 전부 개시로
-    # 남아 있어(예: 2/2) 집계와 등급이 어긋나 보이는데, 그 어긋남을 설명하는 것이 이 줄입니다.
+    # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 다만 **누락 한정을 대신하지는
+    # 않습니다.** 종전에는 "이 경우 하위 한정은 전부 개시로 남아 있다(예: 2/2)"를 전제로
+    # 곧바로 반환했는데, 그 전제가 깨지는 셀이 실제로 나왔습니다(1/5). 그때 이 줄만 내보내면
+    # 보고서는 "선행 구성이 없어 완전 개시로 보지 않았다"만 적고, 실제로 빠진 나머지 한정은
+    # 한 줄도 남기지 않습니다. 읽는 사람은 집계(1/5)와 차이점 줄을 대조할 수 없게 됩니다.
     if match.antecedent_note:
+        if match.missing_limitations:
+            residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
+                                     combination_limit)
+            return f"{match.antecedent_note}. 또한 {residual}에 대한 기재가 확인되지 않았습니다"
         return match.antecedent_note
+    # 다른 채택 문헌이 선행 구성만 보완한 경우, 이 구성 자체에 남은 시점·조건 차이는
+    # 해소된 것으로 쓰지 않습니다. 이번 비디오 편집 사례의 "편집 중" 시점이 여기에 해당합니다.
+    if bridge is not None:
+        if match.missing_limitations:
+            return _residual_gap(match.missing_limitations[:3], mappings, overflow, combination_limit)
+        return None
     if combined and primary is not None:
-        gap = "; ".join(primary.missing_limitations[:2]) or "세부 구성"
-        return (f"{_reference_name(primary.document_id, mappings)}은 {gap}에 대한 기재가 없으나 "
-                f"{_reference_name(match.document_id, mappings)} ({_location(match, documents)})의 "
-                "결합으로 해소됨")
+        # 보완 문헌이 주 인용발명의 공백을 **전부** 메웠을 때만 "해소됨"이라고 적습니다.
+        #
+        # 종전에는 결합이 일어났다는 사실만으로 이 문장을 썼고, 채택된 셀에 남은 누락 한정은
+        # 보지 않았습니다. 그래서 실측 보고서에서 구성 (B)가 본문에는 "인용발명 2의 결합으로
+        # 해소됨"으로, 결론에는 "결합 후에도 구성 B, C에는 차이가 남습니다"로 적혔습니다.
+        # 결론(chain.residual)은 채택 셀의 누락을 보고, 이 줄은 주 인용발명의 누락만 봐서
+        # 같은 구성에 대해 보고서가 스스로를 반박했습니다. 실제로는 두 한정 중 하나
+        # ("도파관 광학 시스템의 모델링")를 어느 문헌도 메우지 못한 상태였습니다.
+        resolved = [limitation for limitation in primary.missing_limitations
+                    if limitation not in match.missing_limitations]
+        supplement = (f"{_reference_name(match.document_id, mappings)} "
+                      f"({_location(match, documents)})")
+        if not match.missing_limitations:
+            gap = "; ".join(resolved[:2]) or "세부 구성"
+            return (f"{_reference_name(primary.document_id, mappings)}은 {gap}에 대한 기재가 없으나 "
+                    f"{supplement}의 결합으로 해소됨")
+        residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
+                                 combination_limit)
+        if resolved:
+            return (f"{_reference_name(primary.document_id, mappings)}에 없던 "
+                    f"{'; '.join(resolved[:2])}은 {supplement}의 결합으로 해소되었으나, "
+                    f"{residual}은 결합 후에도 남음")
+        return residual
     if match.missing_limitations:
         return _residual_gap(match.missing_limitations[:3], mappings, overflow, combination_limit)
     if match.judgment in {"동일", "실질적 동일"} and not match.downgraded_from:
         return None
     return "세부 구현·조건에 차이가 있어 동일하다고 보기 어렵습니다."
+
+
+def _antecedent_bridge(claim: Claim, label: str, match: ElementMatch | None,
+                       chain: ChainInfo, matrix: dict[str, dict[str, ElementMatch]]) -> ElementMatch | None:
+    """결합 복원에 사용된 선행 구성의 대표 근거를 찾습니다."""
+    if match is None or not match.antecedent_resolved_by:
+        return None
+    source_labels = antecedents(claim).get(label, [])
+    candidates = [matrix.get(document_id, {}).get(source_label)
+                  for document_id in match.antecedent_resolved_by
+                  if document_id in {chain.primary, *chain.secondaries}
+                  for source_label in source_labels]
+    return best_match(candidates)
 
 
 def _residual_gap(missing: list[str], mappings: list[DocumentMapping],
@@ -639,8 +694,49 @@ def _topic_particle(word: str) -> str:
     return "은"
 
 
-def _summary_difference(chain: ChainInfo, results: list[ClaimResult],
-                        mappings: list[DocumentMapping] | None = None) -> str:
+def report_invariants(reports: list[ClaimReport]) -> list[str]:
+    """조립된 보고서가 스스로를 반박하지 않는지 확인합니다.
+
+    이 파이프라인의 버그는 계산이 틀리는 형태보다 **본문과 결론이 서로 다른 자료를 보는**
+    형태로 나왔습니다. 실제로 나간 두 건이 그랬습니다.
+      - 결론은 "구성 B에 차이가 남습니다"인데 본문은 "인용발명 2의 결합으로 해소됨"
+        (본문이 주 인용발명의 누락만 보고, 결론은 채택 셀의 누락을 봤습니다)
+      - 집계는 "1/5 개시"인데 차이점 줄에는 지시 관계 사유만 있고 누락 한정은 한 줄도 없음
+    둘 다 테스트가 아니라 보고서를 눈으로 읽다가 발견됐습니다. 조립 직후에 기계적으로
+    맞춰 보면 같은 유형이 다시 새어 나가지 않습니다.
+
+    고치지는 않습니다. 어느 쪽이 맞는지는 사안마다 다르므로, 어긋났다는 사실만 남깁니다.
+    """
+    notes: list[str] = []
+    for report in reports:
+        residual = set(report.chain.residual)
+        for item in report.claims:
+            gap = item.total_limitations - item.disclosed_limitations
+            difference = (item.difference or "").strip()
+            if item.label in residual and not difference:
+                notes.append(f"[보고서 정합성] 청구항 {report.claim_number} ({item.label}): "
+                             "결론은 차이가 남는다고 적었는데 본문에 차이점 줄이 없습니다.")
+            # 빠진 한정이 있으면 차이점 줄이 **그 한정을 실제로 언급**해야 합니다. 줄이
+            # 있기만 하면 통과시키면, 지시 관계 사유 한 줄만 적고 빠진 한정 넷을 통째로
+            # 삼킨 실측 사례를 놓칩니다.
+            # 누락 목록 자체가 없으면 대조할 것이 없습니다. 그때는 "차이점 줄이 아예 없다"만
+            # 봅니다 — 빈 목록으로 "하나도 언급되지 않았다"를 참으로 만들면, 멀쩡한 보고서가
+            # 전부 지적됩니다(필드가 없던 시절의 산출물이 정확히 그랬습니다).
+            mentioned = any(limitation and limitation in difference
+                            for limitation in item.missing_limitations)
+            if item.corresponded and gap > 0 and (
+                    not difference or (item.missing_limitations and not mentioned)):
+                notes.append(f"[보고서 정합성] 청구항 {report.claim_number} ({item.label}): "
+                             f"한정 {item.disclosed_limitations}/{item.total_limitations} 개시인데 "
+                             "본문에 빠진 한정이 적히지 않았습니다.")
+            if item.label in residual and difference.endswith("결합으로 해소됨"):
+                notes.append(f"[보고서 정합성] 청구항 {report.claim_number} ({item.label}): "
+                             "본문은 결합으로 해소되었다고 적었는데 결론은 차이가 남는다고 "
+                             "적었습니다.")
+    return notes
+
+
+def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
     """구성별 차이점과 겹치지 않는 범위에서 가장 두드러진 차이를 한 줄로 정리합니다.
 
     커버되지 않은 구성을 한 덩어리로 적지 않습니다. "어디에서도 확인되지 않았다"는 진짜

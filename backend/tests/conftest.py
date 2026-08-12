@@ -20,8 +20,25 @@ def isolate_app_data(tmp_path, monkeypatch):
     entailment_cache.mkdir()
     monkeypatch.setattr("app.entailment.CACHE_DIR", entailment_cache)
     monkeypatch.setattr("app.cache.ENTAILMENT_CACHE_DIR", entailment_cache)
+    # 분해 캐시도 격리합니다. 빠뜨리면 테스트가 실제 저장소에 분해를 남기고, 다음 테스트가
+    # 그것을 재사용해 "LLM을 몇 번 불렀는가"를 검사하는 테스트들이 서로 간섭합니다.
+    decomposition_cache = tmp_path / "decomposition_cache"
+    decomposition_cache.mkdir()
+    monkeypatch.setattr("app.cache.DECOMPOSITION_CACHE_DIR", decomposition_cache)
     # 선행기술 결과 검증은 외부 웹을 호출합니다. 테스트에서 나가지 않도록 막습니다.
     monkeypatch.setattr("app.priorart.verify_hits", lambda hits: None)
+
+
+@pytest.fixture(autouse=True)
+def single_sample(monkeypatch):
+    """자기일관성 샘플링은 런타임 노브다. 테스트는 1회로 고정한다.
+
+    기본값(3회)을 그대로 두면 "셀당 CLI 1회"를 검사하는 테스트들이 호출 수만 3배로 보고
+    실패한다. 그 테스트들이 지키려는 것은 중복 호출이 없다는 사실이지 절대 호출 수가 아니다.
+    샘플링 자체는 samples를 명시하는 전용 테스트에서 검증한다.
+    """
+    monkeypatch.setattr("app.compare.COMPARE_SAMPLES", 1)
+    monkeypatch.setattr("app.cache.COMPARE_SAMPLES", 1)
 
 
 @pytest.fixture(autouse=True)

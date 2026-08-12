@@ -377,6 +377,26 @@ def test_the_secondary_that_fills_the_most_gaps_wins_the_single_slot():
     assert chain.beyond_limit == ["D"] and chain.beyond_limit_documents["D"] == ["3"]
 
 
+def test_video_editing_buffer_document_outranks_a_shallow_timing_improvement():
+    """실측 회귀: US2010이 (D) 공백을 메우면 (B)만 조금 보강하는 CN보다 먼저 채택한다."""
+    target = claim(importances=(2, 5, 5, 4))
+    matches = (
+        [cell("1", "A", "동일"), cell("1", "B", "일부 차이"),
+         cell("1", "C", "동일"), cell("1", "D", "대응 없음")]
+        + [cell("2", label, "대응 없음") for label in "ABC"]
+        + [cell("2", "D", "실질적 동일")]
+        + [cell("3", "A", "대응 없음"), cell("3", "B", "동일"),
+           cell("3", "C", "대응 없음"), cell("3", "D", "대응 없음")]
+    )
+
+    chain = build(target, matches, all_claims=[target])
+
+    assert chain.primary == "1"
+    assert chain.secondaries == ["2"]
+    assert coverage_of(chain, "D").adopted_document == "2"
+    assert chain.uncovered == []
+
+
 # --- 주지관용기술 -------------------------------------------------------------
 
 def test_a_generic_gap_backed_by_several_documents_becomes_well_known_art():
@@ -646,3 +666,145 @@ def test_grade_carries_no_percentage_band():
     assert report_grade(checked("D1-P-0001")) == ("실질적 동일", "🟢")
     assert report_grade(checked("D1-P-0001", judgment="차이")) == ("대응 안됨", "⚪")
     assert report_grade(None) == ("대응 안됨", "⚪")
+
+
+# --- 결합에서의 지시 관계 상한 복원 (fail-closed) --------------------------------
+
+def _anaphora_claim() -> Claim:
+    """(B)가 (A)의 대상을 "상기 …"로 참조하는 청구항. consistency.antecedents가 링크를 만든다."""
+    return Claim(number=1, elements=[
+        ClaimElement(label="A", text="제1 반사부재", importance=5),
+        ClaimElement(label="B", text="상기 제1 반사부재의 전방에 배치되는 광원", importance=5),
+    ])
+
+
+def _capped(document_id: str, judgment: str = "일부 유사") -> ElementMatch:
+    """(B) 셀. 같은 문헌에 (A)가 없어 consistency가 상한을 씌운 상태를 재현한다."""
+    match = cell(document_id, "B", judgment)
+    match.antecedent_capped_from = "실질적 동일"
+    match.downgraded_from = "실질적 동일"
+    match.antecedent_note = "같은 인용발명에서 구성 A의 대응이 확인되지 않아, 완전 개시로 보지 않았습니다"
+    return match
+
+
+def test_a_fully_disclosed_antecedent_in_another_document_lifts_the_cap():
+    """결합 문헌이 선행 구성을 완전 개시했으면 단독문헌 상한은 풀려야 한다."""
+    matches = [cell("1", "A", "대응 없음"), _capped("1"),
+               cell("2", "A", "실질적 동일"), cell("2", "B", "대응 없음")]
+    chain = build(_anaphora_claim(), matches)
+
+    adopted = coverage_of(chain, "B")
+    assert adopted.adopted_judgment == "실질적 동일"
+    assert matrix_for(matches)["1"]["B"].judgment == "일부 유사"   # 원본 셀은 감사용으로 보존된다
+
+
+def test_a_partially_disclosed_antecedent_does_not_lift_the_cap():
+    """fail-closed: 선행 구성이 부분 개시면 결합해도 지시 대상이 세워지지 않는다.
+
+    종전에는 has_correspondence만 요구해 '일부 차이'로도 상한이 풀렸다. 그러면 (A)를 부분적으로만
+    개시한 문헌을 끌어와 (B)를 완전 개시로 세우게 되고, 이는 교차문헌 결합 명제를 검증하지 않은
+    채 결합 커버리지를 과대평가하는 것이다.
+    """
+    matches = [cell("1", "A", "대응 없음"), _capped("1"),
+               cell("2", "A", "일부 차이", missing=["반사면의 곡률 한정"]), cell("2", "B", "대응 없음")]
+    chain = build(_anaphora_claim(), matches)
+
+    adopted = coverage_of(chain, "B")
+    assert adopted.adopted_judgment == "일부 유사"                 # 상한 유지
+    # 상한을 유지했다는 사실이 보고서에도 남아야 한다. 조용히 낮추면 "한정은 개시인데 등급만
+    # 낮은" 결과가 이유 없이 보인다.
+    assert matrix_for(matches)["1"]["B"].antecedent_note
+
+
+def test_the_restored_grade_never_exceeds_the_antecedent_it_references():
+    """복원 상한은 선행 구성 중 가장 약한 판정을 넘지 못한다.
+
+    (A)가 '실질적 동일'(rank 4)인데 (B)를 '동일'(rank 5)로 복원하면, 참조하는 대상보다 더
+    완전하게 개시되었다고 적는 셈이 된다. enforce_antecedents가 같은 문헌 안에서 쓰는
+    limit = min(선행 구성 판정) 규칙을 결합 범위에도 그대로 적용한다.
+    """
+    capped = _capped("1")
+    capped.antecedent_capped_from = "동일"
+    matches = [cell("1", "A", "대응 없음"), capped,
+               cell("2", "A", "실질적 동일"), cell("2", "B", "대응 없음")]
+    chain = build(_anaphora_claim(), matches)
+
+    assert coverage_of(chain, "B").adopted_judgment == "실질적 동일"
+
+
+# --- 주 인용발명 자격 게이트 ------------------------------------------------------
+# 이 게이트는 오래 "있는 척"만 했습니다. 임계가 절대 차(0.20)라 core_direct 최고점이 0.5
+# 안팎인 실측 분포에서는 최고점의 60%짜리 문헌까지 통과했고, 그마저도 "핵심 구성을 하나라도
+# 직접 개시하면 되살린다"는 예외가 임계와 무관하게 되돌려 놓았습니다. 실측 사건에서는
+# 4문헌 중 3문헌이 후보로 남았고 결국 main_score 1위가 뽑혔습니다.
+
+def _shared_core_matrix() -> list[ElementMatch]:
+    """실측 사건의 구조: 핵심 구성 C는 세 문헌이 함께 개시하고, D만 문헌 1이 앞선다.
+
+    (C)를 공유한다는 사실은 주 인용발명 자격의 근거가 되지 못합니다 — 후보 전부가 가진
+    것이기 때문입니다. 자격을 가르는 것은 아무도 갖지 못한 (D)입니다.
+    """
+    return (
+        [cell("1", "C", "실질적 동일"), cell("1", "D", "일부 차이", direct=False)]
+        + [cell("2", "C", "실질적 동일"), cell("2", "D", "차이", direct=False)]
+        + [cell("3", "C", "실질적 동일"), cell("3", "D", "대응 없음")]
+    )
+
+
+def _core_claim() -> Claim:
+    target = Claim(number=1, elements=[
+        ClaimElement(label="C", text="구성 C", importance=4),
+        ClaimElement(label="D", text="구성 D", importance=5)])
+    return target
+
+
+def test_a_core_element_every_candidate_discloses_does_not_earn_primary_standing():
+    """모두가 가진 핵심 구성을 가졌다는 사실로는 주 인용발명 후보가 되지 못한다."""
+    chain = build(_core_claim(), _shared_core_matrix())
+    assert chain.primary == "1"
+    # 문헌 2·3도 (C)를 '실질적 동일·direct·검증됨'으로 개시하지만 고유 기여가 없다.
+    assert chain.candidates[0].document_id == "1"
+    roles = {score.document_id: score.detail["role"] for score in chain.candidates}
+    assert roles["2"] != "주 인용발명" and roles["3"] != "주 인용발명"
+
+
+def test_a_document_holding_the_only_route_to_a_core_element_survives_the_gate():
+    """임계에 못 미쳐도 다른 후보가 못 가진 핵심 구성을 직접 개시하면 후보로 남긴다."""
+    target = Claim(number=1, elements=[
+        ClaimElement(label="A", text="구성 A", importance=5),
+        ClaimElement(label="B", text="구성 B", importance=5)])
+    matches = (
+        [cell("1", "A", "동일"), cell("1", "B", "대응 없음")]
+        + [cell("2", "A", "대응 없음"), cell("2", "B", "동일")]   # 점수는 낮지만 (B)의 유일 경로
+    )
+    chain = build(target, matches)
+    assert chain.primary == "1"
+    # 문헌 2는 자격을 잃지 않았으므로 보조 인용발명으로 결합될 수 있다.
+    assert chain.secondaries == ["2"]
+
+
+def test_an_alternative_group_always_occupies_exactly_one_slot():
+    """"A, B 또는 C 중 적어도 하나"는 요구사항 하나다. 몇 개를 개시했든 셈이 흔들리면 안 된다.
+
+    종전에는 충족된 묶음에서 미개시 대안만 뺐다. 그래서 모델이 대안을 몇 개나 개시로
+    표시했는지에 따라 보고서에 (1,1)·(2,2)·(3,3)이 제각각 찍혔고, 같은 청구항을 충족한
+    두 문헌이 서로 다른 개시 수를 달고 나갔다.
+    """
+    def alternatives(*flags) -> ElementMatch:
+        return ElementMatch(
+            claim_number=1, label="A", document_id="1", judgment="실질적 동일",
+            directness="direct", quote="원문 발췌 문장입니다", chunk_id="D1-P-0001",
+            verify="verified",
+            limitation_checks=[
+                LimitationCheck(index=index, limitation=f"대안 {index}", alternative_group="속성",
+                                disclosed=disclosed,
+                                quote="근거 문장입니다" if disclosed else "",
+                                chunk_id="D1-P-0001" if disclosed else "",
+                                verify="verified" if disclosed else "empty")
+                for index, disclosed in enumerate(flags)])
+
+    assert limitation_counts(alternatives(True, False, False)) == (1, 1)
+    assert limitation_counts(alternatives(True, True, False)) == (1, 1)
+    assert limitation_counts(alternatives(True, True, True)) == (1, 1)
+    # 아무 대안도 개시되지 않으면 묶음 하나가 통째로 미개시다.
+    assert limitation_counts(alternatives(False, False, False)) == (0, 1)

@@ -5,10 +5,13 @@ import pytest
 
 from app import agy, cache, claims as claims_module, compare, pipeline, priorart
 from app.chain import build_chain
-from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimResult, Document,
+from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimReport, ClaimResult, Document,
                         DocumentMapping, ElementMatch, EvidenceSpan)
+from app.claims import parse_claims
+from app.compare import DOCUMENT_BUDGET_CHARS
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
 from app.report import to_markdown
+from app.report import report_invariants
 from app.report import (_closest_related, _difference, _narrative, _reason_clause,
                         _summary_difference, _summary_similarity, build_claim_report,
                         build_mappings, refresh_mappings)
@@ -53,7 +56,10 @@ RESPONSES = {
          "quote": "", "chunk_id": "", "missing_limitations": [], "limitation_checks": checks(False)},
         {"label": "A", "judgment": "일부 유사", "directness": "inferred", "reason": "저장 관련 기재만 있음",
          "quote": "", "chunk_id": "", "limitation_checks": checks(False)},
-        {"label": "B", "judgment": "동일", "directness": "direct", "reason": "상태 변경 시 알림 전송을 개시함",
+        # 등급은 코드가 산출하므로 스텁도 judgment가 아니라 terminology를 넘긴다.
+        # 한정이 전부 개시된 상태에서 identical이면 "동일"이 산출된다.
+        {"label": "B", "terminology": "identical", "directness": "direct",
+         "reason": "상태 변경 시 알림 전송을 개시함",
          "quote": QUOTE_B, "chunk_id": "D2-P-0012", "missing_limitations": [],
          "limitation_checks": checks(True, QUOTE_B, "D2-P-0012")},
     ]},
@@ -255,11 +261,26 @@ def test_report_keeps_the_comparison_when_no_document_qualifies_as_primary():
 
 
 def test_second_run_reuses_the_cache_without_calling_the_cli(stub_cli):
+    """같은 입력이면 LLM을 **한 번도** 부르지 않는다.
+
+    종전에는 분해만 다시 불렀다("elements"). 그런데 분해 결과가 비교 캐시 키에 들어가므로,
+    다시 분해해서 문장이 한 글자라도 달라지면 그 뒤 판정 캐시가 전량 미스가 된다. 분해까지
+    입력 해시로 캐시해야 "같은 입력이면 같은 결과"가 실제로 성립한다.
+    """
     pipeline.analyze("job", CLAIMS, DOCUMENTS)
     stub_cli.clear()
     result = pipeline.analyze("job2", CLAIMS, DOCUMENTS)
-    assert stub_cli == ["elements"]                             # 비교 호출 없음
+    assert stub_cli == []
     assert result.cached_claims == [1]
+
+
+def test_force_redecompose_bypasses_the_decomposition_cache(monkeypatch, stub_cli):
+    """분해 프롬프트를 손볼 때는 캐시를 무시하고 다시 분해할 수 있어야 한다."""
+    pipeline.analyze("job", CLAIMS, DOCUMENTS)
+    stub_cli.clear()
+    monkeypatch.setattr(claims_module, "FORCE_REDECOMPOSE", True)
+    pipeline.analyze("job2", CLAIMS, DOCUMENTS)
+    assert stub_cli == ["elements"]                             # 분해만 다시, 비교는 캐시
 
 
 def test_multiple_dependent_claims_use_one_batch_comparison_and_stay_separate(monkeypatch, stub_cli):
@@ -396,7 +417,8 @@ def test_a_failed_batch_call_falls_back_to_per_cell_comparison(monkeypatch, stub
         if '"claims"' in prompt:                       # 일괄 경로만 실패시킨다
             raise RuntimeError("agy CLI의 response 필드가 JSON이 아닙니다")
         return {"matches": [
-            {"label": "A", "judgment": "동일", "directness": "direct", "reason": "우선순위 큐를 개시함",
+            {"label": "A", "terminology": "identical", "directness": "direct",
+             "reason": "우선순위 큐를 개시함",
              "quote": QUOTE_A, "chunk_id": "D1-P-0021",
              "limitation_checks": checks(True, QUOTE_A, "D1-P-0021")}]}
 
@@ -885,7 +907,13 @@ def test_a_stored_decomposition_keeps_the_comparison_cache_valid(monkeypatch, st
                                           decomposition=store)
     assert len(cells) == 2
 
-    # 분해를 물려주지 않으면 같은 청구항인데도 키가 달라져 전부 다시 판정한다.
+    # 분해를 물려주지 않아도 입력 해시 캐시가 같은 분해를 돌려주므로 키가 유지된다.
+    # 종전에는 여기서 청구항 문언이 그대로인데도 분해가 흔들려 전부 다시 판정했다(4).
+    pipeline.extend_with_dependent_claims(copy.deepcopy(base), combined, {2}, DOCUMENTS)
+    assert len(cells) == 2
+
+    # 강제 재분해를 켜면 그 안전장치가 풀리고 분해가 다시 흔들린다.
+    monkeypatch.setattr(claims_module, "FORCE_REDECOMPOSE", True)
     pipeline.extend_with_dependent_claims(copy.deepcopy(base), combined, {2}, DOCUMENTS)
     assert len(cells) == 4
 
@@ -1026,3 +1054,272 @@ def test_closest_passage_prefers_the_document_that_came_nearest():
 
     assert "인용발명 2" in related and "단락 [0151]" in related
     assert "컴퓨팅 장치" not in related
+
+
+# --- 문헌 축 일괄 구성대비 -------------------------------------------------------
+# 문헌 본문이 청구항 수만큼 반복해 실리는 것이 이 파이프라인 토큰 비용의 대부분입니다.
+# 문헌 축으로 묶으면 그 반복이 사라지지만, 응답 하나에 담기는 판정 수가 늘어 셀이 빠질
+# 위험이 커집니다. 아래 두 테스트가 지키는 것은 "빠진 셀이 조용히 사라지지 않는다"입니다.
+
+_BATCH_CLAIMS = ("【청구항 1】 요청을 큐에 저장하는 저장부를 포함하는 장치.\n"
+                 "【청구항 2】 제1항에 있어서, 상기 큐를 우선순위로 정렬하는 정렬부.")
+_BATCH_QUOTE = "The controller stores the request in a processing queue by priority order."
+_BATCH_DOCUMENTS = [Document(id="1", filename="prior.pdf", chunks=[
+    Chunk(document_id="1", chunk_id="D1-P-0001", page=1, paragraph="0001", text=_BATCH_QUOTE)])]
+
+
+def _batch_match(number: int) -> dict:
+    return {"claim_number": number, "label": "A", "directness": "direct", "quote": _BATCH_QUOTE,
+            "chunk_id": "D1-P-0001", "terminology": "equivalent", "different_purpose": False,
+            "limitation_checks": [{"index": 0, "disclosed": True, "quote": _BATCH_QUOTE,
+                                   "chunk_id": "D1-P-0001"}]}
+
+
+def _batch_importance() -> dict:
+    return {"elements": [{"claim_number": number, "label": "A", "importance": 5}
+                         for number in (1, 2)]}
+
+
+def _enable_batch(monkeypatch, size: int = 2) -> None:
+    monkeypatch.setattr(pipeline, "COMPARE_CLAIM_BATCH", size)
+
+
+def test_document_batch_sends_the_document_once_for_all_claims(monkeypatch):
+    """문헌 축으로 묶으면 문헌 본문이 청구항 수만큼 반복 전송되지 않는다."""
+    carrying_document = []
+
+    def fake(prompt: str, expect: str = "claims"):
+        if expect == "elements":
+            return _batch_importance()
+        if _BATCH_QUOTE in prompt:
+            carrying_document.append(prompt)
+        return {"matches": [_batch_match(1), _batch_match(2)]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", fake)
+    _enable_batch(monkeypatch)
+
+    result = pipeline.analyze("job", _BATCH_CLAIMS, _BATCH_DOCUMENTS)
+
+    # 청구항 축이었다면 문헌 본문이 청구항마다 한 번씩, 즉 두 번 실렸다.
+    assert len(carrying_document) == 1
+    assert [report.claim_number for report in result.reports] == [1, 2]
+
+
+def test_a_claim_missing_from_the_batch_reply_falls_back_to_a_single_call(monkeypatch):
+    """일괄 응답에서 빠진 청구항은 미판정으로 흘리지 않고 단건으로 다시 받는다."""
+    modes: list[str] = []
+
+    def fake(prompt: str, expect: str = "claims"):
+        if expect == "elements":
+            return _batch_importance()
+        if '"claims":' in prompt:                 # 문헌 축 일괄 프롬프트
+            modes.append("batch")
+            return {"matches": [_batch_match(1)]}  # 청구항 2를 일부러 뺀다
+        modes.append("single")
+        return {"matches": [_batch_match(2)]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", fake)
+    _enable_batch(monkeypatch)
+
+    result = pipeline.analyze("job", _BATCH_CLAIMS, _BATCH_DOCUMENTS)
+
+    assert modes == ["batch", "single"]
+    assert [report.claim_number for report in result.reports] == [1, 2]
+    assert all(report.chain.track != "analysis_incomplete" for report in result.reports)
+
+
+def test_batch_and_single_cells_are_cached_under_different_keys(monkeypatch):
+    """일괄로 받은 셀을 단건 키로 저장하면 두 프롬프트의 판정이 한 파일에서 섞인다."""
+    stored: list[str] = []
+
+    def fake(prompt: str, expect: str = "claims"):
+        if expect == "elements":
+            return _batch_importance()
+        return {"matches": [_batch_match(1), _batch_match(2)]}
+
+    for module in (compare, claims_module):
+        monkeypatch.setattr(module, "run_cli", fake)
+    monkeypatch.setattr(cache, "store", lambda key, cell: stored.append(key))
+    _enable_batch(monkeypatch)
+
+    pipeline.analyze("job", _BATCH_CLAIMS, _BATCH_DOCUMENTS)
+
+    claim = parse_claims(_BATCH_CLAIMS)[0]
+    single = cache.cache_key(claim, _BATCH_DOCUMENTS[0], "", DOCUMENT_BUDGET_CHARS, [],
+                             mode="single", samples=1)
+    assert stored and single not in stored
+
+
+# --- 선행기술 적격성 분류 ---------------------------------------------------------
+# 날짜는 오래 "나열만" 되었습니다. 그래서 대상 우선일 이후에 나온 문헌도, 후공개 선출원도
+# 통상 선행기술과 같은 칸에 들어갔습니다. 여기서도 자동 탈락은 시키지 않습니다 — 적격성은
+# 법역과 신규성·진보성 구분까지 봐야 정해지고 날짜 추출 실패도 흔하기 때문입니다.
+
+def _dated(document_id: str, published: str = "", filed: str = "") -> Document:
+    return Document(id=document_id, filename=f"D{document_id}.pdf",
+                    publication_date=published, filing_date=filed,
+                    chunks=[Chunk(document_id=document_id, chunk_id=f"D{document_id}-P-0001",
+                                  text="본문")])
+
+
+def test_a_document_published_after_the_priority_date_is_named_as_a_later_document():
+    from app import eligibility
+    category, detail = eligibility.classify_document(
+        _dated("1", published="2023-01-01", filed="2022-12-01"), "2022-06-01")
+    assert category == eligibility.LATER
+    assert "선행기술로 쓸 수 없습니다" in detail
+
+
+def test_a_secret_prior_application_is_not_filed_next_to_ordinary_prior_art():
+    """공개는 뒤지만 출원이 앞선 문헌은 신규성 근거로만 쓸 수 있어 칸을 나눠야 한다."""
+    from app import eligibility
+    category, detail = eligibility.classify_document(
+        _dated("1", published="2023-01-01", filed="2021-05-01"), "2022-06-01")
+    assert category == eligibility.SECRET_PRIOR_APPLICATION
+    assert "신규성 근거로만" in detail and "진보성" in detail
+
+
+def test_missing_dates_are_unknown_rather_than_eligible_or_ineligible():
+    """추출 실패를 적격으로 흘리면 없는 근거 위에 거절이 서고, 부적격으로 흘리면 문헌이 사라진다."""
+    from app import eligibility
+    category, _ = eligibility.classify_document(_dated("1"), "2022-06-01")
+    assert category == eligibility.UNKNOWN
+
+
+def test_eligibility_is_reported_but_never_filters_the_matrix(monkeypatch, stub_cli):
+    """분류는 보고서에 남기되 문헌을 선정에서 빼지는 않는다."""
+    later = Document(id="2", filename="later.pdf", publication_date="2030-01-01",
+                     filing_date="2029-01-01", chunks=DOCUMENTS[1].chunks)
+    result = pipeline.analyze("job", CLAIMS, [DOCUMENTS[0], later],
+                              priority_date="2022-06-01")
+    assert any("선행기술로 쓸 수 없습니다" in line for line in result.validation)
+    # 그래도 판정 자체는 수행되어 매트릭스에 남는다.
+    assert any(row.document_id == "2"
+               for coverage in result.reports[0].chain.element_coverage
+               for row in coverage.candidates)
+
+
+def test_an_unparseable_priority_date_suspends_classification_instead_of_guessing():
+    from app import eligibility
+    lines = eligibility.warnings([_dated("1", published="2020-01-01")], "2022년 6월")
+    assert len(lines) == 1 and "형식을 인식하지 못했습니다" in lines[0]
+
+
+def test_a_combination_that_leaves_a_gap_does_not_claim_it_was_resolved():
+    """본문의 "결합으로 해소됨"과 결론의 "차이가 남습니다"가 같은 구성을 두고 어긋나면 안 된다.
+
+    실측 보고서에서 구성 (B)가 정확히 그랬다. 본문은 주 인용발명의 누락만 보고 "해소됨"을
+    적었고, 결론은 채택 셀의 누락을 보고 잔존 차이로 적었다. 실제로는 두 한정 중 하나를
+    어느 문헌도 메우지 못한 상태였다.
+    """
+    mappings = [DocumentMapping(document_id="1", filename="primary.pdf", reference_number=1),
+                DocumentMapping(document_id="2", filename="supplement.pdf", reference_number=2)]
+    documents = {"2": Document(id="2", filename="supplement.pdf", chunks=[
+        Chunk(document_id="2", chunk_id="D2-P-0007", page=3, paragraph="0007", text="근거 원문")])}
+    primary = ElementMatch(claim_number=1, label="B", document_id="1", judgment="일부 차이",
+                           directness="direct", quote="주 인용발명 발췌", chunk_id="D1-P-0001",
+                           verify="verified",
+                           missing_limitations=["트레이닝 세트로 한정함", "도파관 모델링으로 한정함"])
+    # 보완 문헌이 앞의 한정만 메우고 "도파관 모델링"은 그대로 남긴 경우.
+    adopted = ElementMatch(claim_number=1, label="B", document_id="2", judgment="일부 차이",
+                           directness="direct", quote="보완 발췌", chunk_id="D2-P-0007",
+                           verify="verified", missing_limitations=["도파관 모델링으로 한정함"])
+
+    line = _difference(adopted, primary, True, mappings, documents)
+    assert "도파관 모델링으로 한정함" in line and "남음" in line
+    assert not line.endswith("결합으로 해소됨")
+
+    # 보완 문헌이 공백을 전부 메운 경우에는 종전 문장 그대로.
+    adopted.missing_limitations = []
+    assert _difference(adopted, primary, True, mappings, documents).endswith("결합으로 해소됨")
+
+
+def test_an_antecedent_cap_does_not_swallow_the_remaining_limitations():
+    """지시 관계 상한 문장이 실제 누락 한정을 대신해서는 안 된다.
+
+    종전 구현은 antecedent_note가 있으면 곧바로 반환했다. "이 경우 하위 한정은 전부 개시로
+    남아 있다(예: 2/2)"를 전제한 것인데, 실측에서 1/5인 셀이 나왔다. 그러면 보고서는
+    "선행 구성이 없어 완전 개시로 보지 않았다"만 적고 실제로 빠진 네 한정은 한 줄도 남기지
+    않아, 읽는 사람이 집계와 차이점 줄을 대조할 수 없게 된다.
+    """
+    mappings = [DocumentMapping(document_id="1", filename="d.pdf", reference_number=1)]
+    documents = {"1": Document(id="1", filename="d.pdf", chunks=[
+        Chunk(document_id="1", chunk_id="D1-P-0001", page=1, text="근거")])}
+    match = ElementMatch(
+        claim_number=1, label="C", document_id="1", judgment="일부 유사", directness="direct",
+        quote="발췌", chunk_id="D1-P-0001", verify="verified",
+        antecedent_note="같은 인용발명에서 구성 B의 대응이 확인되지 않아, 이를 참조하는 이 구성을 "
+                        "완전 개시로 보지 않았습니다",
+        missing_limitations=["학습된 뉴럴 네트워크에 입력될 이미지로 한정함",
+                             "타겟 균일도 이미지의 출력을 목적으로 한정함"])
+
+    line = _difference(match, None, False, mappings, documents)
+    assert "구성 B의 대응이 확인되지 않아" in line          # 상한 사유는 그대로 남고
+    assert "학습된 뉴럴 네트워크에 입력될 이미지로 한정함" in line   # 누락 한정도 함께 나온다
+    assert "타겟 균일도 이미지의 출력을 목적으로 한정함" in line
+
+    # 누락 한정이 없으면 종전처럼 상한 사유만 적는다.
+    match.missing_limitations = []
+    assert _difference(match, None, False, mappings, documents) == match.antecedent_note
+
+
+def test_batch_cells_judged_in_a_different_grouping_do_not_share_a_cache_key():
+    """일괄 프롬프트에는 형제 청구항이 함께 실린다. 묶음이 다르면 같은 셀도 다른 프롬프트다."""
+    claim = parse_claims(_BATCH_CLAIMS)[0]
+    document = _BATCH_DOCUMENTS[0]
+    args = (claim, document, "", DOCUMENT_BUDGET_CHARS, [])
+    alone = cache.cache_key(*args, mode="document-batch", samples=1, cohort=[1, 2])
+    wider = cache.cache_key(*args, mode="document-batch", samples=1, cohort=[1, 2, 3])
+    assert alone != wider
+
+
+def test_claim_grouping_does_not_depend_on_what_is_already_cached(monkeypatch):
+    """묶음이 캐시 상태를 따라 달라지면 같은 셀이 실행마다 다른 프롬프트로 판정된다.
+
+    그러면 키에 적은 cohort와 실제 프롬프트가 어긋나, 서로 다른 프롬프트의 판정이 한 키를
+    공유하게 된다.
+    """
+    monkeypatch.setattr(pipeline, "COMPARE_CLAIM_BATCH", 2)
+    claims = parse_claims(_BATCH_CLAIMS)
+    assert [[c.number for c in g] for g in pipeline._claim_groups(claims)] == [[1, 2]]
+    # 청구항이 하나 더 붙어도 앞 묶음은 그대로다(고정 규칙이므로).
+    more = claims + [Claim(number=3, elements=[ClaimElement(label="A", text="구성")])]
+    assert [[c.number for c in g] for g in pipeline._claim_groups(more)] == [[1, 2], [3]]
+
+
+# --- 보고서 자기모순 자동 감지 ------------------------------------------------------
+# 이 파이프라인의 버그 두 건은 계산이 틀린 것이 아니라 본문과 결론이 서로 다른 자료를 본
+# 것이었고, 둘 다 테스트가 아니라 보고서를 눈으로 읽다가 발견됐다. 조립 직후에 기계적으로
+# 맞춰 보면 같은 유형이 다시 새어 나가지 않는다.
+
+def _assembled(difference: str | None, disclosed: int, total: int,
+               residual: list[str], missing: list[str] | None = None) -> ClaimReport:
+    return ClaimReport(
+        claim_number=1, track="inventive_step_combination",
+        chain=ChainInfo(claim_number=1, primary="1", residual=residual),
+        claims=[ClaimResult(label="B", claim="구성 B", corresponded=True,
+                            disclosed_limitations=disclosed, total_limitations=total,
+                            missing_limitations=missing or [],
+                            grade="일부 차이", emoji="🟠", narrative="서술",
+                            difference=difference, status="부분 개시")])
+
+
+def test_a_conclusion_that_contradicts_the_body_is_flagged():
+    """실제로 나간 보고서: 결론은 'B에 차이가 남습니다', 본문은 '결합으로 해소됨'."""
+    notes = report_invariants([_assembled("인용발명 2의 결합으로 해소됨", 3, 3, ["B"])])
+    assert any("결합으로 해소되었다고 적었는데" in note for note in notes)
+
+
+def test_a_missing_limitation_with_no_difference_line_is_flagged():
+    """실제로 나간 보고서: 집계는 1/5인데 차이점 줄에 빠진 한정이 하나도 없었다."""
+    notes = report_invariants([_assembled("같은 인용발명에서 구성 A의 대응이 확인되지 않았습니다",
+                                          1, 5, [], missing=["학습된 NN에 입력될 이미지로 한정함"])])
+    assert any("본문에 빠진 한정이 적히지 않았습니다" in note for note in notes)
+
+
+def test_a_consistent_report_produces_no_note():
+    assert report_invariants([_assembled("도파관 모델링 한정은 결합 후에도 남음", 2, 3, ["B"],
+                                        missing=["도파관 모델링 한정"])]) == []
+    assert report_invariants([_assembled(None, 3, 3, [])]) == []

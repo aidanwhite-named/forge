@@ -25,11 +25,16 @@ from .models import Chunk, Document
 # 종류 코드는 반드시 문자+숫자(A1·B1·B2)여야 합니다. 문자 하나만 허용하면 뒤따르는
 # 제목의 첫 글자를 종류 코드로 삼켜버립니다("US 11,456,887 VIRTUAL…" → "US 11,456,887 V").
 _DOCUMENT_NUMBER_PATTERNS = (
-    re.compile(r"\b(US\s*(?:20)?\d{2}\s*/?\s*\d{6,7}(?:\s+[A-Z]\d)?)", re.IGNORECASE),
+    # 구형 US 공보는 PDF 추출 시 일련번호 한가운데가 갈립니다
+    # ("US 2010/01 78024 A1"). 숫자 사이 공백은 정규화 단계에서 제거합니다.
+    re.compile(r"\b(US\s*(?:20)?\d{2}\s*/?\s*(?:\d\s*){6,7}(?:[A-Z]\d)?)", re.IGNORECASE),
     re.compile(r"\b(US\s*\d{1,2}\s*,?\s*\d{3}\s*,?\s*\d{3}(?:\s+[A-Z]\d)?)", re.IGNORECASE),
     re.compile(r"\b(WO\s*\d{4}\s*/?\s*\d{6}(?:\s+[A-Z]\d)?)", re.IGNORECASE),
     re.compile(r"\b(EP\s*\d{7}(?:\s+[A-Z]\d)?)", re.IGNORECASE),
-    re.compile(r"\b(CN\s*\d{8,10}\s*[A-Z]?\d?)", re.IGNORECASE),
+    # CN 공개번호는 7자리인 구형 공보(CN1874517A)부터 9자리 최신 공보까지 있으며,
+    # Google Patents PDF에는 뒤쪽에 12자리 출원번호도 함께 나타납니다. 먼저 나온 공개번호를
+    # 보존하려면 7자리부터 인식해야 합니다.
+    re.compile(r"\b(CN\s*\d{7,12}\s*[A-Z]?\d?)", re.IGNORECASE),
     re.compile(r"\b((?:JP|CN)\s*\d{4}\s*-?\s*\d{6,7}(?:\s+[A-Z]?\d)?)", re.IGNORECASE),
     re.compile(r"(10\s*-\s*\d{4}\s*-\s*\d{7})"),
     re.compile(r"(10\s*-\s*\d{7})"),
@@ -38,6 +43,14 @@ _DOCUMENT_NUMBER_PATTERNS = (
 # 먼저 적용하면 한국 공개번호 대신 PCT/US 번호를 대표 문헌번호로 잘못 고릅니다. 공보가
 # 자기 번호라고 명시한 (11) 공개번호·등록번호는 국가별 일반 패턴보다 우선합니다.
 _LABELED_DOCUMENT_NUMBER_PATTERNS = (
+    # 등록·공고번호(10-2364425)는 연도 자리가 없는 7자리라, 아래 공개번호 패턴이 잡지
+    # 못합니다. 그대로 두면 일반 패턴이 같은 표지의 **출원번호**(10-2020-0120051)를 먼저
+    # 집어, 등록특허공보의 대표 번호가 출원번호로 보고서에 실렸습니다. 등록번호가 적혀
+    # 있다는 것은 등록공보라는 뜻이므로 공개번호보다 먼저 봅니다.
+    re.compile(
+        r"(?:\(\s*11\s*\)\s*)?(?:등록번호|공고번호)\s*[:：]?\s*"
+        r"(10\s*-\s*\d{7})(?!\s*[-\d])"
+    ),
     re.compile(
         r"(?:\(\s*11\s*\)\s*)?(?:공개번호|등록번호|공고번호)\s*[:：]?\s*"
         r"(10\s*-\s*\d{4}\s*-\s*\d{7})"
@@ -245,7 +258,16 @@ def extract_document_number(text: str) -> str:
 
 
 def _normalize_document_number(value: str) -> str:
-    """PDF 추출기가 구분자 둘레에 넣은 공백만 제거합니다."""
+    """PDF 추출기가 번호 내부에 넣은 공백을 공보 표준 표기로 복원합니다."""
+    compact = re.sub(r"\s+", "", str(value or "")).upper()
+    us_publication = re.fullmatch(r"US((?:20)?\d{2})/?(\d{6,7})([A-Z]\d)?", compact)
+    if us_publication:
+        year, serial, kind = us_publication.groups()
+        return f"US {year}/{serial}" + (f" {kind}" if kind else "")
+    cn_number = re.fullmatch(r"CN(\d{7,12})([A-Z]\d?)?", compact)
+    if cn_number:
+        digits, kind = cn_number.groups()
+        return f"CN {digits}" + (f" {kind}" if kind else "")
     number = re.sub(r"\s*([/,-])\s*", r"\1", re.sub(r"\s+", " ", value))
     return number.strip()
 
@@ -259,7 +281,11 @@ def extract_dates(text: str, doc_type: str = "technical") -> tuple[str, str]:
     head = text[:6000]
     publication = _labeled_date(
         head,
+        # 등록·설정공고된 문헌은 공개일자 없이 공고일자만 적힌 경우가 흔합니다(한국 등록특허공보,
+        # 중국 실용신안 授权公告日). 그것을 빼 두면 등록공보의 공개일이 통째로 비고, 선행기술
+        # 적격성 분류가 전부 '날짜 불명'으로 떨어집니다. 실측 4문헌 중 3문헌이 그랬습니다.
         (r"(?:申请公布日|公开日|Publication\s+Date|(?<!국제)공개일자|(?<!국제)공개일)\s*[:：]?\s*",
+         r"(?:授权公告日|公告日|(?<!국제)공고일자|(?<!국제)공고일)\s*[:：]?\s*",
          r"(?:Published|Publication)\s*[:：]?\s*"),
     )
     filing = _labeled_date(
@@ -297,8 +323,12 @@ def _us_header_publication_date(text: str) -> str:
     publication_year = int(year_match.group(1))
     month = (r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?")
+    # US 공보의 공개일은 표지가 아니라 **각 면의 running header**에 있습니다. 2단 조판을
+    # 복원하면서 그 머리말이 "Jul\n. 7. 2022"처럼 쪼개지고, 일(日)과 연(年) 사이가 쉼표가
+    # 아니라 마침표로 추출됩니다. 종전 패턴은 쉼표와 붙은 공백만 허용해서 실측 US 공보의
+    # 공개일을 한 건도 잡지 못했고, 그 결과 선행기술 적격성 분류가 '날짜 불명'이 됐습니다.
     for found in re.finditer(
-            rf"\b({month})\.?\s+(\d{{1,2}}),\s+(20\d{{2}})\b", text, re.IGNORECASE):
+            rf"\b({month})\s*\.?\s*(\d{{1,2}})\s*[.,]\s*(20\d{{2}})\b", text, re.IGNORECASE):
         if int(found.group(3)) != publication_year:
             continue
         try:

@@ -469,6 +469,25 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 }
 .quality { background: var(--surface-soft); }
 .reference-chip { color: #fff; background: var(--green); }
+/* 구성 라벨 배지. 한 글자는 정원, '전제부'처럼 긴 것은 알약 모양으로 늘어납니다. */
+.badge {
+  min-width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+/* 등급 색. backend REPORT_GRADES의 이모지 색을 따르되, 글자가 읽히도록 명도를 낮췄습니다. */
+.badge.tone-identical { color: #fff; background: #2b6fb8; }
+.badge.tone-substantial { color: #fff; background: #35804a; }
+.badge.tone-variation { color: #fff; background: #b85c07; }
+.badge.tone-partial { color: #4a3a05; background: #f2c230; }
+.badge.tone-none { color: #5d6663; border-color: var(--line-dark); background: #e2e6e1; }
+.badge.tone-unjudged { color: #fff; background: var(--danger); }
 /* 선행기술 결과의 실재 확인 표시. 확인하지 못한 것을 감추지 않고 그대로 구분해 보입니다. */
 .verify-chip { padding: 4px 8px; border-radius: 999px; font-size: 10px; font-weight: 800; white-space: nowrap; }
 .verify-chip.verified { color: #2c5c22; background: #e8f6df; }
@@ -582,8 +601,7 @@ details > summary::-webkit-details-marker { display: none; }
 
 .settings { max-width: 780px; }
 .settings label { display: block; margin-bottom: 22px; font-size: 13px; font-weight: 800; }
-.settings select,
-.settings input {
+.settings select {
   min-width: 280px;
   margin-left: 16px;
   padding: 10px 12px;
@@ -650,8 +668,7 @@ footer {
   .log-viewer { min-height: 0; grid-template-columns: 1fr; }
   .log-list { max-height: 230px; border-right: 0; border-bottom: 1px solid var(--line); }
   .log-content pre { min-height: 360px; }
-  .settings select,
-  .settings input { display: block; width: 100%; min-width: 0; margin: 8px 0 0; }
+  .settings select { display: block; width: 100%; min-width: 0; margin: 8px 0 0; }
   .settings .ghost { margin: 8px 0 0; }
 }
 
@@ -661,4 +678,40 @@ footer {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* 대상 출원일·우선일. 청구항 카드 안에 붙는 보조 입력이라 본 입력보다 작게 둡니다.
+   grid로 두면 한 줄 전체를 차지하는 설명문(small)의 max-content가 라벨 트랙까지 부풀려
+   입력이 라벨에서 700px 떨어진 자리에 놓입니다. flex로 두고 설명문만 다음 줄로 내립니다. */
+.input-card .field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 14px;
+}
+.input-card .field-row label { color: var(--ink); font-size: 13px; font-weight: 700; }
+.input-card .field-row input[type="date"] {
+  /* date 입력은 네이티브 위젯으로 그려져서, 이걸 끄지 않으면 author의 border·background가
+     UA 스타일(회색 테두리·흰 배경)에 밀립니다. 같은 카드의 textarea와 톤을 맞추려면 필요합니다. */
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  color: var(--ink);
+  /* date 입력은 UA 스타일이 흰 배경을 넣습니다. 같은 카드의 textarea와 톤을 맞추려면
+     타입 선택자까지 붙여 특이도를 올려야 합니다. */
+  background: #fafbf9;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  transition: border-color .2s ease, box-shadow .2s ease, background .2s ease;
+}
+.input-card .field-row small {
+  flex-basis: 100%;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.65;
 }

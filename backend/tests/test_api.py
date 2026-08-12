@@ -36,7 +36,7 @@ def post_job():
 
 
 def fake_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                decomposition=None, cache_keys=None):
+                decomposition=None, cache_keys=None, priority_date=""):
     if progress:
         progress("구성대비 1/1")
     if decomposition is not None:
@@ -64,7 +64,7 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
     entered = threading.Event()
 
     def slow_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                    decomposition=None, cache_keys=None):
+                    decomposition=None, cache_keys=None, priority_date=""):
         entered.set()
         while not agy.is_cancelled(job_id):
             time.sleep(0.01)
@@ -205,7 +205,7 @@ def test_an_interrupted_job_reports_why_instead_of_404(monkeypatch):
 def test_cell_progress_is_exposed_as_numbers(monkeypatch):
     """진행률을 문자열에만 담으면 화면이 진행 바를 그릴 수 없습니다."""
     def analyze_with_progress(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                              decomposition=None, cache_keys=None):
+                              decomposition=None, cache_keys=None, priority_date=""):
         progress("구성대비 3/8 — 청구항 1 × prior.pdf", 3, 8)
         assert client.get(f"/api/jobs/{job_id}").json()["progress"] == {"done": 3, "total": 8}
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])

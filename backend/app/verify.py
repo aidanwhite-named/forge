@@ -7,6 +7,7 @@
 import re
 from functools import lru_cache
 
+from .coverage import JUDGMENT_RANK, judgment_at_rank
 from .models import Document, ElementMatch, missing_limitations
 from .pdf import chunk_text, document_corpus
 
@@ -14,8 +15,6 @@ MIN_QUOTE_LEN = 15
 MIN_SEGMENT_LEN = 12
 # 검증에 실패한 근거로는 이 등급을 넘는 판정을 인정하지 않습니다.
 UNVERIFIED_JUDGMENT_CAP = "일부 차이"
-_RANK = {"대응 없음": 0, "차이": 1, "일부 유사": 2, "일부 차이": 3, "실질적 동일": 4, "동일": 5}
-_BY_RANK = {rank: judgment for judgment, rank in _RANK.items()}
 # 낱말을 잇는 구분자. 추출 과정에서 생겼는지 원문에 있었는지 구분할 수 없으므로 함께 지웁니다.
 _SEPARATOR_RE = re.compile(r"[^0-9a-z가-힣]+")
 
@@ -43,7 +42,7 @@ def _collapsed_corpus(normalized_corpus: str) -> str:
     return _SEPARATOR_RE.sub("", normalized_corpus)
 
 
-def is_verbatim(quote: str, corpus: str, min_segment_len: int = MIN_SEGMENT_LEN) -> bool:
+def is_verbatim(quote: str, corpus: str) -> bool:
     """'…'로 축약된 각 구간이 모두 원문에 그대로 존재할 때만 참입니다."""
     normalized_corpus = normalize(corpus)
     if not normalized_corpus:
@@ -52,7 +51,7 @@ def is_verbatim(quote: str, corpus: str, min_segment_len: int = MIN_SEGMENT_LEN)
         normalize(re.sub(r"^\s*\[[^\]]+\]\s*", "", segment))
         for segment in re.split(r"\s*(?:…|\.{3,})\s*", str(quote or ""))
     ]
-    segments = [segment for segment in segments if len(segment) >= min_segment_len]
+    segments = [segment for segment in segments if len(segment) >= MIN_SEGMENT_LEN]
     if not segments:
         return False
     if all(segment in normalized_corpus for segment in segments):
@@ -247,13 +246,13 @@ def _status(quote: str, corpus: str) -> str:
 
 def _cap(match: ElementMatch, notes: list[str], reason: str, document_label: str = "") -> None:
     """검증되지 않은 근거의 판정에 상한을 씌웁니다."""
-    limit = _RANK[UNVERIFIED_JUDGMENT_CAP]
+    limit = JUDGMENT_RANK[UNVERIFIED_JUDGMENT_CAP]
     if match.directness == "absent":
-        limit = min(limit, _RANK["차이"])
-    if _RANK.get(match.judgment, 0) <= limit:
+        limit = min(limit, JUDGMENT_RANK["차이"])
+    if JUDGMENT_RANK.get(match.judgment, 0) <= limit:
         return
     match.downgraded_from = match.judgment
-    match.judgment = _BY_RANK[limit]
+    match.judgment = judgment_at_rank(limit)
     source = document_label or f"문서 ID {match.document_id}"
     notes.append(f"청구항 {match.claim_number} ({match.label}) / {source}: "
                  f"{match.downgraded_from} → {match.judgment} ({reason})")

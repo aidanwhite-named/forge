@@ -50,7 +50,11 @@ def test_remote_sensing_outcome_quotes_do_not_entail_local_model_generation_or_m
     notes = validate_entailment(matches, {"1": document})
 
     assert [match.judgment for match in matches] == ["차이", "차이"]
-    assert [match.directness for match in matches] == ["absent", "absent"]
+    # direct는 유지될 수 없지만 absent로도 내리지 않습니다. absent는 "근거 원문이 없음"인데
+    # 이 셀에는 원문 대조를 통과한 발췌가 그대로 남아 있고, absent로 내리면 그 문헌이 보조
+    # 인용발명으로 기여할 자격까지 잃습니다(coverage.ineligible_reason). compare._build_matches가
+    # 같은 조건에서 쓰는 강등과 맞춥니다.
+    assert [match.directness for match in matches] == ["inferred", "inferred"]
     assert all(not match.limitation_checks[0].disclosed for match in matches)
     assert all(match.limitation_checks[0].semantic_status == "rejected" for match in matches)
     assert len(notes) == 2
@@ -99,6 +103,57 @@ def test_sensors_staged_evidence_bundle_can_entail_the_grouping_limitation(monke
     assert not (cache.ENTAILMENT_CACHE_DIR / f"{digest}.json").exists()
 
 
+def test_a_verified_quote_carries_its_local_paragraph_context_into_entailment(monkeypatch):
+    """US2010 [0033] 회귀: 짧은 프리뷰 발췌 때문에 같은 단락의 편집-버퍼 연결을 버리지 않는다."""
+    quote = ("The real time engine 166 provides a preview of the output video sequence by "
+             "rendering the output video sequence in substantially real time.")
+    paragraph = (
+        "0033. " + quote + " To render frames, the real time engine 166 decodes frames, applies "
+        "effects, and composites frames. The real time engine 166 can allocate buffers dynamically. "
+        "For example, a decode buffer, an effects buffer, and a composite buffer can be allocated "
+        "a different capacity on-the-fly for each video segment."
+    )
+    document = _document("2", "US20100178024A1.pdf", [paragraph])
+    match = ElementMatch(
+        claim_number=1, label="D", document_id="2", judgment="실질적 동일", directness="direct",
+        quote=quote, chunk_id="D2-B-p001-01", limitation_checks=[LimitationCheck(
+            index=0, kind="core",
+            limitation="제1 프레임 버퍼들을 이용하여 멀티미디어 데이터의 비디오 편집을 수행함",
+            disclosed=True, quote=quote, chunk_id="D2-B-p001-01")])
+    verify_matches([match], {"2": document})
+
+    def fake(prompt, expect="entailments"):
+        assert expect == "entailments"
+        assert '"source_context"' in prompt
+        assert "applies effects, and composites frames" in prompt
+        assert "an effects buffer, and a composite buffer" in prompt
+        return {"entailments": [{
+            "item_id": "1:D:0", "supported": True,
+            "relation": "functional_equivalent", "directness": "direct",
+            "reason": "같은 단락이 효과 적용·합성과 이에 사용되는 효과·합성 버퍼를 함께 개시한다.",
+        }]}
+
+    monkeypatch.setattr(entailment, "run_cli", fake)
+    notes = validate_entailment([match], {"2": document})
+
+    assert notes == []
+    assert match.judgment == "실질적 동일" and match.directness == "direct"
+    assert match.limitation_checks[0].semantic_status == "accepted"
+
+
+def test_source_context_is_limited_around_the_verified_quote():
+    """비정상적으로 큰 청크도 검증 프롬프트를 무제한 키우지 않는다."""
+    prefix = "p" * 8000
+    quote = "verified relation between the editing operation and buffers"
+    suffix = "s" * 8000
+    document = _document("9", "large.pdf", [prefix + quote + suffix])
+
+    context = entailment._source_context(document, "D9-B-p001-01", quote)
+
+    assert len(context) == entailment.MAX_SOURCE_CONTEXT_CHARS
+    assert quote in context
+
+
 _WHOLE = ("We use a normalized-cut algorithm to divide the camera graph into multiple subgraphs "
           "so that each subgraph can be reconstructed independently.")
 
@@ -124,7 +179,7 @@ def test_a_rejected_whole_element_check_is_reflected_in_the_judgment(monkeypatch
          "directness": "inferred", "reason": "그래프를 나눈다는 기재만 있고 GNSS·상대정합 기준이 없다."}]})
     notes = validate_entailment([match], {"1": document})
 
-    assert match.judgment == "차이" and match.directness == "absent"
+    assert match.judgment == "차이" and match.directness == "inferred"
     assert match.downgraded_from == "실질적 동일"
     assert match.limitation_checks[0].semantic_status == "rejected"
     # whole_element의 실패는 누락 '한정'이 아니라 구성 자체의 미개시라 누락 목록에는 올리지 않는다.
@@ -255,7 +310,7 @@ def test_reference_terms_are_omitted_for_elements_that_introduce_their_own_subje
     # (E)는 "상기 구동 모터"를 참조하지만 그 구성은 이 청구항 행렬 앞자리에 없으므로 비어야 한다.
     # 프롬프트 본문에는 규칙 설명으로 낱말이 나오므로 CONTEXT의 JSON 키만 확인합니다.
     assert '"reference_terms"' not in seen[0]
-    assert match.judgment == "차이" and match.directness == "absent"
+    assert match.judgment == "차이" and match.directness == "inferred"
 
 
 def test_an_unchecked_limitation_restores_the_recovery_downgrade(monkeypatch):
@@ -273,3 +328,46 @@ def test_an_unchecked_limitation_restores_the_recovery_downgrade(monkeypatch):
     assert match.limitation_checks[0].semantic_status == "error"
     assert match.directness == "inferred"     # 복구된 근거는 검증 없이 직접 개시로 두지 않는다
     assert match.judgment == "실질적 동일"      # 다만 비교 판정 자체를 없애지는 않는다
+
+
+def test_a_document_keeps_supplement_eligibility_for_limitations_it_verifiably_discloses(monkeypatch):
+    """core가 기각돼도, 원문으로 검증해 개시한 한정까지 보조 인용발명 자격을 잃어서는 안 된다.
+
+    실측(스마트 윈도우 청구항 × KR101276566): 인용발명 2의 (B)는 core "외부에서 인가되는 전압을
+    컨트롤 박스로 인가하거나 차단하는 부재를 포함함"이 기각됐지만, qualifier 두 건은 원문 대조를
+    통과해 개시가 인정됐고 그 두 건이 바로 주 인용발명이 놓친 한정이었다. 종전에는 이 단계가
+    directness를 absent로 내려 coverage.ineligible_reason이 "직접 근거 없음"으로 걸러 냈고,
+    문헌은 자기가 실제로 개시한 한정조차 보완하지 못했다. 더 나쁜 것은 chain._residual_overflow가
+    미채택 문헌의 개시를 "결합 문헌 수 상한을 넘어 세우지 않았다"고 적어, 자격 탈락을 상한 탓으로
+    잘못 설명한 점이다.
+    """
+    core_quote = "제1 몸체(101)는 원격조종 자동차의 전원부를 제어하기 위한 제어부와 전기적으로 연결된다."
+    switch_quote = ("제1 스위치 버튼(104)이 제1 몸체(101)의 내측으로 눌리는 경우 제1 몸체(101)의 "
+                    "능동형 스위치 회로가 개방되고, 원위치로 복귀되면 단락된다.")
+    document = _document("2", "KR101276566B1.pdf", [core_quote, switch_quote])
+    match = ElementMatch(
+        claim_number=1, label="B", document_id="2", judgment="실질적 동일", directness="direct",
+        quote=core_quote, chunk_id="D2-B-p001-01", limitation_checks=[
+            LimitationCheck(index=0, kind="core",
+                            limitation="외부에서 인가되는 전압을 컨트롤 박스로 인가하거나 차단하는 부재를 포함함",
+                            disclosed=True, quote=core_quote, chunk_id="D2-B-p001-01"),
+            LimitationCheck(index=1, kind="qualifier",
+                            limitation="전압 인가 및 차단 여부를 스위치의 작동 상태에 따라 결정함",
+                            disclosed=True, quote=switch_quote, chunk_id="D2-B-p002-01"),
+        ])
+    verify_matches([match], {"2": document})
+
+    monkeypatch.setattr(entailment, "run_cli", lambda prompt, expect="entailments": {"entailments": [
+        {"item_id": "1:B:0", "supported": False, "relation": "unsupported", "directness": "inferred",
+         "reason": "상대 부재로 전압을 넘기는 전력 경로가 아니라 자기 기기의 전원부를 제어한다."},
+        {"item_id": "1:B:1", "supported": True, "relation": "functional_equivalent",
+         "directness": "direct", "reason": "버튼의 눌림 상태로 회로가 개폐된다."}]})
+    validate_entailment([match], {"2": document})
+
+    from app.coverage import disclosed_limitations, ineligible_reason, is_eligible_supplement
+
+    assert match.judgment == "차이"                       # core가 기각됐으므로 대응으로는 세지 않는다
+    assert match.directness == "inferred"                 # 그러나 근거 원문은 남아 있다
+    assert ineligible_reason(match) == ""
+    assert is_eligible_supplement(match)                  # 개시한 한정으로는 보완할 수 있어야 한다
+    assert disclosed_limitations(match) == {"전압 인가 및 차단 여부를 스위치의 작동 상태에 따라 결정함"}

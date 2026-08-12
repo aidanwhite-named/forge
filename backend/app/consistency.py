@@ -17,10 +17,9 @@
 """
 import re
 
-from .coverage import JUDGMENT_RANK, has_correspondence
+from .coverage import JUDGMENT_RANK, has_correspondence, judgment_at_rank
 from .models import Claim, ElementMatch
 
-_BY_RANK = {rank: judgment for judgment, rank in JUDGMENT_RANK.items()}
 # 지시 대상 어구가 끝나는 자리. 조사·연결어미를 만나면 거기까지가 대상입니다.
 # 위치 관계를 나타내는 명사(사이·중·간·내·외)는 뒤에 조사가 바로 붙어 공백이 없으므로
 # 따로 끊습니다. 끊지 않으면 "제2 반사부재 사이"가 통째로 지시 대상이 되어, 정작 앞
@@ -101,6 +100,64 @@ def antecedents(claim: Claim) -> dict[str, list[str]]:
     return links
 
 
+# --- 교차문헌 일관성 ----------------------------------------------------------
+# 같은 한정을 놓고 문헌마다 어긋난 판정이 나오는 것을 찾아 남깁니다. 보고할 최대 건수만
+# 제한합니다 — 이 노트가 구성대비 결과보다 길어지면 읽히지 않습니다.
+MAX_DIVERGENCE_NOTES = 12
+
+
+def cross_document_notes(matches: list[ElementMatch],
+                         filenames: dict[str, str] | None = None) -> list[str]:
+    """같은 한정이 한 문헌에서는 개시로, 다른 문헌에서는 미개시로 갈린 경우를 남깁니다.
+
+    의미검증(entailment.validate_entailment)은 **문헌별로 따로 호출**됩니다. 어떤 문헌을
+    심사하는 호출은 다른 문헌에 대해 무엇을 인정했는지 볼 수 없으므로, 같은 성격의 기재가
+    한쪽에서는 인정되고 다른 쪽에서는 기각되는 일이 구조적으로 생깁니다. 실측에서 한 문헌의
+    보정 행렬은 개시로 인정되고, 같은 한정에 대해 다른 문헌의 보정 맵은 "그 동작이 없다"는
+    이유로 기각됐습니다. 프롬프트에 "일관되게 판단하라"고 적어도 호출이 갈려 있으면 닿지
+    않습니다.
+
+    **자동으로 되돌리지 않습니다.** 어느 쪽이 옳은지는 원문을 읽어야 정해지고, 코드가 한쪽으로
+    맞추면 지금까지 되풀이된 과잉 교정·과소 교정을 한 번 더 하게 됩니다. 갈린 사실과 양쪽
+    근거를 나란히 남겨 읽는 사람이 판단하게 하는 것이 이 함수의 전부입니다.
+    """
+    names = filenames or {}
+    grouped: dict[tuple[int, str, int, str], dict[str, tuple[str, str]]] = {}
+    for match in matches:
+        if match.error:
+            continue
+        for check in match.limitation_checks:
+            if check.semantic_status not in {"accepted", "rejected"}:
+                continue
+            key = (match.claim_number, match.label, check.index, check.limitation)
+            grouped.setdefault(key, {})[match.document_id] = (
+                check.semantic_status, check.quote or check.semantic_note)
+
+    notes: list[str] = []
+    for (claim_number, label, _, limitation), verdicts in sorted(grouped.items()):
+        accepted = sorted(document_id for document_id, (status, _) in verdicts.items()
+                          if status == "accepted")
+        rejected = sorted(document_id for document_id, (status, _) in verdicts.items()
+                          if status == "rejected")
+        if not accepted or not rejected:
+            continue
+        if len(notes) >= MAX_DIVERGENCE_NOTES:
+            notes.append(f"이 밖에도 문헌 간 판정이 갈린 한정이 더 있습니다. "
+                         f"(표시 상한 {MAX_DIVERGENCE_NOTES}건)")
+            break
+        shown = []
+        for document_id in (*accepted, *rejected):
+            status, detail = verdicts[document_id]
+            mark = "인정" if status == "accepted" else "기각"
+            shown.append(f"{names.get(document_id, f'문헌 {document_id}')}({mark}: "
+                         f"{(detail or '').strip()[:110]})")
+        notes.append(
+            f"청구항 {claim_number} ({label}) 한정 '{limitation[:60]}'의 판정이 문헌 간에 "
+            f"갈렸습니다 — {' / '.join(shown)}. 의미검증은 문헌별로 따로 수행되므로 서로의 "
+            "판단을 보지 못합니다. 같은 성격의 기재인지 원문으로 확인하십시오.")
+    return notes
+
+
 def enforce_antecedents(claim: Claim, matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
     """선행 구성이 대응되지 않은 문헌에서는 그것을 참조하는 구성도 개시로 세지 않습니다.
 
@@ -130,14 +187,15 @@ def enforce_antecedents(claim: Claim, matrix: dict[str, dict[str, ElementMatch]]
             capped = max(min(JUDGMENT_RANK.get(match.judgment, 0), limit), floor)
             if capped >= JUDGMENT_RANK.get(match.judgment, 0):
                 continue
+            match.antecedent_capped_from = match.judgment
             match.downgraded_from = match.downgraded_from or match.judgment
             notes.append(f"청구항 {claim.number} ({label}) / 문헌 {document_id}: "
-                         f"{match.judgment} → {_BY_RANK[capped]} "
+                         f"{match.judgment} → {judgment_at_rank(capped)} "
                          f"(참조 구성 {', '.join(unresolved)}이 같은 문헌에서 대응되지 않음)")
             # 보고서에도 남깁니다. 적지 않으면 "한정은 전부 개시인데 등급만 낮은" 결과가
             # 이유 없이 보이고, 읽는 사람은 집계와 등급 중 어느 쪽이 맞는지 알 수 없습니다.
             match.antecedent_note = (
                 f"같은 인용발명에서 구성 {', '.join(unresolved)}의 대응이 확인되지 않아, "
                 "이를 참조하는 이 구성을 완전 개시로 보지 않았습니다")
-            match.judgment = _BY_RANK[capped]
+            match.judgment = judgment_at_rank(capped)
     return notes
