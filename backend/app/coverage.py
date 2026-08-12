@@ -50,6 +50,9 @@ VERIFY_OK = {"verified", "partial"}          # 발췌가 원문에 실재한다�
 NO_CORRESPONDENCE_JUDGMENTS = {"대응 없음", "차이"}
 # 보완 이득 가중치. 판정 단계 상승을 가장 크게, 나머지는 근거 품질 개선으로 봅니다.
 GAIN_WEIGHTS = {"judgment": 1.00, "directness": 0.35, "evidence": 0.25, "missing": 0.20}
+# 한정 단위 보완의 가중치(limitation_gain). 누락 한정을 **전부** 메웠을 때의 값이며,
+# 판정 1등급 상승(GAIN_WEIGHTS["judgment"] = 1.00)보다 낮게 둡니다.
+LIMITATION_GAIN_WEIGHT = 0.60
 
 
 def judgment_at_rank(rank: int) -> str:
@@ -92,15 +95,26 @@ def counted_checks(checks: list) -> list:
     return counted
 
 
-def disclosed_count(checks: list) -> tuple[int, int]:
+def disclosed_count(checks: list, resolved: set[str] | None = None) -> tuple[int, int]:
     """(개시가 확인된 하위 한정 수, 분모). 대안 묶음은 양쪽에서 한 자리만 차지합니다.
 
     커버율(atomic_coverage)과 보고서 정량 지표(limitation_counts)가 **같은 셈법**을 쓰도록
     한 곳에 둡니다. 종전에는 두 함수와 counted_checks가 각자 대안 묶음 처리를 다시 적어,
     같은 뜻의 계산이 세 벌 있었습니다.
+
+    resolved는 채택 조합의 다른 문헌이 개시한 한정입니다. 원본 문헌 셀에서는 항상 비어
+    있고, chain._merge가 만든 결합 사본에서만 들어옵니다. 대안 묶음 중 하나가 다른 문헌으로
+    해소된 경우에도 묶음 전체를 한 자리로 세어야 하므로 그룹 단위로 함께 확인합니다.
     """
+    resolved = resolved or set()
+    resolved_groups = {check.alternative_group for check in checks
+                       if check.limitation in resolved and check.alternative_group}
     counted = counted_checks(checks)
-    return sum(1 for check in counted if check.disclosed), len(counted)
+    disclosed = sum(1 for check in counted
+                    if check.disclosed
+                    or check.limitation in resolved
+                    or (check.alternative_group and check.alternative_group in resolved_groups))
+    return disclosed, len(counted)
 
 
 def atomic_coverage(match: ElementMatch) -> float | None:
@@ -115,7 +129,8 @@ def atomic_coverage(match: ElementMatch) -> float | None:
     알 수 없습니다. 누락이 있으면 _build_matches가 이미 판정을 '일부 차이' 이하로 강등하고
     quality_key도 누락 수를 세므로, 여기서 추정값을 지어내지 않아도 벌점은 반영됩니다.
     """
-    disclosed, total = disclosed_count(match.limitation_checks)
+    disclosed, total = disclosed_count(
+        match.limitation_checks, set(match.combination_resolved))
     return disclosed / total if total else None
 
 
@@ -326,7 +341,7 @@ def limitation_counts(match: ElementMatch | None) -> tuple[int, int]:
     """
     if match is None:
         return 0, 0
-    return disclosed_count(match.limitation_checks)
+    return disclosed_count(match.limitation_checks, set(match.combination_resolved))
 
 
 def evidence_locations(match: ElementMatch | None) -> int:
@@ -381,9 +396,26 @@ def no_correspondence_labels(claim: Claim, matches: dict[str, ElementMatch]) -> 
 
 
 def difference_labels(claim: Claim, matches: dict[str, ElementMatch]) -> list[str]:
-    """대응 기재는 있으나 청구항과 완전히 같다고는 볼 수 없는 구성."""
+    """채택 조합으로 대응은 되었지만 **실제로 남은** 차이가 있는 구성.
+
+    단독 셀의 판정 라벨은 결합 동기까지 평가하지 않으므로, 다른 채택 문헌이 누락 한정을
+    모두 메워도 보수적으로 '일부 차이'에 머물 수 있습니다. 그 라벨만 보고 residual에 다시
+    올리면 보고서는 같은 한정을 앞에서는 "결합으로 해소"하고 결론에서는 "결합 후에도 남음"으로
+    적습니다. 결합으로 해소한 한정 외에 남은 누락·지시관계·다른 목적이 없으면 커버리지 기준의
+    잔여 차이는 없습니다. 진보성의 결합 동기·용이성은 별도 결론 문구가 계속 유보합니다.
+    """
     return [element.label for element in claim.elements
-            if has_correspondence(matches.get(element.label)) and not is_complete(matches.get(element.label))]
+            if has_correspondence(matches.get(element.label))
+            and _has_residual_difference(matches.get(element.label))]
+
+
+def _has_residual_difference(match: ElementMatch | None) -> bool:
+    if match is None or is_complete(match):
+        return False
+    if (match.combination_resolved and not match.missing_limitations
+            and not match.antecedent_note and not match.different_purpose):
+        return False
+    return True
 
 
 def disclosed_limitations(match: ElementMatch | None) -> set[str]:
@@ -511,6 +543,40 @@ def is_better_match(candidate: ElementMatch | None, current: ElementMatch | None
     if candidate is None:
         return False
     return decisive_key(candidate) > decisive_key(current)
+
+
+def filled_limitations(candidate: ElementMatch | None,
+                       current: ElementMatch | None) -> set[str]:
+    """후보가 **현재 채택 셀에 빠진** 하위 한정 중 원문으로 개시한 것.
+
+    진보성 결합에서 부 인용발명을 데려오는 이유가 바로 이것입니다. 부 인용발명은 그 구성
+    전체를 주 인용발명보다 잘 개시하는 문헌이 아니라, 주 인용발명이 빠뜨린 한정 하나를
+    대는 문헌입니다. 그래서 구성 단위 우열(is_better_match)만 물으면 이 기여는 보이지
+    않습니다 — 오히려 부 인용발명 쪽 등급이 낮은 것이 정상입니다.
+
+    실측에서 이것 때문에 결합이 서지 못했습니다. 주 인용발명이 '일부 차이'(rank 3)로 구성
+    전체를 덮고 도파관 한정 하나만 빠뜨렸는데, 그 한정을 원문으로 개시한 문헌 3건은 구성
+    전체로는 '차이'(rank 1)라 is_better_match에서 전부 탈락했습니다. 결과는 1건짜리 조합과
+    "다른 문헌에서도 더 강한 직접 근거는 확인하지 못했습니다"라는 결론이었습니다.
+    """
+    if candidate is None or current is None:
+        return set()
+    return disclosed_limitations(candidate) & set(current.missing_limitations)
+
+
+def limitation_gain(candidate: ElementMatch | None, current: ElementMatch | None) -> float:
+    """한정 단위 보완 이득. 채택 셀의 누락 한정 중 몇 할을 메웠는지입니다.
+
+    supplement_gain과 같은 척도 위에 올리기 위해 비율에 가중치를 곱합니다. 누락을 전부
+    메워도 supplement_gain의 판정 1등급 상승(1.0)보다 작게 두었습니다. 구성 전체의 등급이
+    올라가는 것과 빠진 한정 하나가 메워지는 것은 같은 무게가 아니고, 둘이 경합하면 등급이
+    올라가는 쪽을 먼저 집는 것이 맞습니다.
+    """
+    filled = filled_limitations(candidate, current)
+    missing = len(current.missing_limitations) if current else 0
+    if not filled or not missing:
+        return 0.0
+    return round(LIMITATION_GAIN_WEIGHT * len(filled) / missing, 6)
 
 
 def supplement_gain(candidate: ElementMatch | None, current: ElementMatch | None) -> float:

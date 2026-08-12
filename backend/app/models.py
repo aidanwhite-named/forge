@@ -178,6 +178,17 @@ class ElementMatch(BaseModel):
     # 같은 문헌에는 없던 선행 구성을 채택 조합의 다른 문헌이 보완한 경우 그 문헌 ID.
     # 보고서가 두 문헌의 발췌를 한 문장에 함께 제시할 때 사용합니다.
     antecedent_resolved_by: list[str] = []
+    # 이 셀이 빠뜨린 하위 한정을 **채택 조합 안의 다른 인용발명**이 원문으로 개시한 경우.
+    # 한정 문언 → 그 한정을 댄 문헌 id.
+    #
+    # 진보성 결합에서 구성 하나의 커버리지는 문헌 하나에서 끝나지 않습니다. 주 인용발명이
+    # 구성 전체의 골격을 대고 부 인용발명이 빠진 한정 하나를 대는 것이 결합의 기본형입니다.
+    # 그런데 결합 결과를 문헌 단위로만 고르면(chain._merge의 best_match) 진 쪽 셀이 통째로
+    # 버려져, 이긴 셀에 남은 누락 한정이 "결합 후에도 남는 차이"로 적힙니다 — 그 한정을
+    # 원문으로 개시한 문헌을 같은 조합 안에 세워 두고도 그렇습니다.
+    # antecedent_resolved_by와 같은 성격이라 채우는 자리도 같습니다: 결합 결과의 사본에만
+    # 기록하고 원본 matrix 셀(감사용 단독 판정)은 건드리지 않습니다.
+    combination_resolved: dict[str, str] = {}
     # --- 표본 합의 계측 -------------------------------------------------------
     # COMPARE_SAMPLES를 3으로 두는 근거는 "같은 셀이 실행마다 다른 판정을 낸다"입니다. 그런데
     # 종전에는 그 불안정성을 **실행 뒤에 확인할 방법이 없었습니다.** compare._merge_votes가
@@ -258,10 +269,8 @@ class ChainInfo(BaseModel):
     primary: str | None = None                # document_id
     secondaries: list[str] = []
     inherited: list[str] = []                 # 종속항이 부모항에서 상속한 문헌
-    # 종속항이 부모 조합에 새로 더한 문헌. 독립항과 같이 보완 이득이 마르면 멈추므로
-    # 상수 상한은 없습니다. 상한을 1건으로 두면 공백을 서로 다른 문헌 둘이 나누어 메우는
-    # 종속항에서 한쪽이 통째로 버려지고, 그 문헌이 원문으로 개시한 구성까지 uncovered로
-    # 보고됩니다 — uncovered는 "어느 문헌에도 대응 기재가 없다"는 사실 진술입니다.
+    # 종속항이 부모 조합에 새로 더한 문헌. 부모에게서 상속한 문헌은 세지 않고, 종속항에서
+    # 새로 더하는 문헌만 MAX_DEPENDENT_ADDITIONS 상한의 대상입니다.
     added: list[str] = []
 
     @field_validator("added", mode="before")
@@ -282,10 +291,12 @@ class ChainInfo(BaseModel):
     # 확인되지 않음"으로 나갑니다.
     reference_only: list[str] = []
     uncovered: list[str] = []                 # 채택 조합으로 대응 기재를 찾지 못한 라벨
-    # 결합 한도 때문에 채택하지 **못한** 문헌에는 검증된 대응 기재가 있는 라벨.
+    # 채택하지 **않은** 문헌에는 검증된 대응 기재가 있는 라벨.
     # uncovered에 함께 들어 있지만 성격이 다릅니다. uncovered 중 이 목록에 없는 것만
     # "어느 인용발명에도 기재가 없다"는 사실 진술이고, 여기 있는 것은 "기재는 있으나 이
-    # 거절 이유에 세울 문헌 수를 넘는다"입니다. 구분하지 않으면 손에 든 문헌을 다시 찾게 됩니다.
+    # 거절 이유에는 세우지 않았다"입니다. 구분하지 않으면 손에 든 문헌을 다시 찾게 됩니다.
+    # **왜** 채택되지 않았는지는 limit_binding이 따로 답합니다 — 상한이 걸린 것과 보완 후보
+    # 평가에서 떨어진 것은 다른 사실이고, 읽는 사람이 취할 후속 조치도 다릅니다.
     beyond_limit: list[str] = []
     beyond_limit_documents: dict[str, list[str]] = {}
     # 같은 문제의 **하위 한정** 판. 구성 전체는 채택 조합에 대응 기재가 있는데 그중 빠진
@@ -299,6 +310,12 @@ class ChainInfo(BaseModel):
     well_known: list[str] = []
     well_known_documents: dict[str, list[str]] = {}
     combination_limit: int = 0                # 이 청구항에 적용한 결합 문헌 수 상한
+    # 그 상한이 **실제로 걸렸는지**. beyond_limit·beyond_limit_residual이 "채택하지 않은
+    # 문헌에 그 기재가 있다"만 말하고 그 이유는 말하지 않으므로, 보고서가 이유를 지어내지
+    # 않으려면 이 값이 필요합니다. 거짓이면 자리가 남아 있는데도 채택되지 않은 것이고
+    # (보완 후보 평가에서 탈락), 참일 때만 "상한을 넘어 세우지 않았다"고 쓸 수 있습니다.
+    # 실측에서 1건짜리 조합을 두고 "상한(2건)을 넘어 세우지 않았다"고 적힌 적이 있습니다.
+    limit_binding: bool = False
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
     element_coverage: list[ElementCoverage] = []
@@ -324,6 +341,17 @@ class Evidence(BaseModel):
     # 보고서에는 그 한 문장만 찍히므로 "이 한정은 무엇으로 개시를 인정했는가"가 남지 않았습니다.
     limitation: str = ""
     kind: str = ""                            # core / qualifier
+    # 이 발췌만으로는 한정 문언이 그대로 읽히지 않고 **의미검증이 다리를 놓아** 개시로 인정된
+    # 경우의 관계와 그 이유(entailment.validate_entailment). explicit이면 비워 둡니다.
+    #
+    # 없으면 보고서가 독자를 오도합니다. 의미검증은 발췌 한 문장이 아니라 그 문장이 속한 청크
+    # 원문(_source_context)과 형제 한정의 인용문(element_context)까지 함께 읽고 판단하는데,
+    # 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐입니다. 그래서 실측에서 "HoloNet은 sRGB
+    # 이미지를 입력으로 받는다"가 "균일도 보정 이미지를 획득함"의 근거로 제시됐습니다 —
+    # 인정의 실제 근거는 같은 청크의 광원 강도 보정 서술이었는데 그것은 보고서에 없었습니다.
+    # 판단을 감추지 않고 함께 내보내야 심사관이 그 다리를 다툴 수 있습니다.
+    semantic_relation: str = ""
+    semantic_note: str = ""
 
 
 class DocumentMapping(BaseModel):

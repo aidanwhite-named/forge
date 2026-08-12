@@ -1,7 +1,7 @@
 """인용발명 선정 알고리즘. 비교 매트릭스가 같으면 항상 같은 조합이 나와야 한다."""
-from app.chain import build_chain, matrix_for
+from app.chain import build_chain, matrix_for, merge_selected
 from app.coverage import evidence_locations, limitation_counts, report_grade, score_document
-from app.models import Claim, ClaimElement, ElementMatch, LimitationCheck
+from app.models import Claim, ClaimElement, ElementMatch, LimitationCheck  # noqa: F401
 
 
 def claim(number: int = 1, depends_on: int | None = None, importances=(5, 5, 3)) -> Claim:
@@ -88,6 +88,189 @@ def test_a_weak_but_real_correspondence_is_a_difference_not_a_gap():
     assert chain.uncovered == []
     assert "C" in chain.residual
     assert chain.track == "inventive_step_combination"
+
+
+WAVEGUIDE = "출력 광학 이미지를 도파관 광학 시스템을 통해 출력되는 이미지로 한정함"
+
+
+def disclosing(document_id: str, label: str, judgment: str, discloses: list[str], *,
+               missing: list[str] | None = None, direct: bool = True) -> ElementMatch:
+    """하위 한정 개시까지 채운 셀. disclosed_limitations가 읽는 것은 limitation_checks다."""
+    match = cell(document_id, label, judgment, direct=direct, missing=missing)
+    match.limitation_checks = [
+        LimitationCheck(index=index, limitation=text, kind="qualifier", disclosed=True,
+                        quote=match.quote, chunk_id=match.chunk_id, verify="verified")
+        for index, text in enumerate(discloses)
+    ] + [
+        LimitationCheck(index=len(discloses) + index, limitation=text, kind="qualifier",
+                        disclosed=False, verify="empty")
+        for index, text in enumerate(missing or [])
+    ]
+    return match
+
+
+def test_a_secondary_that_only_fills_a_missing_limitation_is_still_adopted():
+    """부 인용발명은 구성 전체를 주 인용발명보다 잘 개시하는 문헌이 아니다.
+
+    진보성 결합에서 부 인용발명을 데려오는 이유는 주 인용발명이 빠뜨린 한정을 대는 것이다.
+    그러므로 구성 단위 우열(is_better_match) 하나로 문을 지키면, 주 인용발명이 '일부 차이'만
+    되어도 보완이 사실상 불가능해진다 — 한정 하나를 대는 문헌은 구성 전체로는 등급이 낮은
+    것이 정상이기 때문이다.
+
+    실측 사건: 주 인용발명이 (A)를 '일부 차이'(rank 3)로 덮고 도파관 한정 하나만 빠뜨렸는데,
+    그 한정을 원문으로 개시한 문헌 3건이 구성 전체로는 '차이'(rank 1)라 전부 탈락했다.
+    결과는 1건짜리 조합과 "다른 문헌에서도 이 차이를 완전히 해소하는 더 강한 직접 근거는
+    확인하지 못했습니다"라는 결론이었다.
+    """
+    matches = ([disclosing("1", "A", "일부 차이", ["이미지 세트를 획득함"], missing=[WAVEGUIDE]),
+                cell("1", "B", "일부 차이"), cell("1", "C", "일부 차이")]
+               + [disclosing("2", "A", "차이", [WAVEGUIDE], direct=False),
+                  cell("2", "B", "대응 없음"), cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+    assert chain.primary == "1"
+    assert chain.secondaries == ["2"]
+    candidate = next(item for item in coverage_of(chain, "A").candidates
+                     if item.document_id == "2")
+    assert candidate.adopted is True
+    assert candidate.gain > 0.0
+    assert candidate.better_than_primary is False
+
+
+def test_a_limitation_filled_by_the_combination_is_not_reported_as_a_remaining_difference():
+    """조합 안의 다른 문헌이 그 한정을 원문으로 댔다면 남은 차이로 적지 않는다.
+
+    best_match는 구성 하나를 문헌 하나에 통째로 넘기므로, 진 쪽 셀이 개시한 한정까지 함께
+    버려진다. 그러면 그 한정을 개시한 문헌을 같은 조합 안에 세워 두고도 "결합 후에도 남는
+    차이"로 적히고, 선행기술 검색 대상까지 된다.
+
+    등급은 올리지 않는다. 다만 한정이 전부 메워졌다면 커버리지 기준의 잔여 차이에서는 뺀다.
+    결합 동기·용이성은 이 도구가 확인하지 않으며 보고서 결론에서 별도로 유보한다.
+    """
+    matches = ([disclosing("1", "A", "일부 차이", ["이미지 세트를 획득함"], missing=[WAVEGUIDE]),
+                cell("1", "B", "일부 차이"), cell("1", "C", "일부 차이")]
+               + [disclosing("2", "A", "차이", [WAVEGUIDE], direct=False),
+                  cell("2", "B", "대응 없음"), cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+
+    coverage = coverage_of(chain, "A")
+    assert WAVEGUIDE not in coverage.residual_difference
+    assert coverage.adopted_judgment == "일부 차이"      # 한정은 메워도 등급은 그대로
+    assert "A" not in chain.residual
+    merged = merge_selected(claim(), matrix_for(matches), [chain.primary, *chain.secondaries])
+    assert limitation_counts(merged["A"]) == (2, 2)
+    # 조합이 메운 한정은 미채택 문헌 목록(추가 검색 신호)에도 남지 않는다.
+    assert WAVEGUIDE not in chain.beyond_limit_residual.get("A", {})
+
+
+def test_a_later_winning_cell_keeps_limitations_resolved_by_the_existing_combination():
+    """세 번째 문헌이 대표 셀을 바꿔도 앞선 조합이 해소한 한정은 다시 살아나지 않는다.
+
+    종속항은 부모 조합 두 건에 새 문헌 한 건을 더할 수 있습니다. 1+2 병합에서 해소한 한정을
+    3번 문헌도 빠뜨렸지만 직접성이 더 높아 대표 셀이 3번으로 바뀌는 경우, 2번의 해소 출처를
+    넘기지 않으면 missing이 되살아납니다.
+    """
+    target = claim(importances=(5,))
+    matches = [
+        disclosing("1", "A", "일부 차이", ["이미지 세트를 획득함"],
+                   missing=[WAVEGUIDE], direct=False),
+        disclosing("2", "A", "차이", [WAVEGUIDE], direct=False),
+        disclosing("3", "A", "일부 차이", ["이미지 세트를 획득함"],
+                   missing=[WAVEGUIDE], direct=True),
+    ]
+    merged = merge_selected(target, matrix_for(matches), ["1", "2", "3"])["A"]
+
+    assert merged.document_id == "3"
+    assert merged.missing_limitations == []
+    assert merged.combination_resolved == {WAVEGUIDE: "2"}
+    assert limitation_counts(merged) == (2, 2)
+
+
+def test_equal_contributors_are_broken_by_closeness_to_the_claim_not_document_order():
+    """같은 한정을 여러 문헌이 개시하면 증분 이득이 같아진다. 그때 번호로 고르지 않는다.
+
+    실측 사건에서 도파관 한정이 문헌 3건에 있었다. 번호가 빠른 것을 집으면 청구항과 거의
+    무관한 문헌(격자 구조 특허)이 번호만 앞선다는 이유로 부 인용발명이 되고, 같은 한정을
+    개시하면서 다른 구성까지 걸치는 문헌은 밀려난다. 기여가 같다면 청구항에 전체적으로 더
+    가까운 문헌을 세우는 쪽이 더 방어 가능한 거절 이유다.
+    """
+    matches = ([disclosing("1", "A", "일부 차이", ["이미지 세트를 획득함"], missing=[WAVEGUIDE]),
+                cell("1", "B", "일부 차이"), cell("1", "C", "일부 차이")]
+               # 2번: 도파관 한정만 대고 나머지는 대응 없음 — 청구항과 먼 문헌.
+               + [disclosing("2", "A", "차이", [WAVEGUIDE], direct=False),
+                  cell("2", "B", "대응 없음"), cell("2", "C", "대응 없음")]
+               # 3번: 같은 도파관 한정을 대면서 나머지 구성에도 대응이 있는 문헌.
+               + [disclosing("3", "A", "차이", [WAVEGUIDE], direct=False),
+                  cell("3", "B", "일부 유사"), cell("3", "C", "일부 유사")])
+    chain = build(claim(), matches)
+    assert chain.primary == "1"
+    assert chain.secondaries == ["3"]
+
+    # 동률이 완전히 같으면(적합도까지) 문헌 번호 순이라 결과는 항상 재현된다.
+    twins = ([disclosing("1", "A", "일부 차이", ["이미지 세트를 획득함"], missing=[WAVEGUIDE]),
+              cell("1", "B", "일부 차이"), cell("1", "C", "일부 차이")]
+             + [disclosing("2", "A", "차이", [WAVEGUIDE], direct=False),
+                cell("2", "B", "대응 없음"), cell("2", "C", "대응 없음")]
+             + [disclosing("3", "A", "차이", [WAVEGUIDE], direct=False),
+                cell("3", "B", "대응 없음"), cell("3", "C", "대응 없음")])
+    assert build(claim(), twins).secondaries == ["2"]
+
+
+def test_the_report_only_blames_the_combination_limit_when_it_actually_bound():
+    """자리가 남아 있는데 빠진 문헌을 두고 "상한을 넘었다"고 적지 않는다.
+
+    실측 보고서가 1건짜리 조합을 세워 놓고 "결합 문헌 수 상한(2건)을 넘어 이 거절 이유에는
+    세우지 않음"이라고 적었다. 상한은 2건인데 조합에는 1건뿐이었으니 넘긴 것이 없다. 읽는
+    사람은 상한만 올리면 그 문헌이 들어온다고 읽지만, 실제로 문헌을 떨어뜨린 것은 보완 후보
+    평가였다.
+    """
+    # 2번이 공백 C를 메운 뒤에도 3번이 B의 누락 한정을 메울 수 있지만 자리가 없다.
+    matches = ([cell("1", "A", "동일"),
+                disclosing("1", "B", "일부 차이", ["기본 동작"], missing=[WAVEGUIDE]),
+                cell("1", "C", "대응 없음")]
+               + [cell("2", "A", "대응 없음"), cell("2", "B", "대응 없음"),
+                  cell("2", "C", "동일")]
+               + [cell("3", "A", "대응 없음"),
+                  disclosing("3", "B", "차이", [WAVEGUIDE], direct=False),
+                  cell("3", "C", "대응 없음")])
+    assert build(claim(), matches).limit_binding is True
+
+    # 후보가 정확히 두 건이고 둘 다 채택됐다면 상한에 닿았어도 배제된 후보는 없다.
+    filled = ([cell("1", "A", "동일"), cell("1", "B", "동일"),
+               cell("1", "C", "대응 없음")]
+              + [cell("2", "A", "대응 없음"), cell("2", "B", "대응 없음"),
+                 cell("2", "C", "동일")])
+    assert build(claim(), filled).limit_binding is False
+
+    # 후보가 아예 없어 조합이 1건에 머문 상태 — 상한 탓이 아니다.
+    alone = [cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "일부 차이")]
+    chain = build(claim(), alone)
+    assert chain.secondaries == []
+    assert chain.limit_binding is False
+
+    # 문헌이 상한보다 적으면 조합이 짧아도 상한 탓이 아니다.
+    two = ([cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "일부 차이")]
+           + [cell("2", "A", "차이"), cell("2", "B", "차이"), cell("2", "C", "차이")])
+    assert build(claim(), two).limit_binding is False
+
+
+def test_a_dependent_claim_measures_its_limit_against_added_documents_only():
+    """종속항 상한은 새로 더한 문헌 수에 걸린다. 상속한 문헌은 그 상한의 대상이 아니다.
+
+    조합 전체 크기와 비교하면 부모항에서 문헌 2건을 상속받는 것만으로 언제나 "상한을
+    넘었다"가 되어, 보고서가 실제로 하지 않은 판단을 한 것처럼 적는다.
+    """
+    parent = claim(1, importances=(5, 5, 3))
+    child = claim(2, depends_on=1, importances=(5,))
+    matches = ([cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음")]
+               + [cell("2", "C", "동일")])
+    parent_chain = build(parent, matches, all_claims=[parent, child])
+    assert parent_chain.secondaries == ["2"]
+
+    # 종속항은 부모 조합 2건을 상속하지만 새로 더한 문헌은 없다.
+    child_chain = build_chain(child, matrix_for([cell("1", "A", "동일")]),
+                              {1: parent_chain}, [parent, child])
+    assert child_chain.added == []
+    assert child_chain.limit_binding is False
 
 
 def test_a_low_importance_gap_is_still_reported_as_a_gap():

@@ -14,7 +14,8 @@ import regress  # noqa: E402
 def _observation(judgment: str, corresponded: bool = True, disclosed: int = 2,
                  total: int = 2, track: str = "inventive_step_combination",
                  primary: str = "1") -> dict:
-    return {"kind": "forge", "at": "2026-01-01T00:00:00+00:00", "claims": {"1": {
+    return {"kind": "forge", "at": "2026-01-01T00:00:00+00:00",
+            "versions": {"decomposition": 5}, "claims": {"1": {
         "track": track, "primary": primary, "secondaries": [], "residual": [], "uncovered": [],
         "elements": {"A": {"judgment": judgment, "corresponded": corresponded,
                            "disclosed": disclosed, "total": total, "document": "1"}}}}}
@@ -44,6 +45,15 @@ def test_a_grade_above_the_maximum_fails():
     assert "corresponded" in reasons and "최대" in reasons
 
 
+def test_element_document_and_limitation_counts_are_scored():
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "document": "4", "disclosed": 4, "total": 4}}}}
+    observed = _observation("실질적 동일", disclosed=3, total=4)
+    findings = regress.score(observed, expected)
+    reasons = " ".join(item["reason"] for item in findings if not item["ok"])
+    assert "document='1'" in reasons and "disclosed=3" in reasons
+
+
 def test_an_element_missing_from_the_observation_is_a_failure():
     """판정을 못 받은 것을 조용히 넘기면 하니스가 회귀를 통과시킨다."""
     expected = {"adjudicated": True, "claims": {"1": {"B": {"corresponded": True}}}}
@@ -58,6 +68,49 @@ def test_claim_level_expectations_catch_a_changed_citation_combination():
     findings = regress.score(_observation("동일", primary="1"), expected)
     assert [item["ok"] for item in findings] == [False]
     assert "primary" in findings[0]["reason"]
+
+
+def test_an_empty_combination_regression_is_catchable():
+    """부 인용발명이 한 건도 서지 않는 회귀는 셀 채점으로는 드러나지 않는다.
+
+    실측에서 그런 일이 났다. 주 인용발명만으로도 구성별 등급은 그대로였기 때문에 A·B·C
+    어느 셀도 변하지 않았고, 달라진 것은 조합뿐이었다. 조합 자체를 걸 수 있어야 잡힌다.
+    """
+    expected = {"adjudicated": True, "claims": {"1": {"_secondaries": ["4"]}}}
+    findings = regress.score(_observation("일부 차이"), expected)     # secondaries=[]
+    assert [item["ok"] for item in findings] == [False]
+    assert "secondaries" in findings[0]["reason"]
+
+
+def test_an_expected_empty_combination_is_still_scored():
+    """"결합이 서면 안 된다"도 기대값이다. 빈 값이라고 채점에서 빠지면 적을 수 없다."""
+    expected = {"adjudicated": True, "claims": {"1": {"_secondaries": []}}}
+    assert all(item["ok"] for item in regress.score(_observation("일부 차이"), expected))
+
+    observed = _observation("일부 차이")
+    observed["claims"]["1"]["secondaries"] = ["2"]
+    assert [item["ok"] for item in regress.score(observed, expected)] == [False]
+
+
+def test_residual_and_uncovered_expectations_are_scored():
+    """조합 문헌만 맞고 결합 후 공백이 틀린 보고서를 통과시키면 안 된다."""
+    observed = _observation("일부 차이")
+    observed["claims"]["1"]["residual"] = ["B"]
+    observed["claims"]["1"]["uncovered"] = ["C"]
+    expected = {"adjudicated": True, "claims": {"1": {
+        "_residual": ["B"], "_uncovered": ["C"]}}}
+    assert all(item["ok"] for item in regress.score(observed, expected))
+
+    expected["claims"]["1"]["_residual"] = ["A", "B"]
+    assert any(not item["ok"] and "residual" in item["reason"]
+               for item in regress.score(observed, expected))
+
+
+def test_a_stale_frozen_decomposition_is_a_failure():
+    expected = {"adjudicated": True, "decomposition_version": 4, "claims": {}}
+    findings = regress.score(_observation("동일"), expected)
+    assert [item["ok"] for item in findings] == [False]
+    assert "decomposition" in findings[0]["reason"]
 
 
 def test_diff_reports_only_what_actually_changed():
@@ -126,6 +179,20 @@ def test_aggregate_tracks_a_citation_combination_that_moves_between_runs():
                                 _observation("동일", primary="2")])
     assert merged["claims"]["1"]["primary"] == "2"
     assert merged["claims"]["1"]["primary_spread"] == {"1": 1, "2": 2}
+
+
+def test_aggregate_preserves_claim_level_list_expectations():
+    first = _observation("일부 차이")
+    second = _observation("일부 차이")
+    third = _observation("일부 차이")
+    for observation in (first, second):
+        observation["claims"]["1"]["secondaries"] = ["4"]
+        observation["claims"]["1"]["residual"] = ["B"]
+        observation["claims"]["1"]["uncovered"] = ["C"]
+    merged = regress.aggregate([first, second, third])
+    assert merged["claims"]["1"]["secondaries"] == ["4"]
+    assert merged["claims"]["1"]["residual"] == ["B"]
+    assert merged["claims"]["1"]["uncovered"] == ["C"]
 
 
 def test_a_sampled_observation_can_still_be_scored_and_diffed():

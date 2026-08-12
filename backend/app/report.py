@@ -14,7 +14,7 @@ from .consistency import antecedents
 from .coverage import (JUDGMENT_RANK, best_match, evidence_locations, limitation_counts,
                        report_grade)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
-                     DocumentMapping, ElementMatch, Evidence)
+                     DocumentMapping, ElementMatch, Evidence, LimitationCheck)
 
 # 발췌 길이 상한. 요구 형식이 "최대 3줄, 가능하면 1줄"이므로 한 줄 분량으로 자릅니다.
 EXCERPT_LIMIT = 150
@@ -130,8 +130,9 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
     grade, emoji = report_grade(match)
     evidence = _collect_evidence(label, chain, matrix, documents, mappings)
     bridge = _antecedent_bridge(claim, label, match, chain, matrix)
-    combined = bool(corresponded and match and chain.primary and (
+    replaced_cell = bool(corresponded and match and chain.primary and (
         (match.document_id != chain.primary and _usable(primary)) or bridge is not None))
+    combined = bool(replaced_cell or (match and match.combination_resolved))
     disclosed, total = limitation_counts(match)
     return ClaimResult(
         label=label,
@@ -145,12 +146,12 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         grade=grade,
         emoji=emoji,
         narrative=_narrative(
-            label, text, match, primary, combined, mappings, documents,
+            label, text, match, primary, replaced_cell, mappings, documents,
             _closest_related(label, matrix, mappings, documents),
             _gap_note(label, chain, mappings), bridge=bridge),
         difference=_difference(
-            match, primary, combined, mappings, documents,
-            chain.beyond_limit_residual.get(label), chain.combination_limit, bridge=bridge),
+            match, primary, replaced_cell, mappings, documents,
+            chain.beyond_limit_residual.get(label), _unadopted_note(chain), bridge=bridge),
         combination=combined,
         evidence=evidence,
         status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
@@ -188,8 +189,7 @@ def _gap_note(label: str, chain: ChainInfo, mappings: list[DocumentMapping]) -> 
         names = ", ".join(_reference_name(document_id, mappings)
                           for document_id in chain.beyond_limit_documents.get(label, []))
         return (f"({label}) 구성은 채택된 인용발명 조합에는 대응 기재가 없음 — {names}에 대응 "
-                f"기재가 있으나 결합 문헌 수 상한({chain.combination_limit}건)을 넘어 이 거절 "
-                "이유에는 세우지 않음")
+                f"기재가 있으나 {_unadopted_note(chain)} 이 거절 이유에는 세우지 않음")
     return ""
 
 
@@ -281,10 +281,29 @@ def _reason_clause(reason: str) -> str:
     return f"{reason}에 해당하므로"
 
 
+def _resolved_note(match: ElementMatch, mappings: list[DocumentMapping]) -> str:
+    """채택 셀이 빠뜨린 한정을 조합 안의 다른 인용발명이 댄 경우 그 사실을 적습니다.
+
+    이 줄이 없으면 chain._absorb_limitations가 메운 한정은 차이점에서 그냥 사라집니다.
+    그러면 집계(개시 한정 수)는 올라갔는데 이유가 보고서 어디에도 없어, 읽는 사람은 무엇이
+    왜 바뀌었는지 대조할 수 없습니다. 어느 문헌이 그 한정을 댔는지가 결합 거절 이유의
+    본체이므로 문헌 이름과 함께 적습니다.
+    """
+    if not match.combination_resolved:
+        return ""
+    by_document: dict[str, list[str]] = {}
+    for limitation, document_id in match.combination_resolved.items():
+        by_document.setdefault(document_id, []).append(limitation)
+    return ", ".join(
+        f"{'; '.join(sorted(limitations)[:2])}은 "
+        f"{_reference_name(document_id, mappings)}의 결합으로 해소됨"
+        for document_id, limitations in sorted(by_document.items()))
+
+
 def _difference(match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
                 mappings: list[DocumentMapping], documents: dict[str, Document],
                 overflow: dict[str, list[str]] | None = None,
-                combination_limit: int = 0,
+                unadopted_note: str = "",
                 bridge: ElementMatch | None = None) -> str | None:
     if match is None or not _corresponded(match):
         return None
@@ -296,15 +315,28 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
     if match.antecedent_note:
         if match.missing_limitations:
             residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
-                                     combination_limit)
+                                     unadopted_note)
             return f"{match.antecedent_note}. 또한 {residual}에 대한 기재가 확인되지 않았습니다"
         return match.antecedent_note
     # 다른 채택 문헌이 선행 구성만 보완한 경우, 이 구성 자체에 남은 시점·조건 차이는
     # 해소된 것으로 쓰지 않습니다. 이번 비디오 편집 사례의 "편집 중" 시점이 여기에 해당합니다.
     if bridge is not None:
         if match.missing_limitations:
-            return _residual_gap(match.missing_limitations[:3], mappings, overflow, combination_limit)
+            return _residual_gap(match.missing_limitations[:3], mappings, overflow, unadopted_note)
         return None
+    # 채택 셀 자체는 주 인용발명인데, 그 셀이 빠뜨린 한정을 조합 안의 다른 문헌이 댄 경우.
+    # 아래 `combined` 분기는 채택 셀의 **문헌이 바뀐** 경우만 다루므로 여기서 먼저 답합니다.
+    resolved_note = _resolved_note(match, mappings)
+    if resolved_note:
+        if match.missing_limitations:
+            residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
+                                     unadopted_note)
+            return f"{resolved_note}. 다만 {residual}은 결합 후에도 남음"
+        if not match.antecedent_note and not match.different_purpose:
+            return resolved_note
+        # 한정은 모두 메워졌어도 지시 관계나 목적 차이가 남으면 그 차이는 감추지 않습니다.
+        return (f"{resolved_note}. 다만 {match.judgment} 판정에 그쳐 하위 한정까지 "
+                "동일하다고 보기는 어렵습니다")
     if combined and primary is not None:
         # 보완 문헌이 주 인용발명의 공백을 **전부** 메웠을 때만 "해소됨"이라고 적습니다.
         #
@@ -323,14 +355,14 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
             return (f"{_reference_name(primary.document_id, mappings)}은 {gap}에 대한 기재가 없으나 "
                     f"{supplement}의 결합으로 해소됨")
         residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
-                                 combination_limit)
+                                 unadopted_note)
         if resolved:
             return (f"{_reference_name(primary.document_id, mappings)}에 없던 "
                     f"{'; '.join(resolved[:2])}은 {supplement}의 결합으로 해소되었으나, "
                     f"{residual}은 결합 후에도 남음")
         return residual
     if match.missing_limitations:
-        return _residual_gap(match.missing_limitations[:3], mappings, overflow, combination_limit)
+        return _residual_gap(match.missing_limitations[:3], mappings, overflow, unadopted_note)
     if match.judgment in {"동일", "실질적 동일"} and not match.downgraded_from:
         return None
     return "세부 구현·조건에 차이가 있어 동일하다고 보기 어렵습니다."
@@ -349,14 +381,29 @@ def _antecedent_bridge(claim: Claim, label: str, match: ElementMatch | None,
     return best_match(candidates)
 
 
-def _residual_gap(missing: list[str], mappings: list[DocumentMapping],
-                  overflow: dict[str, list[str]] | None, combination_limit: int) -> str:
-    """남은 한정을 적되, 결합 한도 밖 문헌이 개시한 것은 그 사실과 함께 적습니다.
+def _unadopted_note(chain: ChainInfo) -> str:
+    """채택되지 않은 문헌에 기재가 있을 때 그 이유. chain._unadopted_reason과 같은 값입니다.
 
-    한도 밖에 기재가 있는 한정을 그냥 남은 차이로 적으면, 읽는 사람은 그것을 추가 검색
-    대상으로 읽습니다. 그런데 그 기재는 이미 업로드된 문헌 안에 있습니다. 상한은 *거절 이유를
-    몇 건으로 세울지*의 문제이지 *문헌에 기재가 있느냐*의 문제가 아니므로 둘을 같은 문장에
-    뭉치지 않습니다(chain.beyond_limit이 미대응 줄에서 하는 것과 같은 구분입니다).
+    상한이 실제로 걸렸을 때만 상한 탓으로 적습니다. 자리가 남아 있는데도 빠진 문헌을 두고
+    "상한을 넘었다"고 적으면 도구가 하지 않은 판단을 한 것처럼 보고하게 되고, 읽는 사람은
+    상한만 올리면 그 문헌이 들어온다고 읽습니다. 실측에서 1건짜리 조합에 "상한(2건)을 넘어"가
+    적힌 적이 있습니다.
+    """
+    if chain.limit_binding:
+        if chain.inherited:
+            return f"종속항 추가 인용발명 수 상한({chain.combination_limit}건)을 넘어"
+        return f"결합 문헌 수 상한({chain.combination_limit}건)을 넘어"
+    return "보완 후보 평가에서 채택되지 않아"
+
+
+def _residual_gap(missing: list[str], mappings: list[DocumentMapping],
+                  overflow: dict[str, list[str]] | None, unadopted_note: str) -> str:
+    """남은 한정을 적되, 채택되지 않은 문헌이 개시한 것은 그 사실과 함께 적습니다.
+
+    채택 밖에 기재가 있는 한정을 그냥 남은 차이로 적으면, 읽는 사람은 그것을 추가 검색
+    대상으로 읽습니다. 그런데 그 기재는 이미 업로드된 문헌 안에 있습니다. 채택 여부는 *거절
+    이유를 어떻게 세울지*의 문제이지 *문헌에 기재가 있느냐*의 문제가 아니므로 둘을 같은
+    문장에 뭉치지 않습니다(chain.beyond_limit이 미대응 줄에서 하는 것과 같은 구분입니다).
     """
     parts: list[str] = []
     for limitation in missing:
@@ -365,8 +412,8 @@ def _residual_gap(missing: list[str], mappings: list[DocumentMapping],
             parts.append(limitation)
             continue
         names = ", ".join(_reference_name(document_id, mappings) for document_id in sources)
-        parts.append(f"{limitation} ({names}에 대응 기재가 있으나 결합 문헌 수 "
-                     f"상한({combination_limit}건)을 넘어 이 거절 이유에는 세우지 않음)")
+        parts.append(f"{limitation} ({names}에 대응 기재가 있으나 {unadopted_note} "
+                     "이 거절 이유에는 세우지 않음)")
     return "; ".join(parts)
 
 
@@ -438,8 +485,10 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
         document = documents.get(document_id)
         mapping = by_id.get(document_id)
         def add(chunk_id: str, quote: str, translation: str, verify: str,
-                limitation: str = "", kind: str = "") -> None:
+                limitation: str = "", kind: str = "",
+                check: LimitationCheck | None = None) -> None:
             page, paragraph = _chunk_position(document, chunk_id)
+            relation, note = _semantic_bridge(check)
             evidence.append(Evidence(
                 document_id=document_id,
                 filename=document.filename if document else "",
@@ -450,6 +499,7 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
                 original_excerpt=quote if translation else None,
                 quality=_QUALITY.get(verify, "UNVERIFIED"),
                 limitation=limitation, kind=kind,
+                semantic_relation=relation, semantic_note=note,
             ))
 
         spans = []
@@ -470,12 +520,40 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
         for check in match.limitation_checks:
             if check.disclosed and check.quote and not check.whole_element:
                 add(check.chunk_id, check.quote, check.quote_translation, check.verify,
-                    limitation=check.limitation, kind=check.kind)
+                    limitation=check.limitation, kind=check.kind, check=check)
                 for span in check.evidence:
                     if span.quote:
                         add(span.chunk_id, span.quote, span.quote_translation, span.verify,
-                            limitation=check.limitation, kind=check.kind)
+                            limitation=check.limitation, kind=check.kind, check=check)
     return evidence
+
+
+# 의미검증이 개시를 인정하며 붙인 관계. explicit은 발췌가 문언 그대로를 담은 경우라
+# 따로 적지 않습니다. 나머지 둘은 발췌와 한정 사이를 **판단으로** 이은 것이므로 적습니다.
+_BRIDGE_LABELS = {
+    "necessary_implicit": "필연적 함의로 인정",
+    "functional_equivalent": "기능적 동등으로 인정",
+}
+
+
+def _semantic_bridge(check: LimitationCheck | None) -> tuple[str, str]:
+    """이 한정의 개시가 발췌 문언 그대로가 아니라 의미검증의 판단에 서 있으면 그 근거.
+
+    의미검증(entailment)은 발췌 한 문장이 아니라 그 문장이 속한 청크 원문과 형제 한정의
+    인용문까지 함께 읽고 판단합니다. 그런데 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐이라,
+    인정의 실제 근거가 그 발췌 밖에 있으면 독자에게는 보이지 않습니다. 실측에서 "HoloNet은
+    sRGB 이미지를 입력으로 받는다"가 "균일도 보정 이미지를 획득함"의 근거로 제시됐고,
+    실제 인정 근거였던 같은 청크의 광원 강도 보정 서술은 보고서 어디에도 없었습니다.
+    발췌만 읽은 심사관은 도구가 개시를 잘못 인정했다고 볼 수밖에 없습니다.
+
+    판단을 감추지 않고 관계와 이유를 함께 내보내면, 그 다리가 타당한지를 다툴 수 있습니다.
+    """
+    if check is None or check.semantic_status != "accepted":
+        return "", ""
+    label = _BRIDGE_LABELS.get(check.semantic_relation)
+    if not label:
+        return "", ""
+    return label, _clip(check.semantic_note, 160)
 
 
 def _chunk_position(document: Document | None, chunk_id: str) -> tuple[int | None, str | None]:
@@ -537,16 +615,17 @@ def _conclusion(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch])
     if genuine:
         detail.append(f"미대응 구성: {', '.join(genuine)}.")
     if chain.beyond_limit:
-        detail.append(f"결합 한도 밖 인용발명에만 기재가 있는 구성: {', '.join(chain.beyond_limit)}.")
+        detail.append(f"미채택 인용발명에만 기재가 있는 구성: {', '.join(chain.beyond_limit)} "
+                      f"({_unadopted_note(chain)} 세우지 않음).")
     if chain.well_known:
         detail.append(f"주지관용기술로 다룬 구성: {', '.join(chain.well_known)}.")
     if chain.residual:
-        # 남은 차이 중 한도 밖 문헌이 메우는 것은 따로 적습니다. 뭉쳐 두면 결론 줄만 읽는
+        # 남은 차이 중 미채택 문헌이 메우는 것은 따로 적습니다. 뭉쳐 두면 결론 줄만 읽는
         # 사람이 그 구성 전체를 추가 검토 대상으로 옮겨 적게 됩니다.
         limited = [label for label in chain.residual if label in chain.beyond_limit_residual]
         detail.append(f"차이가 남는 구성: {', '.join(chain.residual)}.")
         if limited:
-            detail.append(f"그중 결합 한도 밖 인용발명이 그 한정을 개시한 구성: {', '.join(limited)}.")
+            detail.append(f"그중 미채택 인용발명이 그 한정을 개시한 구성: {', '.join(limited)}.")
     return f"{title} — {' '.join(detail)}" if detail else title
 
 
@@ -757,8 +836,8 @@ def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
         lines.append(f"구성 {', '.join(genuine)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
                      "추가 검색이 필요합니다.")
     if limited:
-        lines.append(f"구성 {', '.join(limited)}은 대응 기재를 가진 인용발명이 있으나 결합 문헌 수 "
-                     f"상한({chain.combination_limit}건)을 넘어 이 조합에 세우지 않았습니다.")
+        lines.append(f"구성 {', '.join(limited)}은 대응 기재를 가진 인용발명이 있으나 "
+                     f"{_unadopted_note(chain)} 이 조합에 세우지 않았습니다.")
     if well_known:
         lines.append(f"구성 {', '.join(well_known)}은 주지관용기술로 보아 결합에 더했으며, "
                      "그 인정 여부는 별도로 확인해야 합니다.")
@@ -768,12 +847,12 @@ def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
     if not residual:
         return ""
     line = f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다."
-    # 그 차이 중 일부가 한도 밖 문헌에 이미 있다면 여기서도 갈라 적습니다. 요약만 읽고
+    # 그 차이 중 일부가 미채택 문헌에 이미 있다면 여기서도 갈라 적습니다. 요약만 읽고
     # 추가 검색 목록을 만드는 독자에게는 이 줄이 유일한 신호입니다.
     limited = [label for label in residual if label in chain.beyond_limit_residual]
     if limited:
-        line += (f" 그중 구성 {', '.join(limited)}의 남은 한정은 결합 문헌 수 "
-                 f"상한({chain.combination_limit}건) 밖 인용발명에 대응 기재가 있습니다.")
+        line += (f" 그중 구성 {', '.join(limited)}의 남은 한정은 채택하지 않은 인용발명에 "
+                 f"대응 기재가 있습니다({_unadopted_note(chain)} 세우지 않음).")
     return line
 
 
@@ -913,6 +992,11 @@ def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
         kind = f"{proof.kind} · " if proof.kind else ""
         lines.append(f"- ({kind}{_clip(proof.limitation, 80)}) "
                      f'"{_clip(proof.excerpt, EXCERPT_LIMIT)}" ({_evidence_source(proof)})')
+        # 발췌 문언 그대로가 아니라 의미검증의 판단으로 인정된 개시는 그 판단을 붙여 적습니다.
+        # 없으면 발췌만 읽는 독자에게는 근거가 어긋나 보입니다(_semantic_bridge).
+        if proof.semantic_relation:
+            note = f" — {proof.semantic_note}" if proof.semantic_note else ""
+            lines.append(f"  ↳ 발췌 문언 그대로는 아니며 {proof.semantic_relation}{note}")
     return lines
 
 

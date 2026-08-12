@@ -36,6 +36,7 @@ DEFAULT_CASES_DIR = ROOT / "cases"
 # 등급 서열은 앱과 같은 표를 씁니다. 하니스가 자기 사다리를 들면 같은 등급을 두 곳이
 # 다르게 읽습니다.
 from app.coverage import JUDGMENT_RANK           # noqa: E402
+from app.report import to_markdown                # noqa: E402
 
 
 # --- 관측 ---------------------------------------------------------------------
@@ -103,6 +104,16 @@ def score(observation: dict, expected: dict) -> list[dict]:
     실제 출력에 맞춰 고치는 일이 반복됩니다.
     """
     findings: list[dict] = []
+    if "decomposition_version" in expected:
+        actual_version = (observation.get("versions") or {}).get("decomposition")
+        wanted_version = expected["decomposition_version"]
+        findings.append({
+            "where": "분해 버전",
+            "ok": actual_version == wanted_version,
+            "reason": (f"decomposition={actual_version!r}"
+                       if actual_version == wanted_version
+                       else f"decomposition={actual_version!r}, 기대 {wanted_version!r}"),
+        })
     for number, elements in (expected.get("claims") or {}).items():
         observed_claim = (observation.get("claims") or {}).get(number) or {}
         observed_elements = observed_claim.get("elements") or {}
@@ -118,11 +129,25 @@ def score(observation: dict, expected: dict) -> list[dict]:
                 findings.append(entry)
         # 청구항 수준 기대값은 선택입니다. 구성 라벨과 섞이지 않도록 "_track"·"_primary"처럼
         # 밑줄을 붙여 적습니다. 인용발명 조합이 바뀌는 회귀가 실제로 났으므로 걸 수 있게 둡니다.
-        for key in ("track", "primary"):
-            wanted = elements.get(f"_{key}")
-            if wanted and observed_claim.get(key) != wanted:
+        #
+        # _secondaries가 필요한 이유: 실측에서 부 인용발명이 **한 건도** 채택되지 않는 회귀가
+        # 났는데, 구성별 등급은 주 인용발명만으로도 그대로라 셀 채점으로는 전혀 드러나지
+        # 않았습니다. 조합 자체를 걸 수 있어야 잡힙니다.
+        #
+        # 키가 있으면 값이 비어 있어도 채점합니다. `if wanted`로 걸러 내면 "_secondaries": []
+        # 즉 "결합이 서면 안 된다"는 기대를 아예 적을 수 없습니다.
+        for key in ("track", "primary", "secondaries", "residual", "uncovered"):
+            marker = f"_{key}"
+            if marker not in elements:
+                continue
+            wanted = elements[marker]
+            actual_value = observed_claim.get(key)
+            if actual_value != wanted:
                 findings.append({"where": f"청구항 {number}", "ok": False,
-                                 "reason": f"{key}={observed_claim.get(key)!r}, 기대 {wanted!r}"})
+                                 "reason": f"{key}={actual_value!r}, 기대 {wanted!r}"})
+            else:
+                findings.append({"where": f"청구항 {number}", "ok": True,
+                                 "reason": f"{key}={actual_value!r}"})
     return findings
 
 
@@ -139,6 +164,13 @@ def _check_element(where: str, spec: dict, actual: dict) -> list[dict]:
     if "max_grade" in spec and rank > JUDGMENT_RANK.get(spec["max_grade"], 5):
         findings.append({"where": where, "ok": False,
                          "reason": f"{actual['judgment']} > 최대 {spec['max_grade']}"})
+    if "document" in spec and actual["document"] != spec["document"]:
+        findings.append({"where": where, "ok": False,
+                         "reason": f"document={actual['document']!r}, 기대 {spec['document']!r}"})
+    for key in ("disclosed", "total"):
+        if key in spec and actual[key] != spec[key]:
+            findings.append({"where": where, "ok": False,
+                             "reason": f"{key}={actual[key]!r}, 기대 {spec[key]!r}"})
     if not findings:
         findings.append({"where": where, "ok": True, "reason": _brief(actual)})
     return findings
@@ -317,9 +349,16 @@ def aggregate(observations: list[dict]) -> dict:
             }
         tracks = Counter(obs["claims"][number]["track"] for obs in observations)
         primaries = Counter(obs["claims"][number]["primary"] for obs in observations)
+        list_votes = {
+            key: Counter(tuple(obs["claims"][number].get(key) or []) for obs in observations)
+            for key in ("secondaries", "residual", "uncovered")
+        }
         claims[number] = {
             "track": tracks.most_common(1)[0][0], "track_spread": dict(tracks),
             "primary": primaries.most_common(1)[0][0], "primary_spread": dict(primaries),
+            **{key: list(votes.most_common(1)[0][0]) for key, votes in list_votes.items()},
+            **{f"{key}_spread": {str(list(value)): count for value, count in votes.items()}
+               for key, votes in list_votes.items()},
             "elements": elements,
         }
     return {"kind": "sampled", "at": base["at"], "note": f"{len(observations)}회 반복",
@@ -334,6 +373,11 @@ def _save_artifacts(case: dict, result, judgment: dict) -> None:
             json.dumps(result.model_dump(), ensure_ascii=False), encoding="utf-8")
         (directory / "judgment.json").write_text(
             json.dumps(judgment, ensure_ascii=False), encoding="utf-8")
+        # 회귀 판정만 맞고 실제 사용자 보고서가 어긋나는 퇴행도 사람이 바로 확인할 수 있게
+        # 앱과 같은 렌더러로 최신 보고서를 함께 보존합니다.
+        markdown = to_markdown(result)
+        (directory / "report.md").write_text(markdown, encoding="utf-8")
+        (directory / "report.txt").write_text(markdown, encoding="utf-8")
     except OSError:
         pass  # 진단용 부산물입니다. 저장 실패로 회귀 실행을 멈추지 않습니다.
 

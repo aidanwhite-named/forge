@@ -6,7 +6,7 @@ import pytest
 from app import agy, cache, claims as claims_module, compare, pipeline, priorart
 from app.chain import build_chain
 from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimReport, ClaimResult, Document,
-                        DocumentMapping, ElementMatch, EvidenceSpan)
+                        DocumentMapping, ElementMatch, EvidenceSpan, LimitationCheck)
 from app.claims import parse_claims
 from app.compare import DOCUMENT_BUDGET_CHARS
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
@@ -532,6 +532,44 @@ def test_each_limitation_keeps_the_sentence_that_proved_it(monkeypatch):
             "(인용발명 1 · 단락 [0021])") in markdown
     # 구성 원문 한 줄을 통째로 점검한 셀은 한정별 근거가 아니므로 반복해 적지 않는다.
     assert markdown.count("근거:") == 1
+    # 발췌가 한정 문언을 그대로 담고 있으면(explicit) 판단 줄을 덧붙이지 않는다.
+    assert "발췌 문언 그대로는 아니며" not in markdown
+
+
+def test_a_disclosure_bridged_by_semantic_review_says_so_next_to_the_excerpt():
+    """발췌 문언 그대로가 아니라 의미검증의 판단으로 인정한 개시는 그 판단을 함께 적는다.
+
+    의미검증은 발췌 한 문장이 아니라 그 문장이 속한 청크 원문과 형제 한정의 인용문까지 읽고
+    판단하는데, 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐이다. 그래서 실측 보고서에서
+    "HoloNet은 sRGB 이미지를 입력으로 받는다"가 "균일도 보정 이미지를 획득함"의 근거로
+    제시됐다. 인정의 실제 근거는 같은 청크의 광원 강도 보정 서술이었지만 보고서에는 없었고,
+    발췌만 읽은 심사관에게는 도구가 개시를 잘못 인정한 것으로 보일 수밖에 없다.
+    """
+    limitation = "쓰기 요청을 큐에 저장함"
+    note = "버퍼에 적재하는 구성이 큐 저장과 역할이 같음"
+    target = Claim(number=1, elements=[
+        ClaimElement(label="A", text=limitation, importance=5)])
+    match = ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment="실질적 동일",
+        directness="direct", quote=QUOTE_A, chunk_id="D1-P-0021", verify="verified",
+        limitation_checks=[LimitationCheck(
+            index=0, limitation=limitation, kind="core", disclosed=True,
+            quote=QUOTE_A, chunk_id="D1-P-0021", verify="verified",
+            semantic_status="accepted", semantic_relation="functional_equivalent",
+            semantic_note=note)])
+    matrix = {"1": {"A": match}}
+    chain = build_chain(target, matrix, {}, [target])
+    mappings = build_mappings([DOCUMENTS[0]], [chain])
+    report = build_claim_report(target, chain, matrix, {"1": DOCUMENTS[0]}, mappings)
+    result = pipeline.AnalysisResult(job_id="job", claim_mapping=mappings, reports=[report])
+
+    proof = next(value for value in element(report, "A").evidence if value.kind == "core")
+    assert proof.semantic_relation == "기능적 동등으로 인정"
+    assert proof.semantic_note == note
+    markdown = to_markdown(result)
+
+    assert ("  ↳ 발췌 문언 그대로는 아니며 기능적 동등으로 인정 — "
+            "버퍼에 적재하는 구성이 큐 저장과 역할이 같음") in markdown
 
 
 def test_summary_states_the_common_ground_and_the_sharpest_difference(stub_cli):
@@ -589,12 +627,54 @@ def test_supplement_is_written_as_one_combined_sentence():
                           "인용발명 2 (10-2020-0002) (단락 [0012])의 결합으로 해소됨")
 
 
-def test_a_remaining_limitation_names_the_over_limit_document_that_discloses_it():
-    """남은 한정을 한도 밖 문헌이 개시했다면 차이점 줄에 그 사실을 함께 적는다.
+def test_a_limitation_only_supplement_is_counted_and_marked_as_a_combination():
+    """대표 셀이 주 문헌에 남아도 한정을 댄 부 문헌은 결합으로 표시되어야 한다."""
+    limitation = "출력 이미지를 도파관 광학 시스템을 통해 출력함"
+    quote_1 = "장치는 출력 이미지를 획득하여 표시한다."
+    quote_2 = "회절 도파관은 광학 이미지를 출력한다."
+    target = Claim(number=1, elements=[
+        ClaimElement(label="A", text="이미지를 획득하여 도파관으로 출력함", importance=5)])
+    primary = ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment="일부 차이",
+        directness="direct", quote=quote_1, chunk_id="D1-P-0001", verify="verified",
+        missing_limitations=[limitation], limitation_checks=[
+            LimitationCheck(index=0, limitation="출력 이미지를 획득함", kind="core",
+                            disclosed=True, quote=quote_1, chunk_id="D1-P-0001",
+                            verify="verified"),
+            LimitationCheck(index=1, limitation=limitation, kind="qualifier", disclosed=False),
+        ])
+    secondary = ElementMatch(
+        claim_number=1, label="A", document_id="2", judgment="차이",
+        directness="inferred", quote=quote_2, chunk_id="D2-P-0002", verify="verified",
+        limitation_checks=[
+            LimitationCheck(index=0, limitation=limitation, kind="qualifier", disclosed=True,
+                            quote=quote_2, chunk_id="D2-P-0002", verify="verified")])
+    matrix = {"1": {"A": primary}, "2": {"A": secondary}}
+    chain = build_chain(target, matrix, {}, [target])
+    documents = [document("1", quote_1, "0001"), document("2", quote_2, "0002")]
+    mappings = build_mappings(documents, [chain])
+    report = build_claim_report(target, chain, matrix,
+                                {item.id: item for item in documents}, mappings)
+    item = element(report, "A")
+
+    assert chain.secondaries == ["2"]
+    assert item.combination is True
+    assert (item.disclosed_limitations, item.total_limitations) == (2, 2)
+    assert "인용발명 2" in (item.difference or "") and "결합으로 해소" in item.difference
+    candidate = next(value for value in chain.element_coverage[0].candidates
+                     if value.document_id == "2")
+    assert candidate.adopted is True and candidate.gain > 0.0
+
+
+def test_a_remaining_limitation_names_the_unadopted_document_that_discloses_it():
+    """남은 한정을 미채택 문헌이 개시했다면 차이점 줄에 그 사실을 함께 적는다.
 
     적지 않으면 "→ 차이점: 길 안내 정보를 제공함"만 남아 추가 검색 대상으로 읽히는데, 그
-    기재는 이미 업로드된 문헌 안에 있다. 상한은 거절 이유를 몇 건으로 세울지의 문제이지
+    기재는 이미 업로드된 문헌 안에 있다. 채택 여부는 거절 이유를 어떻게 세울지의 문제이지
     문헌에 기재가 있느냐의 문제가 아니므로 둘을 같은 문장에 뭉치지 않는다.
+
+    **빠진 이유는 지어내지 않는다.** 상한이 실제로 걸렸을 때만 상한 탓으로 적고, 자리가
+    남아 있었다면 그렇게 적는다(report._unadopted_note).
     """
     documents = {"1": document("1", QUOTE_A, "0025")}
     match = ElementMatch(claim_number=1, label="P0", document_id="1", judgment="일부 차이",
@@ -607,9 +687,13 @@ def test_a_remaining_limitation_names_the_over_limit_document_that_discloses_it(
 
     assert _difference(match, None, False, mappings, documents) == "길 안내 정보를 제공함"
     assert _difference(match, None, False, mappings, documents,
-                       {"길 안내 정보를 제공함": ["3"]}, 2) == (
+                       {"길 안내 정보를 제공함": ["3"]}, "결합 문헌 수 상한(2건)을 넘어") == (
         "길 안내 정보를 제공함 (인용발명 3 (US 2009/0005961 A1)에 대응 기재가 있으나 "
         "결합 문헌 수 상한(2건)을 넘어 이 거절 이유에는 세우지 않음)")
+    assert _difference(match, None, False, mappings, documents,
+                       {"길 안내 정보를 제공함": ["3"]}, "보완 후보 평가에서 채택되지 않아") == (
+        "길 안내 정보를 제공함 (인용발명 3 (US 2009/0005961 A1)에 대응 기재가 있으나 "
+        "보완 후보 평가에서 채택되지 않아 이 거절 이유에는 세우지 않음)")
 
 
 def test_uncovered_elements_are_offered_for_prior_art_search(monkeypatch, stub_cli):

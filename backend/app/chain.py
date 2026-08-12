@@ -8,10 +8,10 @@ from .consistency import antecedents
 from .coverage import (
     JUDGMENT_RANK, PRIMARY_CANDIDATE_RATIO,
     best_match, combined_similarity, core_direct_score, core_elements, difference_labels,
-    disclosed_limitations, has_correspondence, ineligible_reason, is_better_match,
-    is_complete, is_eligible_supplement, judgment_at_rank, no_correspondence_labels,
-    residual_difference, rows_for, score_document, supplement_gain, supplement_needed_labels,
-    supplement_reason, well_known_labels,
+    disclosed_limitations, filled_limitations, has_correspondence, ineligible_reason,
+    is_better_match, is_complete, is_eligible_supplement, judgment_at_rank, limitation_gain,
+    no_correspondence_labels, residual_difference, rows_for, score_document, supplement_gain,
+    supplement_needed_labels, supplement_reason, well_known_labels,
 )
 from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
                      NoveltyScreen, SupplementCandidate)
@@ -185,11 +185,22 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
             break
         candidate = _best_secondary(claim, matrix, merged, targets,
                                     no_correspondence_labels(claim, merged),
-                                    exclude={chain.primary, *chain.secondaries})
+                                    exclude={chain.primary, *chain.secondaries},
+                                    scores=_fitness(chain))
         if candidate is None:
             break
         chain.secondaries.append(candidate)
         merged = _merge(claim, merged, matrix[candidate])
+
+    # 상한에 닿은 것만으로는 부족합니다. 한 자리만 더 있었다면 실제로 채택됐을 유효 후보가
+    # 남아 있을 때만 상한이 조합을 막은 것입니다. 후보가 전부 이미 채택됐거나 이득 문턱을
+    # 넘지 못했다면 상한을 올려도 결과가 같으므로 limit_binding은 거짓이어야 합니다.
+    chain.limit_binding = bool(
+        len(chain.secondaries) + 1 >= MAX_COMBINED_DOCUMENTS
+        and _best_secondary(
+            claim, matrix, merged, supplement_needed_labels(claim, merged),
+            no_correspondence_labels(claim, merged),
+            exclude={chain.primary, *chain.secondaries}, scores=_fitness(chain)))
 
     chain.uncovered = no_correspondence_labels(claim, merged)
     # 대응은 있으나 하위 한정이나 구현 방식에 차이가 남는 구성입니다.
@@ -249,13 +260,17 @@ def _apply_gap_policy(claim: Claim, chain: ChainInfo, matrix: Matrix,
                       merged: dict[str, ElementMatch]) -> None:
     """남은 공백을 세 가지로 갈라 트랙과 결론 문장을 정합니다.
 
-      - 결합 한도 밖 문헌에 검증된 대응 기재가 있는 구성 → beyond_limit
+      - 채택되지 않은 문헌에 검증된 대응 기재가 있는 구성 → beyond_limit
       - 주지관용기술로 다룰 수 있는 구성 → well_known (거절 이유는 그대로 성립)
       - 나머지 → 진짜 공백. 이때만 "어느 인용발명에서도 확인되지 않았다"고 적습니다.
 
-    셋을 한 칸에 뭉치면 보고서가 사실과 다른 진술을 하게 됩니다. 상한 때문에 뺀 문헌의 기재를
+    셋을 한 칸에 뭉치면 보고서가 사실과 다른 진술을 하게 됩니다. 채택하지 않은 문헌의 기재를
     "없다"고 적으면 이미 손에 든 문헌을 다시 찾게 되고, 주지관용으로 충분한 범용 구성 하나
     때문에 거절 이유 전체가 "구성 곤란"으로 떨어지면 실제로 설 수 있는 거절이 사라집니다.
+
+    **왜 채택되지 않았는지는 따로 셉니다(limit_binding).** 이 목록이 답하는 것은 "그 기재가
+    어디 있는가"까지입니다. 조합에 자리가 남아 있는데도 빠진 문헌을 두고 "상한을 넘었다"고
+    적으면, 도구가 하지 않은 판단을 한 것처럼 보고하게 됩니다.
     """
     adopted = {chain.primary, *chain.secondaries}
     overflow: dict[str, list[str]] = {}
@@ -286,21 +301,37 @@ def _apply_gap_policy(claim: Claim, chain: ChainInfo, matrix: Matrix,
                        "어느 인용발명에서도 확인되지 않았습니다.")
     if limited:
         reasons.append(f"구성 {', '.join(limited)}에는 대응 기재를 가진 인용발명이 있으나, "
-                       f"결합 문헌 수 상한({chain.combination_limit}건)을 넘어 이 거절 이유에 "
-                       "세우지 않았습니다.")
+                       f"{_unadopted_reason(chain)} 이 거절 이유에 세우지 않았습니다.")
     chain.rationale = " ".join(reasons) + " 이대로는 거절 이유를 구성하기 어렵습니다."
+
+
+def _unadopted_reason(chain: ChainInfo) -> str:
+    """채택되지 않은 문헌에 기재가 있을 때, 그 문헌이 빠진 이유를 한 구로 적습니다.
+
+    보고서 세 곳(결론·미대응 줄·차이점 줄)이 같은 사실을 설명하므로 문구를 여기서 한 번만
+    정합니다. report._unadopted_note가 같은 값을 씁니다.
+    """
+    if chain.limit_binding:
+        if chain.inherited:
+            return f"종속항 추가 인용발명 수 상한({chain.combination_limit}건)을 넘어"
+        return f"결합 문헌 수 상한({chain.combination_limit}건)을 넘어"
+    return "보완 후보 평가에서 채택되지 않아"
 
 
 def _residual_overflow(chain: ChainInfo, matrix: Matrix, merged: dict[str, ElementMatch],
                        adopted: set[str | None]) -> dict[str, dict[str, list[str]]]:
-    """대응은 되었는데 **남은 차이**를 한도 밖 문헌이 메우는 경우를 한정 단위로 찾습니다.
+    """대응은 되었는데 **남은 차이**를 미채택 문헌이 메우는 경우를 한정 단위로 찾습니다.
 
     beyond_limit이 지키는 것은 "(X) 구성에 대응되는 인용발명이 확인되지 않음" 줄이고, 이쪽이
     지키는 것은 "→ 차이점: …" 줄입니다. 둘은 같은 사실을 서로 다른 자리에서 부정합니다 —
     구성 전체가 빠졌든 한정 하나가 빠졌든, 업로드된 문헌에 원문이 있는데 없다고 적으면 심사관은
     이미 손에 든 문헌을 다시 찾아 나서게 됩니다. 실측에서 전제부의 "길 안내 정보를 제공함"이
-    그렇게 적혔습니다. 그 한정을 원문으로 개시한 내비게이션 특허가 업로드되어 있었지만 결합
-    상한(2건) 밖이었고, 보고서는 그 사실을 적지 않은 채 남은 차이로만 적었습니다.
+    그렇게 적혔습니다. 그 한정을 원문으로 개시한 내비게이션 특허가 업로드되어 있었지만 채택
+    조합 밖이었고, 보고서는 그 사실을 적지 않은 채 남은 차이로만 적었습니다.
+
+    **채택 조합이 이미 메운 한정은 여기 오지 않습니다.** merged를 보므로, _absorb_limitations가
+    조합 안의 다른 문헌으로 메운 한정은 missing에서 빠져 애초에 후보가 되지 않습니다. 그것은
+    미채택 문헌을 가리킬 일이 아니라 결합으로 해소된 것이라고 적을 일입니다.
 
     구성 단위 대응(has_correspondence)이 아니라 **그 한정 자체**를 개시했는지로 봅니다.
     구성에 대응이 있다는 것만으로는 정작 빠진 그 한정이 있다는 뜻이 아닙니다.
@@ -366,21 +397,42 @@ def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore
     return sorted(eligible, key=lambda document_id: order.get(document_id, len(order)))
 
 
+def _fitness(chain: ChainInfo) -> dict[str, float]:
+    """문헌별 단독 적합도. 보완 후보의 기여가 동률일 때의 차순위 기준입니다."""
+    return {score.document_id: score.main_score for score in chain.candidates}
+
+
 def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch],
-                    targets: list[str], gaps: list[str], exclude: set[str]) -> str | None:
-    """주 인용발명 대비 **증분**으로 평가합니다. 두 종류를 함께 봅니다.
+                    targets: list[str], gaps: list[str], exclude: set[str],
+                    scores: dict[str, float] | None = None) -> str | None:
+    """주 인용발명 대비 **증분**으로 평가합니다. 세 종류를 함께 봅니다.
 
       - 완전 미대응 구성: 검증된 대응 기재를 처음 제공하면 이득으로 셉니다(GAP_PRIORITY 가중).
       - 부분 대응 구성: 판정·직접성·근거·누락 한정 중 하나 이상이 실제로 개선될 때만 셉니다.
+      - 그 어느 쪽도 아니지만 **채택 셀이 빠뜨린 한정을 원문으로 개시한** 구성.
 
     절대 성능이 높아도 어느 쪽에도 기여하지 못하면 채택하지 않습니다.
+
+    세 번째가 없으면 결합이 서지 않습니다. 부 인용발명은 구성 전체를 주 인용발명보다 잘
+    개시하는 문헌이 아니라 빠진 한정 하나를 대는 문헌이므로, 구성 단위 우열(is_better_match)
+    하나로 문을 지키면 주 인용발명이 '일부 차이'만 되어도 보완이 사실상 불가능해집니다.
+    실측 사건에서 도파관 한정을 원문으로 개시한 문헌 3건이 전부 이 문에서 탈락했고, 조합은
+    1건에 머문 채 "다른 문헌에서도 더 강한 직접 근거는 확인하지 못했습니다"로 나갔습니다
+    (coverage.filled_limitations 참조).
 
     공백에 유사도 하한을 걸지 않는 이유: 그 구성의 유일한 대응 기재를 가진 문헌이라도
     판정이 '일부 차이'면 하한에 걸려 탈락하고, 결과적으로 "어느 문헌에도 대응이 없다"는
     보고서가 나옵니다. 결합해서 남는 차이는 버리지 않고 보고서의 차이점으로 남깁니다.
+
+    **동률 처리.** 같은 한정을 여러 문헌이 개시하면 증분 이득이 정확히 같아집니다(실측 사건에서
+    도파관 한정이 3건에 있었습니다). 그때 문헌 번호가 빠른 것을 집으면 청구항과 거의 무관한
+    문헌이 번호만 앞선다는 이유로 부 인용발명이 됩니다. 기여도가 같다면 **청구항에 전체적으로
+    더 가까운 문헌**(단독 적합도)을 세우는 것이 더 방어 가능한 거절 이유이므로 그것을 다음
+    기준으로 둡니다. 그래도 같으면 문헌 번호 순이라 결과는 항상 재현됩니다.
     """
     gap_labels = set(gaps)
-    best, best_gain = None, 0.0
+    fitness = scores or {}
+    best, best_key = None, None
     for document_id in sorted(matrix):                 # 동률일 때 항상 같은 문헌이 뽑히도록 고정
         if document_id in exclude:
             continue
@@ -388,7 +440,10 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
         gain, useful = 0.0, 0
         for label in targets:
             candidate, current = matches.get(label), merged.get(label)
-            if not is_eligible_supplement(candidate) or not is_better_match(candidate, current):
+            if not is_eligible_supplement(candidate):
+                continue
+            step = _supplement_step(candidate, current)
+            if step <= 0.0:
                 continue
             if label in gap_labels:
                 # 공백에는 '검증된 대응 기재가 실제로 생겼는지'만 요구합니다.
@@ -397,18 +452,79 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
                 weight = GAP_PRIORITY
             else:
                 weight = 1.0
-            gain += weight * supplement_gain(candidate, current) * _importance(claim, label)
+            gain += weight * step * _importance(claim, label)
             useful += 1
-        if useful and gain > best_gain:
-            best, best_gain = document_id, gain
-    return best if best_gain >= MIN_SUPPLEMENT_GAIN else None
+        if not useful:
+            continue
+        key = (round(gain, 6), useful, fitness.get(document_id, 0.0))
+        if best_key is None or key > best_key:
+            best, best_key = document_id, key
+    return best if best_key and best_key[0] >= MIN_SUPPLEMENT_GAIN else None
+
+
+def _supplement_step(candidate: ElementMatch | None, current: ElementMatch | None) -> float:
+    """후보 한 셀의 실제 보완 기여. 선정과 감사 데이터가 같은 값을 쓰게 합니다.
+
+    구성 전체의 우열이 개선되면서 빠진 한정도 메우는 후보가 있을 수 있습니다. 둘을 if/else로
+    가르면 우열이 조금 개선됐다는 이유로 더 큰 한정 보완 이득이 가려집니다. 같은 누락 감소를
+    두 번 더하지 않도록 두 경로 중 큰 값을 사용합니다.
+    """
+    structural = supplement_gain(candidate, current) if is_better_match(candidate, current) else 0.0
+    return max(0.0, structural, limitation_gain(candidate, current))
 
 
 def _merge(claim: Claim, current: dict[str, ElementMatch], addition: dict[str, ElementMatch]) -> dict[str, ElementMatch]:
     """구성별로 더 강한 판정을 채택합니다. 결합 후 커버리지는 여기서만 정해집니다."""
-    merged = {element.label: best_match([current.get(element.label), addition.get(element.label)])
-              for element in claim.elements}
+    merged = {}
+    for element in claim.elements:
+        cells = [current.get(element.label), addition.get(element.label)]
+        merged[element.label] = _absorb_limitations(best_match(cells), cells)
     return _restore_combination_antecedents(claim, merged)
+
+
+def _absorb_limitations(chosen: ElementMatch | None,
+                        cells: list[ElementMatch | None]) -> ElementMatch | None:
+    """채택 셀이 빠뜨린 한정을 같은 조합의 다른 문헌이 개시했다면 결합 결과에 반영합니다.
+
+    best_match는 구성 하나를 문헌 하나에 통째로 넘깁니다. 그러면 진 쪽 셀이 원문으로 개시한
+    한정까지 함께 버려지고, 이긴 셀의 missing_limitations가 그대로 "결합 후에도 남는 차이"가
+    됩니다. 그 한정을 개시한 문헌을 **같은 조합 안에** 세워 두고도 그렇습니다. _best_secondary가
+    바로 그 기여를 보고 문헌을 채택했는데 결과에는 반영되지 않는, 앞뒤가 맞지 않는 상태였습니다.
+
+    **판정 라벨은 올리지 않습니다.** 여기서 하는 말은 "그 한정의 기재가 조합 안에 있다"까지이고,
+    "두 문헌을 결합할 동기가 있다"거나 "결합하면 구성이 완성된다"는 그 다음 판단입니다. 후자는
+    이 도구가 확인하지 않으므로 등급에 손대지 않습니다. 결과적으로 그 구성은 '일부 차이'로 남아
+    residual에 계속 오르고, 보고서에는 남은 차이 대신 **어느 문헌이 그 한정을 댔는지**가
+    적힙니다(report._resolved_note). _restore_combination_antecedents와 같은 fail-closed입니다.
+
+    원본 matrix 셀은 감사용 단독 판정이므로 사본에만 기록합니다.
+    """
+    if chosen is None or not chosen.missing_limitations:
+        return chosen
+    # chosen 자체가 앞선 병합에서 이미 해소한 한정은 그대로 보존합니다. 또한 진 쪽 셀이
+    # 합성 셀이라면 그 셀의 해소 출처도 이번 chosen의 누락을 메울 수 있습니다. 이를 빼면
+    # 문헌 1+2가 해소한 한정이 문헌 3과 합칠 때 다시 missing으로 살아납니다.
+    resolved: dict[str, str] = dict(chosen.combination_resolved)
+    missing = set(chosen.missing_limitations)
+    for cell in cells:
+        if cell is None:
+            continue
+        for limitation, document_id in cell.combination_resolved.items():
+            if limitation in missing:
+                resolved.setdefault(limitation, document_id)
+        if cell.document_id == chosen.document_id:
+            continue
+        if not is_eligible_supplement(cell):
+            continue
+        for limitation in sorted(filled_limitations(cell, chosen)):
+            resolved.setdefault(limitation, cell.document_id)
+    if not resolved:
+        return chosen
+    copy = chosen.model_copy(deep=True)
+    copy.missing_limitations = [limitation for limitation in copy.missing_limitations
+                                if limitation not in resolved]
+    copy.combination_resolved = resolved
+    return copy
 
 
 def _restore_combination_antecedents(
@@ -543,13 +659,22 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
         if not targets:
             break
         candidate = _best_secondary(claim, matrix, merged, targets, gaps,
-                                    exclude={chain.primary, *chain.secondaries})
+                                    exclude={chain.primary, *chain.secondaries},
+                                    scores=_fitness(chain))
         if candidate is None:
             break
         added.append(candidate)
         chain.secondaries.append(candidate)
         merged = _merge(claim, merged, matrix[candidate])
     chain.added = added
+    # 종속항의 상한은 **새로 더한 문헌 수**에 걸리며, 실제로 다음 유효 후보가 남아 있을 때만
+    # 조합을 막은 것입니다. 상속한 문헌 수나 단순한 상한 도달만으로 참이 되지 않습니다.
+    chain.limit_binding = bool(
+        len(added) >= MAX_DEPENDENT_ADDITIONS
+        and _best_secondary(
+            claim, matrix, merged, supplement_needed_labels(claim, merged),
+            no_correspondence_labels(claim, merged),
+            exclude={chain.primary, *chain.secondaries}, scores=_fitness(chain)))
 
     chain.uncovered = no_correspondence_labels(claim, merged)
     chain.residual = difference_labels(claim, merged)
@@ -622,7 +747,8 @@ def _element_coverage(claim: Claim, chain: ChainInfo, merged: dict[str, ElementM
             adopted_judgment=adopted.judgment if adopted else "대응 없음",
             adopted_role=_role_of(adopted.document_id, chain) if adopted else "미대응",
             residual_difference=residual_difference(adopted),
-            candidates=[_candidate_row(document_id, matrix[document_id].get(label), primary, adopted)
+            candidates=[_candidate_row(document_id, matrix[document_id].get(label), primary,
+                                       adopted)
                         for document_id in sorted(matrix)],
         ))
     return coverages
@@ -631,6 +757,8 @@ def _element_coverage(claim: Claim, chain: ChainInfo, merged: dict[str, ElementM
 def _candidate_row(document_id: str, match: ElementMatch | None, primary: ElementMatch | None,
                    adopted: ElementMatch | None) -> SupplementCandidate:
     reason = ineligible_reason(match)
+    adopted_sources = ({adopted.document_id, *adopted.combination_resolved.values(),
+                        *adopted.antecedent_resolved_by} if adopted else set())
     return SupplementCandidate(
         document_id=document_id,
         judgment=match.judgment if match else "대응 없음",
@@ -638,11 +766,11 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         verify=match.verify if match else "empty",
         has_quote=bool(match and match.quote),
         missing_count=len(match.missing_limitations) if match else 0,
-        gain=supplement_gain(match, primary),
+        gain=_supplement_step(match, primary),
         better_than_primary=is_better_match(match, primary),
         eligible=not reason,
         rejected_reason=reason,
-        adopted=bool(adopted and adopted.document_id == document_id),
+        adopted=document_id in adopted_sources,
         sample_count=match.sample_count if match else 0,
         sample_agreement=match.sample_agreement if match else 0.0,
         sample_early_exit=bool(match and match.sample_early_exit),
