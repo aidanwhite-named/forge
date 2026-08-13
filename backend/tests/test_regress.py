@@ -107,7 +107,12 @@ def test_residual_and_uncovered_expectations_are_scored():
 
 
 def test_a_stale_frozen_decomposition_is_a_failure():
-    expected = {"adjudicated": True, "decomposition_version": 4, "claims": {}}
+    """분해 프롬프트가 바뀌면 그 위에서 확정한 기대값도 다시 봐야 한다.
+
+    세대는 프롬프트 문면의 해시라(cache.fingerprint) 사람이 올리는 번호가 아니다. 기대값에
+    적어 둔 세대와 실행의 세대가 다르면, 사람이 확정할 때 본 분해가 지금의 분해가 아니다.
+    """
+    expected = {"adjudicated": True, "decomposition_generation": "옛 세대", "claims": {}}
     findings = regress.score(_observation("동일"), expected)
     assert [item["ok"] for item in findings] == [False]
     assert "decomposition" in findings[0]["reason"]
@@ -202,3 +207,82 @@ def test_a_sampled_observation_can_still_be_scored_and_diffed():
                 "claims": {"1": {"A": {"corresponded": True, "min_grade": "실질적 동일"}}}}
     assert all(item["ok"] for item in regress.score(merged, expected))
     assert regress.diff(_observation("실질적 동일", disclosed=2, total=2), merged) == []
+
+
+def test_repeated_runs_do_not_switch_off_invariant_scoring():
+    """--runs를 붙이면 불변식 채점이 꺼지던 결손.
+
+    _report는 'invariants' **키의 존재**를 보고 "기록 없음"을 판단한다. aggregate가 그 키를
+    버리면 반복 측정 결과는 언제나 "불변식 도입 이전 관측"으로 읽혀 위반이 있어도 통과한다.
+    안정성을 재려고 쓰는 모드가, 기대값 없이도 도는 유일한 채점을 끄는 셈이었다.
+    """
+    clean, broken = _observation("동일"), _observation("동일")
+    clean["invariants"] = []
+    broken["invariants"] = ["[불변식 P1] 청구항 1 (B): 공백으로 적었으나 근거가 있습니다"]
+
+    merged = regress.aggregate([clean, clean, clean])
+    assert merged["invariants"] == []
+
+    # 한 회차라도 깨졌으면 위반이다. 간헐적으로만 깨지는 쪽이 오히려 오래 살아남는다.
+    merged = regress.aggregate([clean, clean, broken])
+    assert len(merged["invariants"]) == 1
+    assert "회차 1/3에서만" in merged["invariants"][0]
+
+
+def test_a_run_without_invariant_records_is_not_reported_as_clean():
+    """없는 것을 '위반 없음'으로 적으면 옛 관측이 전부 초록으로 보인다."""
+    merged = regress.aggregate([_observation("동일"), _observation("동일")])
+    assert "invariants" not in merged
+
+
+def test_the_pin_flag_and_decomposition_survive_aggregation():
+    """--runs --pin 결과에서 핀 여부가 사라지면 "앱 경로가 아니다"라는 경고가 사라진다."""
+    runs = []
+    for shape in ("2한정", "2한정", "5한정"):
+        observation = _observation("동일")
+        observation["pinned_decomposition"] = True
+        observation["decomposition"] = {"1": {"A": shape}}
+        runs.append(observation)
+
+    merged = regress.aggregate(runs)
+
+    assert merged["pinned_decomposition"] is True
+    # 분해가 갈린 회차가 있으면 등급 변화를 비교 단계 탓으로 읽으면 안 된다.
+    assert merged["decomposition_spread"]["stable"] is False
+    assert merged["decomposition_spread"]["unstable"]["청구항 1 (A)"] == ["2한정", "5한정"]
+
+
+def test_a_label_seen_in_only_one_run_is_counted_as_unstable():
+    """분모를 '그 구성이 나타난 회차'로 잡으면 1/1 즉 완전 안정으로 집계된다.
+
+    _report의 불안정 목록은 runs > 1을 요구하므로 그 구성은 경고에서 통째로 빠진다. 분해가
+    흔들리면 불안정이 정확히 이 형태로 나타나므로, 이 셀을 지우면 반복 측정이 자기가 재려던
+    것을 못 본다.
+    """
+    with_label, without_label = _observation("동일"), _observation("동일")
+    del without_label["claims"]["1"]["elements"]["A"]
+
+    element = regress.aggregate([with_label, without_label, without_label])["claims"]["1"]["elements"]["A"]
+
+    assert element["runs"] == 3 and element["observed_runs"] == 1
+    assert element["stability"] == "1/3"
+    assert element["hits"] != element["runs"]          # _report의 불안정 판정 조건
+
+
+def test_a_limitation_count_that_moves_between_runs_is_recorded():
+    """한정 수가 갈리면 개시 수 중앙값과 짝이 맞지 않는 분모가 된다."""
+    merged = regress.aggregate([_observation("동일", total=2), _observation("동일", total=2),
+                                _observation("동일", total=8)])
+    element = merged["claims"]["1"]["elements"]["A"]
+    assert element["total"] == 2 and element["total_spread"] == {2: 2, 8: 1}
+
+
+def test_a_claim_missing_from_one_run_does_not_stop_aggregation():
+    """분해가 실패한 회차가 섞여도 집계는 계속되어야 한다."""
+    complete, empty = _observation("동일"), _observation("동일")
+    empty["claims"] = {}
+
+    merged = regress.aggregate([complete, empty, complete])
+
+    assert merged["claims"]["1"]["runs"] == 3
+    assert merged["claims"]["1"]["observed_runs"] == 2
