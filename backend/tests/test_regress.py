@@ -3,6 +3,7 @@
 하니스가 조용히 틀리면 그때부터 모든 프롬프트 수정이 근거 없이 진행된다. 특히
 "채점하지 않았는데 통과로 세는" 실수는 겉보기에 초록이라 오래 살아남는다.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -275,6 +276,96 @@ def test_a_limitation_count_that_moves_between_runs_is_recorded():
                                 _observation("동일", total=8)])
     element = merged["claims"]["1"]["elements"]["A"]
     assert element["total"] == 2 and element["total_spread"] == {2: 2, 8: 1}
+
+
+def test_repeated_runs_bypass_the_decomposition_cache(monkeypatch, tmp_path):
+    """분해 캐시를 그대로 두면 일반 반복 실행이 회차마다 같은 분해를 재사용한다.
+
+    claims.assign_importance는 청구항 원문 해시로 공유 캐시를 먼저 읽는다. 구성대비·의미검증
+    캐시만 비우면 분해는 고정된 채로 남고, --pin 실행도 등록된 분해를 쓰므로 양쪽 다 분해가
+    고정된다. 두 벌을 비교해 분해 단계의 기여를 분리하려던 실험이 아무것도 재지 못한다.
+    """
+    from app import cache as cache_module
+
+    seen: list = []
+
+    def fake_run_case(case, progress=None, save=True, pin=False, slots=("latest",)):
+        seen.append(cache_module.DECOMPOSITION_CACHE_DIR)
+        return _observation("동일") | {"invariants": [], "pinned_decomposition": pin}
+
+    monkeypatch.setattr(regress, "run_case", fake_run_case)
+    original = cache_module.DECOMPOSITION_CACHE_DIR
+
+    regress.run_case_repeatedly({"id": "x", "dir": tmp_path}, 3)
+
+    assert len(set(seen)) == 3                    # 회차마다 다른 임시 디렉터리
+    assert original not in seen                   # 평소 캐시는 읽지도 쓰지도 않는다
+    assert cache_module.DECOMPOSITION_CACHE_DIR == original      # finally에서 복구
+
+
+def test_every_run_keeps_its_own_artifacts(monkeypatch, tmp_path):
+    """마지막 회차만 남기면 불안정을 발견하고도 회차별 진단에 판정을 다시 받아야 한다."""
+    slots_seen: list = []
+
+    def fake_run_case(case, progress=None, save=True, pin=False, slots=("latest",)):
+        slots_seen.append(slots)
+        return _observation("동일") | {"invariants": []}
+
+    monkeypatch.setattr(regress, "run_case", fake_run_case)
+    regress.run_case_repeatedly({"id": "x", "dir": tmp_path}, 3)
+
+    assert slots_seen == [("run-1",), ("run-2",), ("run-3", "latest")]
+
+
+def test_a_decomposition_that_keeps_its_count_but_changes_content_is_unstable():
+    """같은 3한정이라도 한정 문언이나 core/qualifier 배분이 바뀌면 같은 분해가 아니다.
+
+    개수만 비교하면 그 변동이 '안정'으로 집계되고, 등급이 흔들린 원인을 비교 단계에서만
+    찾게 된다. 원문을 관측에 남기지 않으려면 구조 해시가 유일한 방법이다.
+    """
+    same_count = [{"claims": {"1": {"A": "3한정 #aaaaaaaaaaaa"}}},
+                  {"claims": {"1": {"A": "3한정 #bbbbbbbbbbbb"}}}]
+    spread = regress._decomposition_spread(
+        [{"decomposition": item["claims"]} for item in same_count])
+
+    assert spread["stable"] is False
+    assert spread["unstable"]["청구항 1 (A)"] == ["3한정 #aaaaaaaaaaaa", "3한정 #bbbbbbbbbbbb"]
+
+
+def test_the_structure_digest_reacts_to_more_than_the_limitation_count():
+    """kind 하나만 바뀌어도 그 구성의 근거 요구가 달라지므로 같은 분해로 볼 수 없다."""
+    base = {"label": "A", "text": "…부", "importance": 4, "is_sub": False,
+            "search_terms": ["x"],
+            "limitations": [{"text": "무엇을 함", "kind": "core", "alternative_group": ""}]}
+    moved_kind = {**base, "limitations": [
+        {"text": "무엇을 함", "kind": "qualifier", "alternative_group": ""}]}
+    reworded = {**base, "limitations": [
+        {"text": "무엇을 수행함", "kind": "core", "alternative_group": ""}]}
+
+    assert regress._structure_digest(base) == regress._structure_digest(dict(base))
+    assert regress._structure_digest(base) != regress._structure_digest(moved_kind)
+    assert regress._structure_digest(base) != regress._structure_digest(reworded)
+    # 검색어 순서는 판정을 바꾸지 않으므로 흔들림으로 세지 않는다.
+    assert regress._structure_digest({**base, "search_terms": ["x"]}) == \
+        regress._structure_digest({**base, "search_terms": ["x"]})
+
+
+def test_pinned_and_normal_measurements_are_kept_in_separate_files(tmp_path):
+    """--pin 실행이 직전 일반 실행의 -latest 별칭을 덮어쓰면 두 벌 비교가 성립하지 않는다."""
+    case = {"dir": tmp_path}
+    normal = regress.aggregate([_observation("동일") | {"pinned_decomposition": False}] * 2)
+    pinned = regress.aggregate([_observation("일부 유사") | {"pinned_decomposition": True}] * 2)
+
+    assert normal["kind"] == "sampled" and pinned["kind"] == "sampled-pinned"
+    regress.save_observation(case, normal)
+    regress.save_observation(case, pinned)
+
+    observations = tmp_path / "observations"
+    assert (observations / "sampled-latest.json").exists()
+    assert (observations / "sampled-pinned-latest.json").exists()
+    # 일반 실행 결과가 핀 실행에 덮이지 않았는지 확인한다.
+    kept = json.loads((observations / "sampled-latest.json").read_text(encoding="utf-8"))
+    assert kept["claims"]["1"]["elements"]["A"]["judgment"] == "동일"
 
 
 def test_a_claim_missing_from_one_run_does_not_stop_aggregation():

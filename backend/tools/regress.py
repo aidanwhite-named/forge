@@ -31,6 +31,7 @@
 무관하게 채점합니다. --adopt로 등록만 해 두면 그날부터 그 사건이 회귀를 잡습니다.
 """
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -48,7 +49,19 @@ from app.report import to_markdown                # noqa: E402
 
 # --- 관측 ---------------------------------------------------------------------
 
-def observe(result, kind: str = "forge", note: str = "", pinned: bool = False) -> dict:
+def _kind(base: str, pinned: bool) -> str:
+    """핀 실행과 일반 실행의 관측을 다른 파일 계열로 가릅니다.
+
+    save_observation이 kind로 파일 이름을 짓기 때문에, 같은 이름을 쓰면 --pin 실행이 직전
+    일반 실행의 -latest 별칭을 덮어씁니다. 일반 N회와 핀 N회를 나란히 놓고 분해 단계의
+    기여를 분리하려는 것이 이 모드의 목적인데, 두 벌 중 하나가 남지 않으면 비교가 성립하지
+    않습니다.
+    """
+    return f"{base}-pinned" if pinned else base
+
+
+def observe(result, kind: str = "forge", note: str = "", pinned: bool = False,
+            decomposition: dict | None = None) -> dict:
     """AnalysisResult를 사건 간 비교가 가능한 최소 형태로 줄입니다.
 
     보고서 문장이나 발췌는 담지 않습니다. 그것까지 넣으면 표현이 조금 바뀔 때마다 관측이
@@ -79,25 +92,57 @@ def observe(result, kind: str = "forge", note: str = "", pinned: bool = False) -
             "pending": list(report.chain.combination_pending),
             "elements": elements,
         }
-    return {"kind": kind, "at": datetime.now(timezone.utc).isoformat(), "note": note,
-            "versions": _versions(), "pinned_decomposition": pinned,
+    return {"kind": _kind(kind, pinned), "at": datetime.now(timezone.utc).isoformat(),
+            "note": note, "versions": _versions(), "pinned_decomposition": pinned,
             "invariants": [item for item in result.verify_notes if item.startswith("[불변식")],
-            "decomposition": _decomposition_fingerprint(result),
+            "decomposition": _decomposition_fingerprint(result, decomposition),
             "claims": claims}
 
 
-def _decomposition_fingerprint(result) -> dict:
-    """구성별 (core 수, 전체 한정 수). 분해가 달라졌는지 한 줄로 보기 위한 것입니다.
+def _decomposition_fingerprint(result, decomposition: dict | None = None) -> dict:
+    """구성별 한정 수와 분해 구조 해시. 분해가 달라졌는지 한 줄로 보기 위한 것입니다.
 
     한정 문언 전체를 남기면 관측 파일에 청구항 원문이 그대로 들어가고, 표현이 한 글자만
-    달라져도 전 구성이 '변경'으로 찍혀 무엇이 실제로 변했는지 묻힙니다. 결론을 가르는 것은
-    문언 자체가 아니라 **core가 몇 개이고 무엇을 묶었는가**이므로 그 형태만 셉니다.
+    달라져도 전 구성이 '변경'으로 찍혀 무엇이 실제로 변했는지 묻힙니다. 그래서 사람이 읽는
+    자리에는 개수만 씁니다.
+
+    **개수만으로는 분해가 같은지 알 수 없습니다.** 같은 3한정이라도 한정 문언이 다르거나
+    core/qualifier 배분이 바뀌면 비교 캐시 키·판정 근거·검색어가 전부 달라집니다. 개수가
+    같다는 이유로 '안정'으로 집계하면, 분해가 회차마다 흔들리는데도 그 사실이 측정에서
+    사라집니다 — 일반 실행과 --pin 실행을 비교하는 목적이 정확히 그것을 재는 것입니다.
+    그래서 개수 옆에 구조 해시를 함께 답니다. 해시라서 원문은 새어 나가지 않습니다.
     """
+    stored = (decomposition or {}).get("claims") or {}
     fingerprint: dict[str, dict[str, str]] = {}
     for report in result.reports:
-        fingerprint[str(report.claim_number)] = {
-            item.label: f"{item.total_limitations}한정" for item in report.claims}
+        number = str(report.claim_number)
+        digests = {entry.get("label"): _structure_digest(entry)
+                   for entry in stored.get(number) or []}
+        fingerprint[number] = {
+            item.label: f"{item.total_limitations}한정"
+                        + (f" #{digests[item.label]}" if item.label in digests else "")
+            for item in report.claims}
     return fingerprint
+
+
+def _structure_digest(entry: dict) -> str:
+    """구성 하나의 분해 구조 해시.
+
+    판정을 좌우하는 것만 넣습니다. 구성 문언·중요도·종속 여부·검색어와 한정별
+    문언·kind·대체군입니다. 이 중 하나만 달라져도 그 구성의 비교 캐시 키와 근거 요구가
+    달라지므로, 같은 분해로 볼 수 없습니다.
+    """
+    payload = {
+        "text": entry.get("text", ""),
+        "importance": entry.get("importance"),
+        "is_sub": entry.get("is_sub"),
+        "search_terms": sorted(entry.get("search_terms") or []),
+        "limitations": [{"text": item.get("text", ""), "kind": item.get("kind", ""),
+                         "alternative_group": item.get("alternative_group", "")}
+                        for item in entry.get("limitations") or []],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def _grade_of(item) -> str:
@@ -302,7 +347,8 @@ def load_case(directory: pathlib.Path) -> dict:
     }
 
 
-def run_case(case: dict, progress=None, save: bool = True, pin: bool = False) -> dict:
+def run_case(case: dict, progress=None, save: bool = True, pin: bool = False,
+             slots: tuple[str, ...] = ("latest",)) -> dict:
     """사건 하나를 동결된 문헌으로 다시 판정합니다. PDF 재추출은 하지 않습니다.
 
     **분해는 기본적으로 동결하지 않습니다.** pinned_decomposition을 항상 넘기면 하니스가 도는
@@ -318,17 +364,22 @@ def run_case(case: dict, progress=None, save: bool = True, pin: bool = False) ->
     from app.pipeline import analyze, summarize_matrix
 
     documents = [Document.model_validate(item) for item in case["documents"]]
+    # analyze가 이 dict를 제자리에서 채웁니다(claims.assign_importance). **이 회차에 실제로
+    # 쓰인 분해가 남는 곳은 여기뿐입니다** — 보고서 행에는 한정 개수밖에 없어서, 이것 없이는
+    # 회차 간 분해가 갈렸는지를 개수로만 짐작해야 합니다.
+    decomposition: dict = {}
     result = analyze(f"regress-{case['id']}", case["claims_text"], documents,
                      case["case"].get("analysis_prompt", ""), progress,
-                     decomposition={},
+                     decomposition=decomposition,
                      pinned_decomposition=case["decomposition"] if pin else None)
-    observation = observe(result, note=f"regress {case['id']}", pinned=pin)
+    observation = observe(result, note=f"regress {case['id']}", pinned=pin,
+                          decomposition=decomposition)
     if not save:
         return observation
     # 관측은 셀 판정만 담습니다. 어느 한정이 왜 빠졌는지는 거기 없어서, 등급이 한 칸
     # 달라진 이유를 물으려면 판정을 다시 받아야 했습니다. 전체 산출물을 함께 남겨 두면
     # 진단이 공짜가 됩니다. cases/는 저장소 밖이라 원문 발췌가 새어 나가지 않습니다.
-    _save_artifacts(case, result, summarize_matrix(result))
+    _save_artifacts(case, result, summarize_matrix(result), slots)
     return observation
 
 
@@ -343,13 +394,20 @@ def run_case_repeatedly(case: dict, runs: int, progress=None, pin: bool = False)
     **판정 캐시를 우회합니다.** 우회하지 않으면 2회차부터는 1회차 판정을 그대로 읽어
     변동이 0으로 측정됩니다 — 측정하려는 대상을 측정 도구가 지워 버립니다. 회차마다
     빈 임시 디렉터리를 캐시로 물려, 이 모드의 결과가 평소 캐시를 오염시키지도 않습니다.
+
+    **분해 캐시도 함께 우회합니다.** 구성대비·의미검증만 비우면 청구항 분해는
+    claims.assign_importance가 공유 캐시(cache.decomposition_key)에서 그대로 읽어 옵니다.
+    그러면 일반 실행 N회가 **같은 분해를 N번 재사용**하고, --pin 실행도 등록된 분해를 쓰므로
+    양쪽 다 분해가 고정된 상태가 됩니다. 두 벌을 비교해 분해 단계의 기여를 분리하려던
+    실험이 아무것도 재지 못하게 됩니다 — 분해는 한정 문언·core/qualifier 배분·비교 캐시
+    키를 전부 좌우하므로 이 파이프라인에서 가장 큰 변동원입니다(run_case 참조).
     """
     import tempfile
     from app import cache as cache_module
     from app import entailment as entailment_module
 
     saved = (cache_module.CACHE_DIR, cache_module.ENTAILMENT_CACHE_DIR,
-             entailment_module.CACHE_DIR)
+             cache_module.DECOMPOSITION_CACHE_DIR, entailment_module.CACHE_DIR)
     observations: list[dict] = []
     try:
         for index in range(runs):
@@ -359,13 +417,18 @@ def run_case_repeatedly(case: dict, runs: int, progress=None, pin: bool = False)
                 throwaway = pathlib.Path(scratch)
                 cache_module.CACHE_DIR = throwaway / "compare"
                 cache_module.ENTAILMENT_CACHE_DIR = throwaway / "entailment"
+                cache_module.DECOMPOSITION_CACHE_DIR = throwaway / "decomposition"
                 entailment_module.CACHE_DIR = throwaway / "entailment"
-                for directory in (cache_module.CACHE_DIR, entailment_module.CACHE_DIR):
+                for directory in (cache_module.CACHE_DIR, entailment_module.CACHE_DIR,
+                                  cache_module.DECOMPOSITION_CACHE_DIR):
                     directory.mkdir(parents=True, exist_ok=True)
-                observations.append(run_case(case, progress, save=index == runs - 1, pin=pin))
+                # 회차마다 전체 산출물을 남깁니다. 마지막 회차만 남기면 불안정을 발견하고도
+                # 어느 회차가 어떻게 달랐는지 물으려면 판정을 다시 받아야 합니다.
+                slots = (f"run-{index + 1}",) + (("latest",) if index == runs - 1 else ())
+                observations.append(run_case(case, progress, pin=pin, slots=slots))
     finally:
         (cache_module.CACHE_DIR, cache_module.ENTAILMENT_CACHE_DIR,
-         entailment_module.CACHE_DIR) = saved
+         cache_module.DECOMPOSITION_CACHE_DIR, entailment_module.CACHE_DIR) = saved
     return aggregate(observations)
 
 
@@ -432,9 +495,10 @@ def aggregate(observations: list[dict]) -> dict:
                for key, votes in list_votes.items()},
             "elements": elements,
         }
-    merged = {"kind": "sampled", "at": base["at"], "note": f"{runs}회 반복",
+    pinned = bool(base.get("pinned_decomposition"))
+    merged = {"kind": _kind("sampled", pinned), "at": base["at"], "note": f"{runs}회 반복",
               "versions": base.get("versions"),
-              "pinned_decomposition": base.get("pinned_decomposition", False),
+              "pinned_decomposition": pinned,
               "decomposition": base.get("decomposition", {}),
               "decomposition_spread": _decomposition_spread(observations),
               "claims": claims}
@@ -491,19 +555,27 @@ def _decomposition_spread(observations: list[dict]) -> dict:
     return {"stable": not unstable, "unstable": unstable}
 
 
-def _save_artifacts(case: dict, result, judgment: dict) -> None:
-    directory = case["dir"] / "runs" / "latest"
-    directory.mkdir(parents=True, exist_ok=True)
+def _save_artifacts(case: dict, result, judgment: dict,
+                    slots: tuple[str, ...] = ("latest",)) -> None:
+    """산출물을 지정한 슬롯마다 보존합니다.
+
+    반복 측정에서 마지막 회차만 남기면, 불안정하다는 사실을 발견해도 **어느 회차에서 어떤
+    한정·근거·오류가 달랐는지** 물으려면 판정을 다시 받아야 합니다. 회차별 산출물은 이미
+    만들어져 있으므로 그것을 버리지 않는 것만으로 진단이 공짜가 됩니다.
+    """
     try:
-        (directory / "result.json").write_text(
-            json.dumps(result.model_dump(), ensure_ascii=False), encoding="utf-8")
-        (directory / "judgment.json").write_text(
-            json.dumps(judgment, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(result.model_dump(), ensure_ascii=False)
+        summary = json.dumps(judgment, ensure_ascii=False)
         # 회귀 판정만 맞고 실제 사용자 보고서가 어긋나는 퇴행도 사람이 바로 확인할 수 있게
         # 앱과 같은 렌더러로 최신 보고서를 함께 보존합니다.
         markdown = to_markdown(result)
-        (directory / "report.md").write_text(markdown, encoding="utf-8")
-        (directory / "report.txt").write_text(markdown, encoding="utf-8")
+        for slot in slots:
+            directory = case["dir"] / "runs" / slot
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "result.json").write_text(payload, encoding="utf-8")
+            (directory / "judgment.json").write_text(summary, encoding="utf-8")
+            (directory / "report.md").write_text(markdown, encoding="utf-8")
+            (directory / "report.txt").write_text(markdown, encoding="utf-8")
     except OSError:
         pass  # 진단용 부산물입니다. 저장 실패로 회귀 실행을 멈추지 않습니다.
 
@@ -598,7 +670,7 @@ def _report(case: dict, observation: dict, previous: dict | None) -> bool:
             print("    ※ 청구항 분해가 회차마다 달라졌습니다 — 위 변화는 분해 차이일 수 있습니다")
             for key, shapes in drift.items():
                 print(f"      {key}: {shapes}")
-    elif observation.get("kind") == "sampled":
+    elif str(observation.get("kind") or "").startswith("sampled"):
         print("  [안정성] 전 구성·조합·분해가 회차 간 일치")
 
     if observation.get("pinned_decomposition"):
@@ -655,7 +727,8 @@ def main() -> int:
     parser.add_argument("--cases-dir", default=str(DEFAULT_CASES_DIR))
     parser.add_argument("--case", action="append", help="사건 id (여러 번 지정 가능)")
     parser.add_argument("--score-only", action="store_true",
-                        help="LLM을 부르지 않고 저장된 forge-latest.json만 채점합니다")
+                        help="LLM을 부르지 않고 저장된 최신 관측만 채점합니다 "
+                             "(--pin과 함께 쓰면 핀 실행의 관측을 봅니다)")
     parser.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"),
                         help="관측 파일 두 개를 직접 대조합니다")
     parser.add_argument("--runs", type=int, default=1,
@@ -703,7 +776,9 @@ def main() -> int:
     outcomes: list[bool | None] = []
     for directory in directories:
         case = load_case(directory)
-        latest = directory / "observations" / "forge-latest.json"
+        # 기준선도 실행 종류를 따라갑니다. 핀 실행을 직전 일반 실행과 대조하면 분해를
+        # 고정한 효과가 회귀로 찍힙니다 — 두 실행은 애초에 다른 것을 재고 있습니다.
+        latest = directory / "observations" / f"{_kind('forge', args.pin)}-latest.json"
         previous = json.loads(latest.read_text(encoding="utf-8")) if latest.exists() else None
         if args.score_only:
             if previous is None:
