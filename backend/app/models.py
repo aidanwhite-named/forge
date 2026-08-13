@@ -234,9 +234,13 @@ class SupplementCandidate(BaseModel):
     has_quote: bool = False
     missing_count: int = 0
     gain: float = 0.0                         # 주 인용발명 대비 보완 이득
+    merged_gain: float = 0.0                  # **채택 조합** 대비 증분 이득. 0이면 중복 후보
     better_than_primary: bool = False
     eligible: bool = False                    # 보완 근거로 쓸 자격이 있는지
     rejected_reason: str = ""                 # 자격 미달 사유
+    # 채택되지 않은 후보가 왜 빠졌는지. 자격 미달·중복(증분 0)·이득 문턱 미달·결합 상한 중
+    # 하나입니다. **비어 있으면 사유 없이 사라진 것**이고, 그때만 불변식 P2가 발화합니다.
+    excluded_reason: str = ""
     adopted: bool = False                     # 최종 결합에서 이 구성의 근거로 채택되었는지
     # 표본 합의 계측치(ElementMatch에서 그대로 옮김). 이 행은 (구성 × 문헌) 전수를 담으므로
     # 셀 단위 일치율을 감사 데이터에서 집계할 수 있는 유일한 자리입니다.
@@ -337,6 +341,13 @@ class ChainInfo(BaseModel):
     # 않으려면 이 값이 필요합니다. 거짓이면 자리가 남아 있는데도 채택되지 않은 것이고
     # (보완 후보 평가에서 탈락), 참일 때만 "상한을 넘어 세우지 않았다"고 쓸 수 있습니다.
     limit_binding: bool = False
+    # 채택이 끝난 뒤, 미채택 문헌이 **조합에 더 보탤 수 있는** 문헌 단위 이득.
+    #
+    # 후보 행의 gain은 주 인용발명 대비입니다. 그것만으로는 "주 인용발명보다는 낫지만 이미
+    # 채택된 보조 인용발명이 같은 것을 대고 있는" 문헌과 "아무도 대지 못한 것을 대는데 빠진"
+    # 문헌을 구별할 수 없습니다. 불변식 P2가 물어야 하는 것은 뒤쪽 하나뿐인데, 앞쪽까지
+    # 위반으로 찍히면 동률 후보가 흔한 만큼 경고가 늘 켜져 진짜 위반이 묻힙니다.
+    unadopted_gain: dict[str, float] = {}
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
     element_coverage: list[ElementCoverage] = []

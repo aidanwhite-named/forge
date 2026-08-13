@@ -6,7 +6,8 @@ import pytest
 from app import agy, cache, claims as claims_module, compare, pipeline, priorart
 from app.chain import build_chain
 from app.models import (ChainInfo, Chunk, Claim, ClaimElement, ClaimReport, ClaimResult, Document,
-                        DocumentMapping, ElementMatch, EvidenceSpan, LimitationCheck)
+                        DocumentMapping, ElementCoverage, ElementMatch, EvidenceSpan,
+                        LimitationCheck, SupplementCandidate)
 from app.claims import parse_claims
 from app.compare import DOCUMENT_BUDGET_CHARS
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
@@ -1487,3 +1488,56 @@ def test_invariants_stay_quiet_while_the_comparison_is_incomplete():
     matrix = _matrix(_evidenced("1", "A"))
     chain = ChainInfo(claim_number=1, track="analysis_incomplete", uncovered=["A"])
     assert pipeline_invariants([_report(chain)], {1: matrix}) == []
+
+
+def _candidate(document_id: str, **overrides) -> SupplementCandidate:
+    row = {"document_id": document_id, "judgment": "실질적 동일", "directness": "direct",
+           "verify": "verified", "has_quote": True, "eligible": True}
+    return SupplementCandidate(**{**row, **overrides})
+
+
+def test_p2_stays_quiet_for_a_duplicate_candidate_the_combination_already_covers():
+    """채택 조합이 같은 기여를 이미 확보했다면 그 후보는 정상 제외다.
+
+    종전 P2는 주 인용발명 대비 이득(row.gain)과 limit_binding을 맞댔는데 둘은 기준선이
+    다르다 — 앞은 주 인용발명 단독, 뒤는 채택 조합 전체다. 실측에서 두 문헌이 같은 구성에
+    정확히 같은 이득을 냈고, 하나가 채택되자 다른 하나가 매 회차 위반으로 보고됐다.
+    """
+    matrix = _matrix(_evidenced("2", "A"))
+    chain = ChainInfo(
+        claim_number=1, track="inventive_step_combination", primary="1", secondaries=["3"],
+        residual=["A"],
+        element_coverage=[ElementCoverage(label="A", candidates=[
+            _candidate("2", gain=0.44, merged_gain=0.0,
+                       excluded_reason="채택 조합이 같은 기여를 이미 확보함(증분 0)")])])
+
+    assert not [note for note in pipeline_invariants([_report(chain)], {1: matrix})
+                if "[불변식 P2]" in note]
+
+
+def test_p2_catches_a_candidate_that_vanished_without_a_reason():
+    """조합에 더 보탤 것이 있는데 사유 없이 빠졌다면 게이트 하나가 조용히 막고 있는 것이다."""
+    matrix = _matrix(_evidenced("2", "A"))
+    chain = ChainInfo(
+        claim_number=1, track="inventive_step_combination", primary="1", secondaries=["3"],
+        residual=["A"],
+        element_coverage=[ElementCoverage(label="A", candidates=[
+            _candidate("2", gain=0.44, merged_gain=0.44, excluded_reason="")])])
+
+    notes = pipeline_invariants([_report(chain)], {1: matrix})
+    assert any("[불변식 P2]" in note and "제외 사유도 기록되지 않았습니다" in note for note in notes)
+
+
+def test_p2_still_checks_when_the_combination_limit_binds():
+    """상한이 걸린 실행이라고 통째로 건너뛰면, 그 안에서 사유 없이 사라진 후보를 놓친다.
+
+    상한 자체가 이제 후보 행에 사유로 적히므로 미리 걸러 낼 필요가 없다.
+    """
+    matrix = _matrix(_evidenced("2", "A"))
+    chain = ChainInfo(
+        claim_number=1, track="inventive_step_combination", primary="1", secondaries=["3"],
+        residual=["A"], limit_binding=True,
+        element_coverage=[ElementCoverage(label="A", candidates=[
+            _candidate("2", gain=0.44, merged_gain=0.44, excluded_reason="")])])
+
+    assert any("[불변식 P2]" in note for note in pipeline_invariants([_report(chain)], {1: matrix}))

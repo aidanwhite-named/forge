@@ -455,10 +455,33 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
     더 가까운 문헌**(단독 적합도)을 세우는 것이 더 방어 가능한 거절 이유이므로 그것을 다음
     기준으로 둡니다. 그래도 같으면 문헌 번호 순이라 결과는 항상 재현됩니다.
     """
-    gap_labels = set(gaps)
     fitness = scores or {}
     best, best_key = None, None
-    for document_id in sorted(matrix):                 # 동률일 때 항상 같은 문헌이 뽑히도록 고정
+    for document_id, (gain, useful) in _supplement_gains(
+            claim, matrix, merged, targets, gaps, exclude).items():
+        if not useful:
+            continue
+        key = (gain, useful, fitness.get(document_id, 0.0))
+        if best_key is None or key > best_key:
+            best, best_key = document_id, key
+    return best if best_key and best_key[0] >= MIN_SUPPLEMENT_GAIN else None
+
+
+def _supplement_gains(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch],
+                      targets: list[str], gaps: list[str],
+                      exclude: set[str]) -> dict[str, tuple[float, int]]:
+    """문헌별 (증분 이득, 기여한 구성 수). 선정과 감사 기록이 **같은 값**을 보게 합니다.
+
+    이 계산이 _best_secondary 안에만 있으면, 채택되지 않은 문헌이 왜 빠졌는지 나중에 다시
+    물을 수 없습니다. 후보 행에는 주 인용발명 대비 이득만 남아 있어서, 이미 채택된 보조
+    인용발명이 같은 것을 대고 있는 중복 후보와 아무도 대지 못한 것을 대는 후보가 같아 보입니다.
+
+    문헌 순서를 고정해 넣습니다(dict는 삽입 순서를 지킵니다). 동률일 때 항상 같은 문헌이
+    뽑혀야 재실행 결과가 재현됩니다.
+    """
+    gap_labels = set(gaps)
+    gains: dict[str, tuple[float, int]] = {}
+    for document_id in sorted(matrix):
         if document_id in exclude:
             continue
         matches = matrix[document_id]
@@ -472,18 +495,11 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
                 continue
             if label in gap_labels and not _fills_a_gap(candidate, current):
                 continue
-            if label in gap_labels:
-                weight = GAP_PRIORITY
-            else:
-                weight = 1.0
+            weight = GAP_PRIORITY if label in gap_labels else 1.0
             gain += weight * step * _importance(claim, label)
             useful += 1
-        if not useful:
-            continue
-        key = (round(gain, 6), useful, fitness.get(document_id, 0.0))
-        if best_key is None or key > best_key:
-            best, best_key = document_id, key
-    return best if best_key and best_key[0] >= MIN_SUPPLEMENT_GAIN else None
+        gains[document_id] = (round(gain, 6), useful)
+    return gains
 
 
 def _fills_a_gap(candidate: ElementMatch | None, current: ElementMatch | None) -> bool:
@@ -808,6 +824,13 @@ def _finalize(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch],
         score.detail = {**score.detail, "role": _role_of(score.document_id, chain)}
     chain.combined_similarity = chain.combined_similarity or round(
         sum(row["importance"] * row["similarity"] for row in rows) / (sum(row["importance"] for row in rows) or 1) * 100, 2)
+    # 후보 행보다 **먼저** 채워야 합니다. 미채택 사유가 이 값에서 나옵니다.
+    if chain.primary:
+        chain.unadopted_gain = {
+            document_id: gain for document_id, (gain, _) in _supplement_gains(
+                claim, matrix, merged, supplement_needed_labels(claim, merged),
+                no_correspondence_labels(claim, merged),
+                exclude={chain.primary, *chain.secondaries}).items()}
     chain.element_coverage = _element_coverage(claim, chain, merged, matrix)
     return chain
 
@@ -833,17 +856,19 @@ def _element_coverage(claim: Claim, chain: ChainInfo, merged: dict[str, ElementM
             adopted_role=_role_of(adopted.document_id, chain) if adopted else "미대응",
             residual_difference=residual_difference(adopted),
             candidates=[_candidate_row(document_id, matrix[document_id].get(label), primary,
-                                       adopted)
+                                       adopted, chain)
                         for document_id in sorted(matrix)],
         ))
     return coverages
 
 
 def _candidate_row(document_id: str, match: ElementMatch | None, primary: ElementMatch | None,
-                   adopted: ElementMatch | None) -> SupplementCandidate:
+                   adopted: ElementMatch | None, chain: ChainInfo) -> SupplementCandidate:
     reason = ineligible_reason(match)
     adopted_sources = ({adopted.document_id, *adopted.combination_resolved.values(),
                         *adopted.antecedent_resolved_by} if adopted else set())
+    taken = document_id in adopted_sources
+    merged_gain = _supplement_step(match, adopted)
     return SupplementCandidate(
         document_id=document_id,
         judgment=match.judgment if match else "대응 없음",
@@ -852,14 +877,42 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         has_quote=bool(match and match.quote),
         missing_count=len(match.missing_limitations) if match else 0,
         gain=_supplement_step(match, primary),
+        merged_gain=merged_gain,
         better_than_primary=is_better_match(match, primary),
         eligible=not reason,
         rejected_reason=reason,
-        adopted=document_id in adopted_sources,
+        excluded_reason="" if taken else _exclusion_reason(document_id, reason, merged_gain, chain),
+        adopted=taken,
         sample_count=match.sample_count if match else 0,
         sample_agreement=match.sample_agreement if match else 0.0,
         sample_early_exit=bool(match and match.sample_early_exit),
     )
+
+
+def _exclusion_reason(document_id: str, ineligible: str, merged_gain: float,
+                      chain: ChainInfo) -> str:
+    """채택되지 않은 후보가 **왜** 빠졌는지. 빈 문자열이면 사유 없이 사라진 것입니다.
+
+    불변식 P2는 이 값이 비어 있을 때만 발화해야 합니다. 종전에는 주 인용발명 대비 이득만
+    보고 발화했는데, 그 이득과 limit_binding은 **기준선이 다릅니다** — 앞은 주 인용발명
+    단독, 뒤는 채택 조합 전체입니다. 그래서 채택된 보조 인용발명이 이미 같은 것을 대고 있는
+    중복 후보마다 위반이 찍혔습니다. 동률 후보는 흔하므로(실측에서 두 문헌이 같은 구성에
+    정확히 같은 이득을 냈습니다) 그 상태로는 경고가 늘 켜져 진짜 위반이 묻힙니다.
+
+    사유는 좁은 것부터 봅니다. 자격 미달이면 그것이 이유이고, 자격은 있는데 조합이 이미
+    같은 기여를 확보했다면 중복이며, 새로 보탤 것이 있는데도 문헌 단위 이득이 문턱에
+    못 미치면 그것이 이유입니다. 셋 다 아닌데 상한이 실제로 걸렸다면 상한이 이유입니다.
+    """
+    if ineligible:
+        return ineligible
+    if merged_gain <= 0.0:
+        return "채택 조합이 같은 기여를 이미 확보함(증분 0)"
+    remaining = chain.unadopted_gain.get(document_id)
+    if remaining is not None and remaining < MIN_SUPPLEMENT_GAIN:
+        return f"문헌 단위 보완 이득 {remaining} < 문턱 {MIN_SUPPLEMENT_GAIN}"
+    if chain.limit_binding:
+        return f"결합 문헌 수 상한({chain.combination_limit}건)"
+    return ""
 
 
 def _role_of(document_id: str, chain: ChainInfo) -> str:

@@ -1156,3 +1156,64 @@ def test_a_limitation_accepted_in_combination_stops_being_a_gap():
     assert merged["B"].combination_resolved.get(axis) == "1"
     # 문헌 단독 판정은 손대지 않는다.
     assert rejected_check.disclosed is False
+
+
+# --- 미채택 사유 기록 ----------------------------------------------------------
+# 불변식 P2가 물어야 하는 것은 "이득이 있었는가"가 아니라 "왜 빠졌는지 적혀 있는가"다.
+# 이득(주 인용발명 대비)과 limit_binding(채택 조합 대비)은 기준선이 달라서, 둘을 맞대면
+# 채택 조합이 이미 같은 것을 대고 있는 중복 후보마다 위반이 찍힌다.
+
+def test_a_duplicate_candidate_is_recorded_as_a_normal_exclusion():
+    """같은 기여를 내는 두 문헌 중 하나가 채택되면 다른 하나는 '중복'으로 빠진 것이다.
+
+    실측(facade-defect-3d)에서 두 문헌이 같은 구성에 정확히 같은 이득 0.4417을 냈고, 하나가
+    채택되자 다른 하나가 매 회차 P2 위반으로 보고됐다. 동률은 흔하므로 그 상태로는 경고가
+    늘 켜져 진짜 위반이 묻힌다.
+    """
+    matches = (
+        [cell("1", "A", "동일"), cell("1", "B", "대응 없음"), cell("1", "C", "동일")]
+        + [cell("2", "A", "대응 없음"), cell("2", "B", "실질적 동일"), cell("2", "C", "대응 없음")]
+        + [cell("3", "A", "대응 없음"), cell("3", "B", "실질적 동일"), cell("3", "C", "대응 없음")]
+    )
+    chain = build(claim(), matches)
+    rows = {row.document_id: row for row in coverage_of(chain, "B").candidates}
+
+    adopted = [document_id for document_id, row in rows.items() if row.adopted]
+    assert len(adopted) == 1                        # 둘 중 하나만 채택된다
+    loser = "3" if adopted == ["2"] else "2"
+    assert rows[loser].gain > 0                     # 주 인용발명 대비로는 여전히 이득이 있다
+    assert rows[loser].merged_gain == 0.0           # 조합 대비 증분은 0이다
+    assert "증분 0" in rows[loser].excluded_reason
+
+
+def test_every_unadopted_candidate_carries_a_reason():
+    """사유 없이 사라진 후보가 있으면 게이트 하나가 조용히 경로를 막고 있다는 뜻이다."""
+    matches = (
+        [cell("1", "A", "동일"), cell("1", "B", "대응 없음"), cell("1", "C", "일부 유사")]
+        + [cell("2", "A", "일부 유사"), cell("2", "B", "실질적 동일"), cell("2", "C", "대응 없음")]
+        + [cell("3", "A", "대응 없음"), cell("3", "B", "일부 차이"), cell("3", "C", "실질적 동일")]
+        + [cell("4", "A", "대응 없음"), cell("4", "B", "대응 없음"), cell("4", "C", "대응 없음")]
+    )
+    chain = build(claim(), matches)
+
+    for coverage in chain.element_coverage:
+        for row in coverage.candidates:
+            if row.adopted:
+                assert row.excluded_reason == ""
+            else:
+                assert row.excluded_reason, f"{coverage.label}/문헌 {row.document_id}에 사유가 없다"
+
+
+def test_the_combination_limit_is_recorded_as_the_reason_when_it_binds():
+    """상한이 실제로 걸려 빠진 문헌은 그 사실이 후보 행에 적혀야 한다."""
+    matches = (
+        [cell("1", "A", "동일"), cell("1", "B", "대응 없음"), cell("1", "C", "대응 없음")]
+        + [cell("2", "A", "대응 없음"), cell("2", "B", "실질적 동일"), cell("2", "C", "대응 없음")]
+        + [cell("3", "A", "대응 없음"), cell("3", "B", "대응 없음"), cell("3", "C", "실질적 동일")]
+    )
+    chain = build(claim(), matches)
+    assert chain.limit_binding                       # 자리가 하나 더 있었다면 채택됐을 후보가 남아 있다
+
+    dropped = [row for coverage in chain.element_coverage for row in coverage.candidates
+               if not row.adopted and row.merged_gain > 0]
+    assert dropped and all("상한" in row.excluded_reason for row in dropped)

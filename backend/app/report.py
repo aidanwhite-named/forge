@@ -831,17 +831,28 @@ def _evidence_is_never_erased(report: ClaimReport,
 
 def _every_rejection_has_a_reason(report: ClaimReport,
                                   matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
-    """P2. 결합에서 빠진 문헌에는 빠진 이유가 있어야 합니다.
+    """P2. 결합에서 빠진 문헌에는 빠진 이유가 **기록되어** 있어야 합니다.
 
-    조합에 자리가 남아 있는데(limit_binding=false) 어떤 구성의 근거를 가진 문헌이 채택되지
-    않았다면, 그 문헌은 보완 후보 평가에서 떨어진 것이고 그 사유가 element_coverage의
-    후보 행에 남아 있어야 합니다. 사유 없이 사라지는 문헌이 있다는 것은 게이트 하나가
-    조용히 경로를 막고 있다는 뜻입니다 — neareye-waveguide에서 gain 0.3짜리 유효 후보가
-    정확히 그렇게 사라졌고, 그 사실은 어떤 채점에도 걸리지 않았습니다.
+    어떤 구성의 근거를 가진 문헌이 채택되지 않았다면, 그 문헌은 보완 후보 평가에서 떨어진
+    것이고 그 사유가 element_coverage의 후보 행에 남아 있어야 합니다. 사유 없이 사라지는
+    문헌이 있다는 것은 게이트 하나가 조용히 경로를 막고 있다는 뜻입니다 —
+    neareye-waveguide에서 gain 0.3짜리 유효 후보가 정확히 그렇게 사라졌고, 그 사실은 어떤
+    채점에도 걸리지 않았습니다.
+
+    **묻는 것은 사유의 유무이지 이득의 크기가 아닙니다.** 종전에는 주 인용발명 대비 이득이
+    양수인데 limit_binding이 거짓이면 위반으로 봤는데, 그 둘은 기준선이 다릅니다 — 앞은
+    주 인용발명 단독 대비, 뒤는 채택 조합 전체 대비입니다. 그래서 채택된 보조 인용발명이
+    이미 같은 것을 대고 있는 **중복 후보**마다 위반이 찍혔습니다. 실측에서 두 문헌이 같은
+    구성에 정확히 같은 이득(0.4417)을 냈고, 하나가 채택되자 다른 하나가 매 회차 위반으로
+    보고됐습니다. 동률은 흔하므로 그 상태로는 경고가 늘 켜져 진짜 위반이 묻힙니다.
+
+    limit_binding으로 전체를 건너뛰지도 않습니다. 상한이 걸린 실행에도 사유 없이 사라진
+    후보가 있을 수 있고, 이제는 상한 자체가 후보 행에 사유로 적히므로 걸러 낼 필요가
+    없습니다(chain._exclusion_reason).
     """
     notes: list[str] = []
     chain = report.chain
-    if chain.limit_binding or not chain.primary:
+    if not chain.primary:
         return notes
     adopted = {chain.primary, *chain.secondaries}
     by_label = {coverage.label: coverage for coverage in chain.element_coverage}
@@ -857,10 +868,10 @@ def _every_rejection_has_a_reason(report: ClaimReport,
             if row is None:
                 notes.append(f"[불변식 P2] 청구항 {report.claim_number} ({label}): 문헌 "
                              f"{document_id}에 개시 근거가 있는데 후보 평가 기록이 없습니다.")
-            elif row.eligible and row.gain > 0 and label not in chain.beyond_limit:
+            elif not row.adopted and not row.excluded_reason and label not in chain.beyond_limit:
                 notes.append(f"[불변식 P2] 청구항 {report.claim_number} ({label}): 문헌 "
-                             f"{document_id}은 자격을 갖추고 이득 {row.gain}을 냈는데 채택되지 "
-                             "않았고, 결합 상한도 걸리지 않았습니다.")
+                             f"{document_id}은 조합에 {row.merged_gain}을 더 보탤 수 있는데 "
+                             "채택되지 않았고, 제외 사유도 기록되지 않았습니다.")
     return notes
 
 
