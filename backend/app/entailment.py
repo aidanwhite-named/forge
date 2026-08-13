@@ -9,41 +9,28 @@ import hashlib
 import json
 from collections import defaultdict
 from .agy import AnalysisCancelled, run_cli
-from .cache import ENTAILMENT_CACHE_DIR, ENTAILMENT_KEY_PREFIX
+from .cache import ENTAILMENT_CACHE_DIR, ENTAILMENT_KEY_PREFIX, fingerprint
 from .config import load_runtime_settings
 from .consistency import antecedent_terms
 from .coverage import JUDGMENT_RANK, derive_judgment, judgment_at_rank
 from .models import Claim, Document, ElementMatch, LimitationCheck, missing_limitations
 from .pdf import chunk_text
 
-# v9: 실제 입력 제시와 특정 시스템을 통한 촬영/출력이 같은 실시 흐름으로 명시되면 인과
-#     경로를 인정하되, 장치 유형 총론 하나만으로는 계속 인정하지 않습니다.
-# v8: 주체 정체성 검사를 해당 원자 한정의 범위에만 적용합니다. 단순 NN 학습 한정을 별도
-#     광학 모델링 한정의 실패로 함께 기각하지 않고, 제시한 입력측 영상과 대응 촬영 결과의
-#     세트는 영상쌍 획득으로 인정하되 특정 도파관 인과 한정과는 분리합니다.
-# v7: 같은 청구 주체의 속성을 서로 다른 모델·부품에서 합치는 것을 막고 입력→출력 방향을
-#     별도 축으로 확인합니다. 광학 프록시의 모델링 역할과 별도 HoloNet의 뉴럴 네트워크
-#     정체성이 합쳐지고, target→phase 흐름이 correction→target으로 뒤집힌 실측을 막습니다.
-# v6: 네 축을 독립 판정하도록 바꾸고, 배경기술·요약·연구 동기·향후 적용 가능성을 개시 근거에서
-#     뺐습니다. v5는 두 방향으로 어긋났습니다 — 문헌이 '획득'을 명시한 한정을 동작 축 결손으로
-#     기각하는 한편, 서론의 과제 서술을 다른 한정의 근거로 통과시켰습니다.
-# v5: 역할 대조가 명칭을 넘어 **동작·대상·집합성·인과관계**까지 지우는 것을 막습니다. 실측에서
-#     "광원이 이미지 광을 생성해 도파관으로 출력한다"는 장치 정상 동작 기재가 "입력 광학
-#     이미지들의 세트를 획득함" 한정의 근거로 통과해, 그 구성이 '실질적 동일 4/4'로 나갔습니다.
-#     같은 유형을 이 단계가 다른 셀에서는 세 건 기각했으므로 규칙의 부재가 아니라 경계의 부재였습니다.
-# v4: 같은 구성요소의 다른 한정이 제출한 검증된 인용문을 element_context로 함께 넘깁니다.
-#     최초 대비가 한 인과 사슬을 형제 한정끼리 쪼개 담으면, 한정별로만 읽는 이 단계가 실제로
-#     개시된 한정을 근거 없음으로 기각했습니다.
-#     함께, 명칭이 아니라 역할로 대조하도록 못박았습니다. 종전 심사자는 청구항 전용 명칭
-#     ("스위치 박스"·"제1 리미트 스위치")이 원문에 없다는 것만으로 기각해, compare 단계가
-#     역할로 옳게 찾아낸 대응을 이 단계가 그대로 거부했습니다.
-PROMPT_VERSION = "entailment-v9-causal-path-evidence"
 CACHE_DIR = ENTAILMENT_CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 인용문이 속한 단락의 국소 문맥만 의미검증에 제공합니다. 특허 단락은 보통 이보다 훨씬
 # 짧지만, 비정상적으로 큰 청크 하나가 검증 프롬프트 대부분을 차지하지 않도록 상한을 둡니다.
 MAX_SOURCE_CONTEXT_CHARS = 12000
+
+def entailment_generation() -> str:
+    """의미검증 프롬프트의 세대. 구성대비 프롬프트와 별도로 셉니다.
+
+    두 프롬프트는 서로 다른 캐시에 저장되고 각자 독립으로 바뀌므로, 한 값으로 묶으면
+    한쪽만 고쳐도 멀쩡한 다른 쪽 판정까지 전부 버리게 됩니다.
+    """
+    return fingerprint(ENTAILMENT_PROMPT)
+
 
 _RELATIONS = {"explicit", "necessary_implicit", "functional_equivalent", "unsupported"}
 _DIRECTNESS = {"direct", "inferred"}
@@ -231,11 +218,9 @@ def _references(claims: list[Claim] | None) -> dict[tuple[int, str], list[str]]:
     """(청구항, 구성) → 그 구성이 앞선 구성에서 물려받은 지시 어구.
 
     이것을 넘기지 않으면 심사자는 지시 대상까지 이 근거 묶음이 개시해야 한다고 읽습니다.
-    실측에서 "크랭크-슬라이드 기구부가 **플라이휠의** 회전 운동을 투사 스크린의 직선 왕복
-    운동으로 변환함" 한정이, 모터→크랭크→피스톤→스크린 왕복을 원문 그대로 개시한 문헌에서
-    "'플라이휠'에 대한 개시가 전혀 없다"는 이유로 기각됐습니다. 플라이휠은 앞 구성이 세운
-    대상이고 그 구성은 이미 그 자리에서 미개시로 판정되어 있었으므로, 같은 사실이 두 구성에
-    두 번 계상되면서 실제로 개시된 크랭크-슬라이드 기구부가 "대응 기재 없음"이 됐습니다.
+    앞 구성이 세운 지시 대상이 이 문헌에 없다는 사실은 이미 그 구성 자리에서 미개시로
+    판정되어 있습니다. 그것을 여기서 다시 요구하면 같은 사실이 두 구성에 두 번 계상되고,
+    이 구성의 동작을 원문 그대로 개시한 문헌이 "대응 기재 없음"으로 떨어집니다.
     """
     return {(claim.number, label): terms
             for claim in claims or []
@@ -274,11 +259,10 @@ def _sibling_context(match: ElementMatch, check: LimitationCheck,
     """같은 구성요소의 **다른** 한정이 제출한, 원문 검증을 통과한 인용문.
 
     최초 대비는 한정마다 근거 묶음을 따로 만드는데, 하나의 인과 사슬이 형제 한정으로 쪼개져
-    담기는 일이 있습니다. 실측에서 core "상대 부재의 결합 상태에 따라 전원 경로를 개폐하는
-    부재를 포함함"의 묶음에는 부재의 존재만 말하는 문장이 들어가고, 개폐 동작을 명시한 같은
-    실시예의 문장은 qualifier 묶음에 들어갔습니다. 이 단계는 한정마다 그 묶음만 읽으므로
-    core는 근거 없는 것으로 기각되었고, 문헌이 그 구성을 원문으로 개시했는데도 구성 전체가
-    "대응 없음"이 되었습니다.
+    담기는 일이 있습니다. core 묶음에는 부재의 존재만 말하는 문장이 들어가고 그 동작을 명시한
+    같은 실시예의 문장은 qualifier 묶음에 들어가는 식입니다. 이 단계는 한정마다 그 묶음만
+    읽으므로, 문헌이 그 구성을 원문으로 개시했는데도 core가 근거 없음으로 기각되어 구성
+    전체가 "대응 없음"이 됩니다.
 
     같은 구성요소·같은 문헌의 검증된 인용문만 넘기므로 새로운 개시 경로를 만들지 않습니다.
     실제로 인과 경로를 잇는 데 쓸 수 있는지는 프롬프트의 '같은 실시 흐름' 조건이 정하고,
@@ -345,12 +329,12 @@ def _reconcile_match(match: ElementMatch) -> None:
     directness는 **compare._build_matches와 같은 규칙**으로 내립니다. core가 하나도 남지 않으면
     direct → inferred이며, "absent"로는 내리지 않습니다. absent의 정의는 "근거 원문이 없음"인데
     (compare.py [직접성 directness]), 이 시점의 셀에는 원문 대조를 통과한 발췌가 남아 있고
-    개시가 인정된 하위 한정도 있을 수 있습니다. 종전에는 여기서만 absent로 내려서, 같은 조건을
-    두 모듈이 다르게 처리했고 그 차이가 결론까지 갔습니다 — coverage.ineligible_reason이
-    absent를 "직접 근거 없음"으로 걸러 내므로, 그 문헌은 **원문으로 검증해 개시한 한정마저**
-    보조 인용발명으로 기여할 자격을 잃었습니다. 게다가 chain._residual_overflow는 미채택 문헌의
-    개시를 "결합 문헌 수 상한을 넘어 세우지 않았다"고 적으므로, 실제로는 자격에서 탈락한 것을
-    보고서가 상한 탓으로 잘못 설명했습니다.
+    개시가 인정된 하위 한정도 있을 수 있습니다. 여기서만 absent로 내리면 같은 조건을 두
+    모듈이 다르게 처리하게 되고, 그 차이가 결론까지 갑니다 — coverage.ineligible_reason이
+    absent를 "직접 근거 없음"으로 걸러 내므로 그 문헌은 **원문으로 검증해 개시한 한정마저**
+    보조 인용발명으로 기여할 자격을 잃습니다. 게다가 chain._residual_overflow는 미채택 문헌의
+    개시를 "결합 문헌 수 상한을 넘어 세우지 않았다"고 적으므로, 자격에서 탈락한 것을 보고서가
+    상한 탓으로 잘못 설명하게 됩니다.
     """
     match.missing_limitations = missing_limitations(match.limitation_checks)
     checks = match.limitation_checks
@@ -358,8 +342,8 @@ def _reconcile_match(match: ElementMatch) -> None:
     if not rejected:
         return
     # 최초 판정과 **같은 사다리**로 다시 산출합니다(coverage.derive_judgment). 이 단계가 바꾼
-    # 것은 한정별 disclosed뿐이므로, 등급은 그 결과로 따라와야 합니다. 종전에는 여기에 별도
-    # 상한 사다리가 있어서 같은 조건을 두 모듈이 다르게 처리했습니다.
+    # 것은 한정별 disclosed뿐이므로, 등급은 그 결과로 따라와야 합니다. 여기에 별도 상한
+    # 사다리를 두면 같은 조건을 두 모듈이 다르게 처리하게 됩니다.
     cap = derive_judgment(
         checks,
         has_evidence=bool(match.quote or match.evidence or any(check.quote for check in checks)),
@@ -406,9 +390,13 @@ def _mark_all_unchecked(targets, message: str, where: str, notes: list[str]) -> 
     notes.append(f"{where}: {message} (한정 {len(targets)}건의 의미검증을 건너뛰었습니다)")
 
 
-def _cached_run(payload: dict, cache_keys: set[str] | None = None) -> dict:
+def _cached_run(payload: dict, cache_keys: set[str] | None = None,
+                prompt: str = ENTAILMENT_PROMPT) -> dict:
     settings = load_runtime_settings()
-    key_payload = {"version": PROMPT_VERSION, "provider": settings["provider"],
+    # 프롬프트를 키에 넣습니다. 문헌 단독 심사와 결합 심사는 서로 다른 질문이므로 payload가
+    # 같아도 같은 답이 아닙니다.
+    key_payload = {"version": entailment_generation(), "prompt": fingerprint(prompt),
+                   "provider": settings["provider"],
                    "model": settings["model"], "payload": payload}
     digest = hashlib.sha256(
         json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -449,3 +437,155 @@ def _covers_all_items(raw: dict, payload: dict) -> bool:
     returned = _returned(raw)
     return all(isinstance((returned.get(item["item_id"]) or {}).get("supported"), bool)
                for item in payload["items"])
+
+
+# --- 결합 단위 의미검증 --------------------------------------------------------
+
+COMBINATION_PROMPT = """[역할]
+당신은 진보성 결합의 근거 심사자입니다. 앞선 심사에서 **문헌 하나만 놓고** 보았을 때 어떤 축이
+그 문헌에 없다는 이유로 기각된 원자 한정을 받습니다. 이번에는 심사관이 실제로 거절 이유에 세운
+**인용발명 조합 전체**의 근거 위에서 같은 한정을 다시 판단하십시오.
+
+[판정 원칙]
+- 진보성 거절 이유에서 한 구성의 근거가 인용발명 하나에서 끝나야 할 이유는 없습니다. 주 인용발명이
+  동작을 개시하고 보조 인용발명이 그 동작의 대상을 개시하는 형태가 결합의 기본형입니다.
+  따라서 evidence(기각된 문헌의 근거)와 combination_context(같은 조합에 채택된 다른 인용발명의
+  검증된 근거)를 **합쳐서** 한정 전체가 뒷받침되는지 보십시오.
+- supported=true는 합쳐서 한정의 입력·대상·동작·출력과 청구된 인과관계가 **모두** 확인될 때만
+  허용됩니다. 어느 한 축이 양쪽 어디에도 없으면 false입니다.
+- **결합의 동기·용이성은 판단하지 마십시오.** 여기서 답할 것은 "그 기재가 조합 안에 있는가"까지
+  입니다. 두 문헌을 결합할 이유가 있는지는 별도 판단이며 이 도구가 하지 않습니다.
+- combination_context는 **다른 인용발명**의 문장입니다. 그 문장이 evidence와 같은 실시 흐름일 필요는
+  없습니다. 다만 그 문장이 실제로 청구된 축을 개시해야 하고, 배경기술·연구 동기·향후 적용
+  가능성 서술은 개시로 보지 않습니다.
+- 문헌들이 서로 다른 대상을 다루고 있어 합쳐도 청구된 관계가 세워지지 않으면 false입니다.
+  예를 들어 한 문헌이 A를 모델링하고 다른 문헌이 B라는 별개 대상을 다룬다면, 둘을 합쳐도
+  "A를 모델링함"이 되지 않습니다.
+- 판단이 애매하면 supported=false로 두십시오.
+- supported=true인 경우 **어느 인용발명의 어느 문장이 빠진 축을 댔는지** supplied_by에 document_id를
+  적고 reason에 그 문장을 밝히십시오. 빠진 축을 댄 문헌을 지목하지 못하면 supported=true가 아닙니다.
+
+[출력]
+JSON 객체 하나만 반환하십시오.
+{"entailments": [{"item_id": "1:B:0", "supported": true, "supplied_by": ["4"],
+  "reason": "조합이 한정 전체를 뒷받침하거나 못하는 이유"}]}
+items의 item_id를 하나도 빠짐없이 정확히 한 번씩 반환하십시오.
+"""
+
+# 결합 문맥으로 넘기는 인용문 수의 상한. 채택 문헌 × 전 구성의 검증된 발췌를 전부 실으면
+# 프롬프트가 문헌 본문만큼 커지고, 정작 빠진 축과 무관한 문장이 대부분을 차지합니다.
+MAX_COMBINATION_CONTEXT = 24
+
+
+def validate_combination(claim: Claim, labels: list[str], matrix: dict, adopted: list[str],
+                         documents: dict[str, Document],
+                         cache_keys: set[str] | None = None) -> list[str]:
+    """축 결손으로 기각된 한정을 **채택 조합 전체**의 근거 위에서 다시 심사합니다.
+
+    validate_entailment는 문헌별로 호출되므로 다른 인용발명이 무엇을 개시했는지 볼 수 없습니다.
+    그 상태에서 "동작은 이 문헌에 있는데 대상이 이 문헌에 없다"가 나오면 그 한정은 기각되고,
+    빠진 대상을 같은 조합의 다른 인용발명이 개시하고 있어도 결과는 달라지지 않습니다. 진보성
+    판단은 결합 위에서 하는 것이므로 검증도 결합 위에서 한 번 더 해야 합니다.
+
+    **순서가 중요합니다.** 조합이 정해져야 결합 문맥을 만들 수 있으므로 이 단계는 인용발명
+    선정 뒤에 옵니다. 선정 단계에서는 축 결손 기각을 결론이 아니라 유보로 두어(fail-open)
+    후보가 조합에 들어올 수 있게 하고, 확정은 여기서 합니다(fail-closed).
+
+    판정 결과는 matrix 셀에 제자리 반영되고, 호출부는 조합을 다시 세웁니다.
+    """
+    items: list[dict] = []
+    targets: list[tuple[ElementMatch, LimitationCheck]] = []
+    for label in labels:
+        context = _combination_context(claim, label, matrix, adopted, documents)
+        if not context:
+            continue
+        for document_id in sorted(matrix):
+            match = matrix[document_id].get(label)
+            if match is None or match.error:
+                continue
+            for check in match.limitation_checks:
+                if check.semantic_status != "rejected":
+                    continue
+                item = _item(match, check, None, documents.get(document_id))
+                item["rejected_reason"] = check.semantic_note
+                item["combination_context"] = context
+                items.append(item)
+                targets.append((match, check))
+    if not items:
+        return []
+
+    notes: list[str] = []
+    payload = {"claim_number": claim.number, "adopted_documents": adopted, "items": items}
+    try:
+        raw = _cached_run(payload, cache_keys, prompt=COMBINATION_PROMPT)
+    except AnalysisCancelled:
+        raise
+    except RuntimeError as exc:
+        # 결합 심사를 받지 못하면 문헌 단독 판단이 그대로 남습니다. 유보 상태가 유지되므로
+        # 보고서는 계속 "결합 위에서 확인 필요"라고 적습니다 — 없는 결론을 지어내지 않습니다.
+        return [f"청구항 {claim.number}: 결합 단위 의미검증에 실패해 유보 상태로 두었습니다: {exc}"]
+
+    returned = _returned(raw)
+    touched: set[int] = set()
+    for match, check in targets:
+        verdict = returned.get(_item_id(match, check))
+        if verdict is None or not isinstance(verdict.get("supported"), bool):
+            continue                       # 판단을 받지 못한 항목은 유보 그대로 둡니다.
+        reason = " ".join(str(verdict.get("reason") or "").split())
+        if verdict["supported"]:
+            supplied = [str(item) for item in verdict.get("supplied_by") or []
+                        if str(item) in set(adopted) and str(item) != match.document_id]
+            if not supplied:
+                # 빠진 축을 댄 문헌을 지목하지 못한 인정은 받지 않습니다. 그것은 결합이 아니라
+                # 문헌 단독 판단을 뒤집는 것이고, 그 판단은 앞 단계가 이미 내렸습니다.
+                continue
+            check.semantic_status = "accepted_in_combination"
+            check.semantic_note = reason or "채택 조합 전체의 근거가 이 한정을 뒷받침합니다."
+            check.combination_documents = supplied
+            notes.append(f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
+                         f"한정 {check.index}을 결합 근거로 인정했습니다 "
+                         f"(빠진 축은 문헌 {', '.join(supplied)}가 개시 — {check.semantic_note})")
+        else:
+            check.semantic_status = "rejected_in_combination"
+            check.semantic_note = reason or "채택 조합 전체로도 이 한정을 뒷받침하지 못합니다."
+            notes.append(f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
+                         f"한정 {check.index}은 결합 근거로도 확인되지 않았습니다 ({check.semantic_note})")
+        touched.add(id(match))
+
+    for match, _ in targets:
+        if id(match) in touched:
+            _reconcile_match(match)
+            touched.discard(id(match))
+    return notes
+
+
+def _combination_context(claim: Claim, label: str, matrix: dict, adopted: list[str],
+                         documents: dict[str, Document]) -> list[dict]:
+    """채택 조합의 **다른 인용발명**이 이 청구항에 대해 낸 검증된 근거.
+
+    같은 구성뿐 아니라 **다른 구성의** 근거까지 넘깁니다. 빠진 축은 대개 청구항의 다른 구성이
+    세운 대상이기 때문입니다 — "(B)의 뉴럴 네트워크가 모델링하는 도파관"의 도파관은 (A)에서
+    도입됩니다. 같은 구성만 보면 정작 그 축을 개시한 문장이 문맥에 들어오지 않습니다.
+    """
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for document_id in adopted:
+        matches = matrix.get(document_id) or {}
+        for element in claim.elements:
+            match = matches.get(element.label)
+            if match is None or match.error:
+                continue
+            for check in match.limitation_checks:
+                for chunk_id, quote, translation, alignment in _verified_bundle(check):
+                    key = (chunk_id, quote)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append({"document_id": document_id, "chunk_id": chunk_id,
+                                 "original": quote, "translation": translation,
+                                 "alignment": alignment,
+                                 "from_element": element.label,
+                                 "from_limitation": check.limitation})
+                    if len(rows) >= MAX_COMBINATION_CONTEXT:
+                        return rows
+    return rows

@@ -371,3 +371,99 @@ def test_a_document_keeps_supplement_eligibility_for_limitations_it_verifiably_d
     assert ineligible_reason(match) == ""
     assert is_eligible_supplement(match)                  # 개시한 한정으로는 보완할 수 있어야 한다
     assert disclosed_limitations(match) == {"전압 인가 및 차단 여부를 스위치의 작동 상태에 따라 결정함"}
+
+
+# --- 결합 단위 의미검증 --------------------------------------------------------
+# 문헌 단독 심사는 "동작은 이 문헌에 있는데 그 동작의 대상이 이 문헌에 없다"를 기각으로 냅니다.
+# 문헌 하나만 놓고 보면 옳지만, 빠진 대상을 같은 조합의 다른 인용발명이 대는 것이 진보성 결합의
+# 정의입니다. 그래서 조합이 정해진 뒤 결합 근거 위에서 한 번 더 묻습니다.
+
+WAVEGUIDE_QUOTE = "images were taken through a diffractive waveguide eyepiece consisting of 3 layers"
+TRAINING_QUOTE = "we train a neural network that models the optical propagation of the display"
+
+
+def _pending_matrix() -> tuple[Claim, dict, dict]:
+    claim = Claim(number=1, elements=[
+        ClaimElement(label="A", text="도파관 광학 시스템을 통해 출력되는 이미지를 획득하는 단계",
+                     importance=4),
+        ClaimElement(label="B", text="도파관 광학 시스템을 모델링하는 뉴럴 네트워크를 학습하는 단계",
+                     importance=5)])
+    # 문헌 4: 도파관을 원문으로 개시. 문헌 3: 뉴럴 네트워크 학습을 개시했으나 그 학습 대상이
+    # 도파관임은 이 문헌에 없어 단독 심사에서 기각된 상태.
+    doc4 = ElementMatch(
+        claim_number=1, label="A", document_id="4", judgment="실질적 동일", directness="direct",
+        quote=WAVEGUIDE_QUOTE, chunk_id="D4-B-p001-01", verify="verified",
+        limitation_checks=[LimitationCheck(
+            index=0, kind="core", limitation="도파관 광학 시스템을 통해 출력되는 이미지를 획득함",
+            disclosed=True, quote=WAVEGUIDE_QUOTE, chunk_id="D4-B-p001-01", verify="verified",
+            semantic_status="accepted")])
+    doc3 = ElementMatch(
+        claim_number=1, label="B", document_id="3", judgment="차이", directness="inferred",
+        quote=TRAINING_QUOTE, chunk_id="D3-B-p001-01", verify="verified",
+        missing_limitations=["도파관 광학 시스템을 모델링하는 뉴럴 네트워크를 학습함"],
+        limitation_checks=[LimitationCheck(
+            index=0, kind="core",
+            limitation="도파관 광학 시스템을 모델링하는 뉴럴 네트워크를 학습함",
+            disclosed=False, quote=TRAINING_QUOTE, chunk_id="D3-B-p001-01", verify="verified",
+            semantic_status="rejected", semantic_note="대상 축 결손 — 도파관 개시 없음")])
+    matrix = {"4": {"A": doc4}, "3": {"B": doc3}}
+    documents = {"4": _document("4", "US20210407365A1.pdf", [WAVEGUIDE_QUOTE]),
+                 "3": _document("3", "neural-holography.pdf", [TRAINING_QUOTE])}
+    return claim, matrix, documents
+
+
+def test_a_missing_axis_supplied_by_another_reference_is_accepted_in_combination(monkeypatch):
+    """빠진 축을 조합 안의 다른 인용발명이 대면 그 한정은 결합 근거로 인정된다."""
+    claim, matrix, documents = _pending_matrix()
+    seen: dict = {}
+
+    def fake(prompt, expect="claims"):
+        seen["prompt"] = prompt
+        return {"entailments": [{"item_id": "1:B:0", "supported": True, "supplied_by": ["4"],
+                                 "reason": "문헌 4가 회절 도파관 접안렌즈를 통한 촬영을 개시함"}]}
+
+    monkeypatch.setattr(entailment, "run_cli", fake)
+    notes = entailment.validate_combination(claim, ["B"], matrix, ["4", "3"], documents)
+
+    check = matrix["3"]["B"].limitation_checks[0]
+    assert check.semantic_status == "accepted_in_combination"
+    assert check.combination_documents == ["4"]
+    assert any("결합 근거로 인정" in note for note in notes)
+    # 문맥에는 **다른 구성**의 근거까지 실려야 한다. 빠진 축은 대개 다른 구성이 세운 대상이다.
+    assert WAVEGUIDE_QUOTE in seen["prompt"]
+    # 문헌 단독 판정은 그대로다. 그 문헌 혼자서는 여전히 개시하지 않는다.
+    assert check.disclosed is False
+
+
+def test_an_acceptance_without_a_named_supplier_is_refused(monkeypatch):
+    """빠진 축을 댄 문헌을 지목하지 못하면 그것은 결합이 아니라 단독 판정 번복이다."""
+    claim, matrix, documents = _pending_matrix()
+    monkeypatch.setattr(entailment, "run_cli", lambda prompt, expect="claims": {
+        "entailments": [{"item_id": "1:B:0", "supported": True, "supplied_by": [],
+                         "reason": "합치면 될 것 같음"}]})
+    entailment.validate_combination(claim, ["B"], matrix, ["4", "3"], documents)
+    assert matrix["3"]["B"].limitation_checks[0].semantic_status == "rejected"
+
+
+def test_a_rejection_on_the_combination_closes_the_reservation(monkeypatch):
+    """결합 위에서도 확인되지 않으면 유보가 아니라 확정된 공백이다."""
+    claim, matrix, documents = _pending_matrix()
+    monkeypatch.setattr(entailment, "run_cli", lambda prompt, expect="claims": {
+        "entailments": [{"item_id": "1:B:0", "supported": False,
+                         "reason": "두 문헌이 서로 다른 광학계를 다루므로 합쳐도 관계가 서지 않음"}]})
+    notes = entailment.validate_combination(claim, ["B"], matrix, ["4", "3"], documents)
+    assert matrix["3"]["B"].limitation_checks[0].semantic_status == "rejected_in_combination"
+    assert any("결합 근거로도 확인되지 않았" in note for note in notes)
+
+
+def test_a_failed_combination_check_leaves_the_reservation_untouched(monkeypatch):
+    """심사를 받지 못하면 없는 결론을 지어내지 않고 유보 그대로 둔다."""
+    claim, matrix, documents = _pending_matrix()
+
+    def broken(prompt, expect="claims"):
+        raise RuntimeError("CLI 응답 없음")
+
+    monkeypatch.setattr(entailment, "run_cli", broken)
+    notes = entailment.validate_combination(claim, ["B"], matrix, ["4", "3"], documents)
+    assert matrix["3"]["B"].limitation_checks[0].semantic_status == "rejected"
+    assert any("유보 상태로 두었습니다" in note for note in notes)

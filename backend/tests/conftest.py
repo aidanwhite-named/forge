@@ -57,3 +57,9 @@ def block_the_real_cli(monkeypatch):
     # 전용 테스트에서 실제 함수를 좁은 응답 스텁으로 검증하고, 나머지 테스트에서는 통과시킵니다.
     monkeypatch.setattr("app.pipeline.validate_entailment",
                         lambda matches, documents, cache_keys=None, claims=None: [])
+    # 결합 단위 의미검증도 같은 규율입니다. 유보가 생기는 사건에서만 도는 단계라, 켜 두면
+    # 무관한 테스트가 조용히 CLI를 부르게 됩니다. 전용 테스트에서 실제 함수를 스텁 응답으로
+    # 검증합니다.
+    monkeypatch.setattr(
+        "app.pipeline.validate_combination",
+        lambda claim, labels, matrix, adopted, documents, cache_keys=None: [])

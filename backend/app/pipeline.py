@@ -25,10 +25,10 @@ from .compare import (DEPENDENT_DOCUMENT_BUDGET_CHARS, DOCUMENT_BUDGET_CHARS,
 from .config import (COMPARE_CLAIM_BATCH, COMPARE_MAX_WORKERS, COMPARE_SAMPLES,
                      load_runtime_settings)
 from .consistency import cross_document_notes, enforce_antecedents
-from .entailment import validate_entailment
+from .entailment import validate_combination, validate_entailment
 from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
-from .report import (build_claim_report, build_mappings, refresh_mappings,
-                     report_invariants)
+from .report import (build_claim_report, build_mappings, pipeline_invariants,
+                     refresh_mappings, report_invariants)
 from .verify import verify_matches
 
 
@@ -71,20 +71,29 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
         matches, {document.id: document.filename for document in documents})
 
     chains: dict[int, ChainInfo] = {}
+    # 매트릭스는 한 번만 만들어 두고 선정·보고서·불변식 검사가 **같은 자료**를 봅니다.
+    # 각자 다시 만들면 같은 이름의 매트릭스가 단계마다 다른 값일 수 있습니다.
+    matrices = {claim.number: _claim_matrix(matches, documents, claim.number) for claim in claims}
     for claim in _processing_order(claims):
-        claim_matrix = _claim_matrix(matches, documents, claim.number)
+        claim_matrix = matrices[claim.number]
         # 셀은 서로 독립적으로 판정되므로, 청구항 전체로 보면 성립할 수 없는 조합이 남습니다.
         # 선정에 들어가기 전에 문헌 안에서의 지시 관계 모순만 정리합니다.
         verify_notes += enforce_antecedents(claim, claim_matrix)
-        chains[claim.number] = build_chain(claim, claim_matrix, chains, claims)
+        chain = build_chain(claim, claim_matrix, chains, claims)
+        # 축 결손으로 유보된 구성이 있으면 **채택 조합 전체의 근거로** 한 번 더 묻고 조합을
+        # 다시 세웁니다. 의미검증은 문헌별로 호출되어 다른 인용발명이 무엇을 개시했는지 보지
+        # 못하는데, 진보성 판단은 결합 위에서 하는 것이라 검증도 결합 위에서 끝나야 합니다.
+        # 선정 단계가 유보를 fail-open으로 통과시키는 것과 짝을 이룹니다 — 여기서 확정합니다.
+        chain, resolve_notes = _resolve_pending(claim, chain, claim_matrix, chains,
+                                                claims, by_id, cache_keys, progress)
+        verify_notes += resolve_notes
+        chains[claim.number] = chain
 
     ordered_chains = [chains[claim.number] for claim in claims]
     mappings = build_mappings(documents, ordered_chains)
 
     reports = [build_claim_report(
-        claim, chains[claim.number],
-        _claim_matrix(matches, documents, claim.number),
-        by_id, mappings)
+        claim, chains[claim.number], matrices[claim.number], by_id, mappings)
         for claim in claims]
 
     for document in documents:
@@ -92,6 +101,10 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
             validation.append(f"{document.filename}에서 텍스트를 거의 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
     # 본문과 결론이 같은 자료를 보고 있는지 조립 직후에 맞춰 봅니다.
     verify_notes += report_invariants(reports)
+    # 사건과 무관하게 항상 참이어야 하는 성질도 여기서 함께 봅니다. 회귀 하니스가 아니라
+    # **실제 분석 실행**에 붙여 두는 것이 요점입니다 — 회귀는 새 청구항·새 인용발명에서 먼저
+    # 나타나고, 그때 하니스는 등록된 옛 사건만 보고 통과합니다.
+    verify_notes += pipeline_invariants(reports, matrices)
 
     return AnalysisResult(
         job_id=job_id, claim_mapping=mappings, reports=reports,
@@ -175,6 +188,34 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
     return existing
 
 
+def _resolve_pending(claim: Claim, chain: ChainInfo, matrix: dict, chains: dict[int, ChainInfo],
+                     all_claims: list[Claim], by_id: dict[str, Document],
+                     cache_keys: set[str] | None, progress) -> tuple[ChainInfo, list[str]]:
+    """유보된 구성을 결합 근거로 확정하고, 판정이 바뀌었으면 조합을 다시 세웁니다.
+
+    조합을 알아야 결합 문맥을 만들 수 있으므로 이 단계는 선정 뒤에 옵니다. 그래서 확정 뒤에는
+    선정을 한 번 더 돌려야 합니다 — 유보가 인정으로 바뀌면 그 구성은 커버된 것이 되고, 기각으로
+    확정되면 진짜 공백이 되어 어느 쪽이든 조합의 근거가 달라지기 때문입니다.
+
+    **다시 세우는 것은 한 번뿐입니다.** 두 번째 선정에서 새로 생긴 유보를 또 확정하려 들면
+    조합과 검증이 서로를 바꾸며 도는 상태가 되고, 같은 입력에서 같은 결과가 나온다는 보장이
+    사라집니다. 새 유보는 유보인 채로 보고서에 남고, 그 사실은 결론 문구가 그대로 말합니다.
+    """
+    if chain.track == "analysis_incomplete" or not chain.combination_pending:
+        return chain, []
+    adopted = [document_id for document_id in [chain.primary, *chain.secondaries] if document_id]
+    if not adopted:
+        return chain, []
+    if progress:
+        progress(f"청구항 {claim.number} 결합 근거 확인 — 구성 "
+                 f"{', '.join(chain.combination_pending)}")
+    notes = validate_combination(claim, list(chain.combination_pending), matrix,
+                                 adopted, by_id, cache_keys)
+    if not notes:
+        return chain, []
+    return build_chain(claim, matrix, chains, all_claims), notes
+
+
 def _fully_judged(matches: list[ElementMatch], documents: list[Document], claim_number: int) -> bool:
     judged = {match.document_id for match in matches if match.claim_number == claim_number}
     return bool(documents) and all(document.id in judged for document in documents)
@@ -243,10 +284,10 @@ def _compare_all(claims: list[Claim], documents: list[Document], guideline: str,
 def _claim_groups(claims: list[Claim]) -> list[list[Claim]]:
     """청구항을 **고정 규칙**으로 묶습니다. 캐시 상태를 보지 않습니다.
 
-    종전 구현은 '이번에 판정이 없는 청구항'만 모아 묶었습니다. 그러면 같은 분석을 두 번
-    돌릴 때 캐시가 얼마나 남아 있느냐에 따라 묶음이 달라지고, 묶음이 달라지면 프롬프트가
-    달라집니다(형제 청구항이 컨텍스트에 실립니다). 판정이 실행마다 흔들릴 뿐 아니라, 키에
-    적은 cohort와 실제 프롬프트가 어긋나 서로 다른 프롬프트의 판정이 한 키를 공유합니다.
+    '이번에 판정이 없는 청구항'만 모아 묶으면, 같은 분석을 두 번 돌릴 때 캐시가 얼마나 남아
+    있느냐에 따라 묶음이 달라집니다. 묶음이 달라지면 프롬프트가 달라지고(형제 청구항이
+    컨텍스트에 실립니다), 판정이 실행마다 흔들릴 뿐 아니라 키에 적은 cohort와 실제 프롬프트가
+    어긋나 서로 다른 프롬프트의 판정이 한 키를 공유합니다.
     """
     if COMPARE_CLAIM_BATCH <= 1:
         return [[claim] for claim in claims]
@@ -471,9 +512,9 @@ def _compare_all_batch(claims: list[Claim], documents: list[Document], guideline
                                                      all_claims)
 
     # 일괄 응답에서 온전한 셀은 그대로 채택하고, 빠진 셀만 단건으로 다시 받습니다.
-    # 예전에는 셀 하나가 어긋나도 응답 전체를 버리고 전 셀을 단건으로 다시 물었습니다.
-    # 셀 수십 개와 하위 제한 점검 수백 줄을 한 응답에 담다 보면 어딘가는 빠지기 마련이라,
-    # 일괄 호출은 사실상 늘 헛돈이 되고 시간은 셀 수에 그대로 비례했습니다.
+    # 셀 하나가 어긋났다고 응답 전체를 버리면 안 됩니다. 셀 수십 개와 하위 제한 점검 수백
+    # 줄을 한 응답에 담다 보면 어딘가는 빠지기 마련이라, 그때마다 전 셀을 다시 물으면 일괄
+    # 호출이 늘 헛돈이 되고 시간은 셀 수에 그대로 비례합니다.
     still_missing: dict[int, list[Document]] = {}
     for claim_number, missing_documents_for_claim in misses_by_claim.items():
         claim = claims_by_number[claim_number]
@@ -517,10 +558,10 @@ def _processing_order(claims: list[Claim]) -> list[Claim]:
 def _date_eligibility_warnings(documents: list[Document], priority_date: str = "") -> list[str]:
     """날짜만으로 가를 수 있는 것을 갈라 보고서에 남깁니다(eligibility.py).
 
-    종전에는 추출한 날짜를 한 줄로 **나열만** 했습니다. 그러면 후공개 선출원과 통상
-    선행기술이 같은 칸에 들어가고, 대상 우선일 이후에 나온 문헌도 주 인용발명으로 뽑혀
-    나갔습니다. 여기서도 자동으로 탈락시키지는 않습니다 — 적격성은 적용 법역과 신규성·
-    진보성 구분까지 봐야 정해지고, 날짜 추출이 실패하는 경우도 흔하기 때문입니다.
+    추출한 날짜를 한 줄로 **나열만** 하면 후공개 선출원과 통상 선행기술이 같은 칸에 들어가고,
+    대상 우선일 이후에 나온 문헌도 주 인용발명으로 뽑힙니다. 다만 자동으로 탈락시키지도
+    않습니다 — 적격성은 적용 법역과 신규성·진보성 구분까지 봐야 정해지고, 날짜 추출이
+    실패하는 경우도 흔하기 때문입니다.
     """
     return eligibility.warnings(documents, priority_date)
 
@@ -535,8 +576,11 @@ def uncovered_elements(result: AnalysisResult, claims_text: str) -> list[dict]:
         labels = list(dict.fromkeys([*report.chain.uncovered, *report.chain.residual]))
         # 결합 한도 밖 문헌에 이미 대응 기재가 있는 구성과 주지관용으로 다룬 구성은 검색
         # 대상이 아닙니다. 선행기술을 새로 찾을 이유가 없는데도 검색하면, 이미 손에 든
-        # 문헌을 두고 웹에서 같은 것을 다시 찾는 일이 됩니다.
-        skip = {*report.chain.beyond_limit, *report.chain.well_known}
+        # 문헌을 두고 웹에서 같은 것을 다시 찾는 일이 됩니다. 축 결손으로 유보한 구성도
+        # 같습니다 — 원문 근거는 이미 업로드된 문헌에 있고, 남은 질문은 그 축을 조합의 다른
+        # 인용발명이 대는가이지 새 문헌이 있는가가 아닙니다.
+        skip = {*report.chain.beyond_limit, *report.chain.well_known,
+                *report.chain.combination_pending}
         for label in labels:
             if label in skip:
                 continue

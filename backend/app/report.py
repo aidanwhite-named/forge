@@ -11,8 +11,8 @@ import re
 
 from .chain import chain_documents, merge_selected
 from .consistency import antecedents
-from .coverage import (JUDGMENT_RANK, best_match, evidence_locations, limitation_counts,
-                       report_grade)
+from .coverage import (JUDGMENT_RANK, best_match, derive_judgment, evidence_locations,
+                       evidenced_limitations, limitation_counts, report_grade)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
                      DocumentMapping, ElementMatch, Evidence, LimitationCheck)
 
@@ -164,8 +164,7 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
 def _corresponded(match: ElementMatch | None) -> bool:
     """보고서가 "대응된 구성"으로 다루는지. 등급표에 오르는 판정만 해당합니다.
 
-    종전에는 `report_similarity(match) is not None`이 이 역할을 겸했습니다. 유사도 숫자를
-    없애면서, 그 숫자의 유무에 기대던 판단을 이름 있는 조건으로 드러냅니다.
+    유사도 숫자의 유무에 기대지 않고 이름 있는 조건으로 드러냅니다.
     """
     return match is not None and match.judgment in _STATUS
 
@@ -190,6 +189,15 @@ def _gap_note(label: str, chain: ChainInfo, mappings: list[DocumentMapping]) -> 
                           for document_id in chain.beyond_limit_documents.get(label, []))
         return (f"({label}) 구성은 채택된 인용발명 조합에는 대응 기재가 없음 — {names}에 대응 "
                 f"기재가 있으나 {_unadopted_note(chain)} 이 거절 이유에는 세우지 않음")
+    # 네 번째 경우. 원문 근거는 있는데 의미검증이 문헌 **단독으로는** 한정의 축 하나를 세우지
+    # 못한 구성입니다. 앞의 셋과 달리 이것은 아직 결론이 아니므로 "확인되지 않음"으로 적을 수
+    # 없습니다. 빠진 축을 같은 조합의 다른 인용발명이 대는지가 남은 질문이고, 그 질문에
+    # 답하는 것이 진보성 결합입니다.
+    if label in chain.combination_pending:
+        reasons = chain.combination_pending_reasons.get(label) or []
+        detail = f"\n  ↳ {reasons[0]}" if reasons else ""
+        return (f"({label}) 구성은 인용발명에 원문 근거가 있으나 문헌 단독으로는 한정의 일부 축이 "
+                f"확인되지 않아 판단을 유보함 — 결합 위에서 확인 필요 (미개시 아님){detail}")
     return ""
 
 
@@ -308,10 +316,10 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
     if match is None or not _corresponded(match):
         return None
     # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 다만 **누락 한정을 대신하지는
-    # 않습니다.** 종전에는 "이 경우 하위 한정은 전부 개시로 남아 있다(예: 2/2)"를 전제로
-    # 곧바로 반환했는데, 그 전제가 깨지는 셀이 실제로 나왔습니다(1/5). 그때 이 줄만 내보내면
-    # 보고서는 "선행 구성이 없어 완전 개시로 보지 않았다"만 적고, 실제로 빠진 나머지 한정은
-    # 한 줄도 남기지 않습니다. 읽는 사람은 집계(1/5)와 차이점 줄을 대조할 수 없게 됩니다.
+    # 않습니다.** "이 경우 하위 한정은 전부 개시로 남아 있다(2/2)"는 전제는 깨질 수 있고
+    # (1/5), 그때 이 줄만 내보내면 보고서는 "선행 구성이 없어 완전 개시로 보지 않았다"만 적고
+    # 실제로 빠진 나머지 한정은 한 줄도 남기지 않습니다. 읽는 사람은 집계와 차이점 줄을
+    # 대조할 수 없게 됩니다.
     if match.antecedent_note:
         if match.missing_limitations:
             residual = _residual_gap(match.missing_limitations[:3], mappings, overflow,
@@ -340,12 +348,11 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
     if combined and primary is not None:
         # 보완 문헌이 주 인용발명의 공백을 **전부** 메웠을 때만 "해소됨"이라고 적습니다.
         #
-        # 종전에는 결합이 일어났다는 사실만으로 이 문장을 썼고, 채택된 셀에 남은 누락 한정은
-        # 보지 않았습니다. 그래서 실측 보고서에서 구성 (B)가 본문에는 "인용발명 2의 결합으로
-        # 해소됨"으로, 결론에는 "결합 후에도 구성 B, C에는 차이가 남습니다"로 적혔습니다.
-        # 결론(chain.residual)은 채택 셀의 누락을 보고, 이 줄은 주 인용발명의 누락만 봐서
-        # 같은 구성에 대해 보고서가 스스로를 반박했습니다. 실제로는 두 한정 중 하나
-        # ("도파관 광학 시스템의 모델링")를 어느 문헌도 메우지 못한 상태였습니다.
+        # 결합이 일어났다는 사실만으로 이 문장을 쓰면 안 됩니다. 결론(chain.residual)은 채택
+        # 셀의 누락을 보는데 이 줄이 주 인용발명의 누락만 보면, 같은 구성이 본문에는 "결합으로
+        # 해소됨"으로 결론에는 "결합 후에도 차이가 남습니다"로 적혀 보고서가 스스로를
+        # 반박합니다. 실제로는 두 한정 중 하나
+        # 를 어느 문헌도 메우지 못한 상태일 수 있습니다.
         resolved = [limitation for limitation in primary.missing_limitations
                     if limitation not in match.missing_limitations]
         supplement = (f"{_reference_name(match.document_id, mappings)} "
@@ -386,8 +393,7 @@ def _unadopted_note(chain: ChainInfo) -> str:
 
     상한이 실제로 걸렸을 때만 상한 탓으로 적습니다. 자리가 남아 있는데도 빠진 문헌을 두고
     "상한을 넘었다"고 적으면 도구가 하지 않은 판단을 한 것처럼 보고하게 되고, 읽는 사람은
-    상한만 올리면 그 문헌이 들어온다고 읽습니다. 실측에서 1건짜리 조합에 "상한(2건)을 넘어"가
-    적힌 적이 있습니다.
+    상한만 올리면 그 문헌이 들어온다고 읽습니다.
     """
     if chain.limit_binding:
         if chain.inherited:
@@ -421,11 +427,11 @@ def _closest_related(label: str, matrix: dict[str, dict[str, ElementMatch]],
                      mappings: list[DocumentMapping], documents: dict[str, Document]) -> str:
     """미대응 구성에 대해 원문 대조를 통과한 가장 가까운 기재 하나를 고릅니다.
 
-    **대표 발췌를 먼저 봅니다.** 종전에는 보조 발췌(evidence)만 훑었는데, 대표 발췌만 있고
-    보조 발췌가 없는 셀은 통째로 건너뛰어졌습니다. 그 셀이 바로 그 구성을 가장 잘 개시한
-    문헌인 경우가 있습니다 — 지시 관계 상한이나 결합 한도로 채택에서 빠진 문헌이 그렇습니다.
-    그러면 보고서에는 아무 관련 없는 문헌의 총론 문장이 "가장 가까운 기재"로 남고, 정작
-    확인된 원문은 사라집니다.
+    **대표 발췌를 먼저 봅니다.** 보조 발췌(evidence)만 훑으면 대표 발췌만 있고 보조 발췌가
+    없는 셀이 통째로 건너뛰어집니다. 그 셀이 바로 그 구성을 가장 잘 개시한 문헌인 경우가
+    있습니다 — 지시 관계 상한이나 결합 한도로 채택에서 빠진 문헌이 그렇습니다. 그러면
+    보고서에는 아무 관련 없는 문헌의 총론 문장이 "가장 가까운 기재"로 남고, 정작 확인된
+    원문은 사라집니다.
 
     문헌 선택은 판정 강도 순입니다. 인용발명 번호 순으로 첫 번째를 집으면 그 구성과 무관한
     문헌이 번호만 빠르다는 이유로 뽑힙니다. 동률이면 번호 순이라 결과는 항상 같습니다.
@@ -541,10 +547,8 @@ def _semantic_bridge(check: LimitationCheck | None) -> tuple[str, str]:
 
     의미검증(entailment)은 발췌 한 문장이 아니라 그 문장이 속한 청크 원문과 형제 한정의
     인용문까지 함께 읽고 판단합니다. 그런데 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐이라,
-    인정의 실제 근거가 그 발췌 밖에 있으면 독자에게는 보이지 않습니다. 실측에서 "HoloNet은
-    sRGB 이미지를 입력으로 받는다"가 "균일도 보정 이미지를 획득함"의 근거로 제시됐고,
-    실제 인정 근거였던 같은 청크의 광원 강도 보정 서술은 보고서 어디에도 없었습니다.
-    발췌만 읽은 심사관은 도구가 개시를 잘못 인정했다고 볼 수밖에 없습니다.
+    인정의 실제 근거가 그 발췌 밖에 있으면 독자에게는 보이지 않습니다. 그러면 발췌만 읽은
+    심사관은 도구가 개시를 잘못 인정했다고 볼 수밖에 없습니다.
 
     판단을 감추지 않고 관계와 이유를 함께 내보내면, 그 다리가 타당한지를 다툴 수 있습니다.
     """
@@ -655,10 +659,9 @@ def _equivalence_caveat(claim: Claim, chain: ChainInfo,
 def _summary_similarity(claim: Claim, results: list[ClaimResult]) -> str:
     """청구항과 인용발명이 공유하는 내용을 한 줄로 요약합니다.
 
-    종전에는 구성 원문 세 개를 " 및 "로 이어 붙였습니다. 구성 문언은 "…하는 단계 및",
-    "…를 포함하되"처럼 다음 구성으로 이어지는 어미로 끝나는 일이 많아, 그대로 이으면
-    "…단계 및에 관한 기술적 목적과"처럼 문장이 깨집니다. 무엇보다 그것은 요약이 아니라
-    구성 목록이라, 이미 위에 구성별로 전부 적혀 있는 내용을 다시 읽히는 것뿐이었습니다.
+    구성 원문을 " 및 "로 이어 붙이지 않습니다. 구성 문언은 "…하는 단계 및", "…를 포함하되"
+    처럼 다음 구성으로 이어지는 어미로 끝나는 일이 많아 그대로 이으면 문장이 깨지고,
+    무엇보다 그것은 요약이 아니라 구성 목록이라 위에 이미 적힌 내용을 다시 읽히게 됩니다.
 
     요약은 **무엇이 공통인가**(가장 중요한 대응 구성 하나)와 **어디까지 공통인가**(대응 범위)
     두 가지로 만듭니다. 둘 다 확정된 판정 데이터에서 나오므로 LLM을 다시 부르지 않습니다.
@@ -773,6 +776,120 @@ def _topic_particle(word: str) -> str:
     return "은"
 
 
+def pipeline_invariants(reports: list[ClaimReport],
+                        matrices: dict[int, dict[str, dict[str, ElementMatch]]]) -> list[str]:
+    """**사건과 무관하게** 항상 참이어야 하는 성질만 확인합니다. 기대값이 필요 없습니다.
+
+    이 파이프라인의 회귀는 지금까지 전부 "새 청구항·새 인용발명을 넣으니 또 안 된다"는
+    형태로 왔고, 그때마다 관측한 셀 하나를 고쳤습니다. 사건별 기대값(cases/expected.json)은
+    사람이 문헌을 통독해야 쓸 수 있어서 사건이 늘지 않고, 늘지 않으면 다음 사건은 여전히
+    처음 보는 사건입니다. 그래서 채점의 축을 사건별 정답에서 **성질**로 옮깁니다.
+
+    아래 성질들은 어떤 청구항·어떤 문헌 조합에서도 참이어야 하므로, 사람이 아무것도 적지
+    않아도 모든 실행에서 자동으로 채점됩니다. 실제 분석 실행에도 그대로 붙습니다 — 회귀는
+    하니스보다 실사용에서 먼저 나타나기 때문입니다.
+
+    고치지는 않습니다. 어느 쪽이 맞는지는 사안마다 다르므로 어긋났다는 사실만 남깁니다.
+    """
+    notes: list[str] = []
+    for report in reports:
+        matrix = matrices.get(report.claim_number) or {}
+        if report.chain.track == "analysis_incomplete":
+            # 미판정 상태에서는 아래 성질들이 애초에 성립할 수 없습니다. 미판정을 '대응 없음'과
+            # 같은 칸에 넣지 않는 것이 이 파이프라인의 규율이므로 여기서도 가릅니다.
+            continue
+        notes += _evidence_is_never_erased(report, matrix)
+        notes += _every_rejection_has_a_reason(report, matrix)
+        notes += _grades_never_exceed_their_own_evidence(report, matrix)
+    return notes
+
+
+def _evidence_is_never_erased(report: ClaimReport,
+                              matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """P1. "어느 인용발명에서도 확인되지 않았다"는 진짜 공백에만 쓸 수 있습니다.
+
+    업로드된 문헌 중 하나라도 그 구성의 한정을 원문 대조를 통과한 근거로 개시했거나 축
+    결손으로만 기각했다면, 그 구성을 공백으로 적는 것은 **사실과 다른 진술**입니다. 읽는
+    사람은 이미 손에 든 문헌을 다시 찾아 나서게 됩니다.
+
+    파이프라인이 이 진술을 만드는 경로가 여러 개(uncovered·rejection_impossible·미채택)라
+    한 곳을 막아도 다른 곳으로 새어 나왔습니다. 그래서 경로가 아니라 **결과**를 봅니다.
+    """
+    notes: list[str] = []
+    chain = report.chain
+    excused = {*chain.beyond_limit, *chain.well_known, *chain.combination_pending}
+    for label in chain.uncovered:
+        if label in excused:
+            continue
+        holders = sorted(document_id for document_id, matches in matrix.items()
+                         if evidenced_limitations(matches.get(label)))
+        if holders:
+            notes.append(f"[불변식 P1] 청구항 {report.claim_number} ({label}): 공백으로 적었으나 "
+                         f"문헌 {', '.join(holders)}에 원문 대조를 통과한 개시 근거가 있습니다.")
+    return notes
+
+
+def _every_rejection_has_a_reason(report: ClaimReport,
+                                  matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """P2. 결합에서 빠진 문헌에는 빠진 이유가 있어야 합니다.
+
+    조합에 자리가 남아 있는데(limit_binding=false) 어떤 구성의 근거를 가진 문헌이 채택되지
+    않았다면, 그 문헌은 보완 후보 평가에서 떨어진 것이고 그 사유가 element_coverage의
+    후보 행에 남아 있어야 합니다. 사유 없이 사라지는 문헌이 있다는 것은 게이트 하나가
+    조용히 경로를 막고 있다는 뜻입니다 — neareye-waveguide에서 gain 0.3짜리 유효 후보가
+    정확히 그렇게 사라졌고, 그 사실은 어떤 채점에도 걸리지 않았습니다.
+    """
+    notes: list[str] = []
+    chain = report.chain
+    if chain.limit_binding or not chain.primary:
+        return notes
+    adopted = {chain.primary, *chain.secondaries}
+    by_label = {coverage.label: coverage for coverage in chain.element_coverage}
+    for label in [*chain.uncovered, *chain.residual]:
+        coverage = by_label.get(label)
+        if coverage is None:
+            continue
+        for document_id, matches in sorted(matrix.items()):
+            if document_id in adopted or not evidenced_limitations(matches.get(label)):
+                continue
+            row = next((item for item in coverage.candidates
+                        if item.document_id == document_id), None)
+            if row is None:
+                notes.append(f"[불변식 P2] 청구항 {report.claim_number} ({label}): 문헌 "
+                             f"{document_id}에 개시 근거가 있는데 후보 평가 기록이 없습니다.")
+            elif row.eligible and row.gain > 0 and label not in chain.beyond_limit:
+                notes.append(f"[불변식 P2] 청구항 {report.claim_number} ({label}): 문헌 "
+                             f"{document_id}은 자격을 갖추고 이득 {row.gain}을 냈는데 채택되지 "
+                             "않았고, 결합 상한도 걸리지 않았습니다.")
+    return notes
+
+
+def _grades_never_exceed_their_own_evidence(
+        report: ClaimReport, matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """P3. 판정 등급은 한정별 개시 여부에서 유도된 값을 넘을 수 없습니다.
+
+    등급은 derive_judgment의 결정론적 함수입니다(coverage). 그보다 **높은** 등급이 셀에
+    남아 있다면 어딘가에서 파생값이 1차 사실과 어긋난 채 굳은 것이고, 그 등급은 그대로
+    has_correspondence·신규성 게이트·문헌 순위로 들어갑니다.
+
+    낮은 쪽은 보지 않습니다. 발췌 검증 실패·지시 관계 상한·결합 결과 상한은 모두 등급을
+    **의도적으로** 내리는 장치라, 양방향으로 검사하면 정상 동작이 매번 위반으로 찍힙니다.
+    """
+    notes: list[str] = []
+    for matches in matrix.values():
+        for label, match in sorted(matches.items()):
+            if match.error or not match.limitation_checks:
+                continue
+            derived = derive_judgment(
+                match.limitation_checks, has_evidence=bool(match.quote or match.evidence),
+                terminology=match.terminology, different_purpose=match.different_purpose)
+            if JUDGMENT_RANK.get(match.judgment, 0) > JUDGMENT_RANK.get(derived, 0):
+                notes.append(f"[불변식 P3] 청구항 {report.claim_number} ({label}) / 문헌 "
+                             f"{match.document_id}: 등급 '{match.judgment}'이 한정별 개시에서 "
+                             f"유도되는 '{derived}'보다 높습니다.")
+    return notes
+
+
 def report_invariants(reports: list[ClaimReport]) -> list[str]:
     """조립된 보고서가 스스로를 반박하지 않는지 확인합니다.
 
@@ -829,12 +946,18 @@ def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
                  if not result.corresponded and not result.is_preamble]
     lines: list[str] = []
     genuine = [label for label in uncovered
-               if label not in chain.beyond_limit and label not in chain.well_known]
+               if label not in chain.beyond_limit and label not in chain.well_known
+               and label not in chain.combination_pending]
     limited = [label for label in uncovered if label in chain.beyond_limit]
     well_known = [label for label in uncovered if label in chain.well_known]
+    pending = [label for label in uncovered if label in chain.combination_pending]
     if genuine:
         lines.append(f"구성 {', '.join(genuine)}은 제시된 인용발명 어디에서도 대응 기재가 확인되지 않아 "
                      "추가 검색이 필요합니다.")
+    if pending:
+        lines.append(f"구성 {', '.join(pending)}은 인용발명에 원문 근거가 있으나 문헌 단독으로는 한정의 "
+                     "일부 축이 확인되지 않아 판단을 유보했습니다. 추가 검색 대상이 아니라 "
+                     "결합 위에서 확인할 대상입니다.")
     if limited:
         lines.append(f"구성 {', '.join(limited)}은 대응 기재를 가진 인용발명이 있으나 "
                      f"{_unadopted_note(chain)} 이 조합에 세우지 않았습니다.")

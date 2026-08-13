@@ -11,7 +11,7 @@ from app.claims import parse_claims
 from app.compare import DOCUMENT_BUDGET_CHARS
 from app.pdf import classify, detect_paragraph_pattern, extract_document_number
 from app.report import to_markdown
-from app.report import report_invariants
+from app.report import pipeline_invariants, report_invariants
 from app.report import (_closest_related, _difference, _narrative, _reason_clause,
                         _summary_difference, _summary_similarity, build_claim_report,
                         build_mappings, refresh_mappings)
@@ -1407,3 +1407,83 @@ def test_a_consistent_report_produces_no_note():
     assert report_invariants([_assembled("도파관 모델링 한정은 결합 후에도 남음", 2, 3, ["B"],
                                         missing=["도파관 모델링 한정"])]) == []
     assert report_invariants([_assembled(None, 3, 3, [])]) == []
+
+
+# --- 사건 무관 불변식 ----------------------------------------------------------
+# 사건별 기대값은 사람이 문헌을 통독해야 쓸 수 있어 사건이 늘지 않는다. 늘지 않으면 다음
+# 사건은 여전히 처음 보는 사건이고, 그래서 "새 청구항·새 인용발명을 넣으면 또 안 된다"가
+# 반복된다. 아래 성질들은 어떤 청구항·어떤 문헌에서도 참이어야 하므로 기대값이 필요 없다.
+
+def _matrix(*matches) -> dict:
+    result: dict = {}
+    for match in matches:
+        result.setdefault(match.document_id, {})[match.label] = match
+    return result
+
+
+def _report(chain: ChainInfo) -> ClaimReport:
+    return ClaimReport(claim_number=1, track=chain.track, chain=chain, claims=[])
+
+
+def _evidenced(document_id: str, label: str, *, rejected: bool = False) -> ElementMatch:
+    """원문 대조를 통과한 개시 근거를 가진 셀. rejected면 의미검증이 축 결손으로만 뺀 상태."""
+    return ElementMatch(
+        claim_number=1, label=label, document_id=document_id,
+        judgment="차이" if rejected else "실질적 동일",
+        directness="direct", quote="원문 발췌", chunk_id=f"D{document_id}-P-0001",
+        verify="verified",
+        limitation_checks=[LimitationCheck(
+            index=0, limitation="핵심 동작을 수행함", kind="core",
+            disclosed=not rejected, quote="원문 발췌", chunk_id=f"D{document_id}-P-0001",
+            verify="verified",
+            semantic_status="rejected" if rejected else "accepted",
+            semantic_note="대상 축 결손" if rejected else "")])
+
+
+def test_p1_catches_a_gap_claimed_over_evidence_that_exists():
+    """"어느 인용발명에서도 확인되지 않았다"는 진짜 공백에만 쓸 수 있다.
+
+    이 진술을 만드는 경로가 여러 개(uncovered·rejection_impossible·미채택)라 한 곳을 막아도
+    다른 곳으로 새어 나왔다. 그래서 경로가 아니라 결과를 본다.
+    """
+    matrix = _matrix(_evidenced("1", "A"))
+    chain = ChainInfo(claim_number=1, track="rejection_impossible", primary="1", uncovered=["A"])
+    notes = pipeline_invariants([_report(chain)], {1: matrix})
+    assert any("[불변식 P1]" in note and "문헌 1" in note for note in notes)
+
+    # 같은 공백이라도 유보로 갈라 두었으면 사실과 어긋나지 않는다.
+    chain.combination_pending = ["A"]
+    assert not [note for note in pipeline_invariants([_report(chain)], {1: matrix})
+                if "[불변식 P1]" in note]
+
+
+def test_p1_treats_an_axis_rejected_document_as_evidence_too():
+    """축 결손으로 기각된 근거도 '문헌에 원문이 있다'는 사실은 그대로다."""
+    matrix = _matrix(_evidenced("1", "A", rejected=True))
+    chain = ChainInfo(claim_number=1, track="rejection_impossible", primary="1", uncovered=["A"])
+    notes = pipeline_invariants([_report(chain)], {1: matrix})
+    assert any("[불변식 P1]" in note for note in notes)
+
+
+def test_p3_catches_a_grade_higher_than_its_own_limitation_checks():
+    """등급은 한정별 개시에서 유도된 값을 넘을 수 없다.
+
+    넘은 등급은 그대로 has_correspondence·신규성 게이트·문헌 순위로 들어간다. 낮은 쪽은 보지
+    않는다 — 발췌 검증·지시 관계·결합 결과 상한이 모두 등급을 의도적으로 내리는 장치다.
+    """
+    inflated = _evidenced("1", "A", rejected=True)      # 한정은 미개시인데
+    inflated.judgment = "실질적 동일"                     # 등급만 높게 남은 상태
+    chain = ChainInfo(claim_number=1, track="inventive_step_combination", primary="1")
+    notes = pipeline_invariants([_report(chain)], {1: _matrix(inflated)})
+    assert any("[불변식 P3]" in note for note in notes)
+
+
+def test_invariants_stay_quiet_while_the_comparison_is_incomplete():
+    """미판정 상태에서는 이 성질들이 애초에 성립하지 않는다.
+
+    미판정을 '대응 없음'과 같은 칸에 넣지 않는 것이 이 파이프라인의 규율이고, 불변식 검사도
+    같은 규율을 따라야 한다. 그러지 않으면 분석이 중단될 때마다 위반이 무더기로 찍힌다.
+    """
+    matrix = _matrix(_evidenced("1", "A"))
+    chain = ChainInfo(claim_number=1, track="analysis_incomplete", uncovered=["A"])
+    assert pipeline_invariants([_report(chain)], {1: matrix}) == []

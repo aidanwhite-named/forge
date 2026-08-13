@@ -4,7 +4,7 @@ import pytest
 
 from app import claims
 from app import claims as claims_module
-from app.claims import (DECOMPOSITION_VERSION, ancestry, assign_importance,
+from app.claims import (ancestry, assign_importance, decomposition_generation,
                         input_quality_warnings, parse_claims)
 
 
@@ -164,7 +164,7 @@ def test_a_version_one_decomposition_is_recomputed_under_the_atomic_split_rules(
     assert len(calls) == 1
     assert "같은 조건을 core와 qualifier에 중복" in calls[0]
     assert "여러 대안에 공통인 문구는 각 대안에 되풀이하지" in calls[0]
-    assert legacy["version"] == claims_module.DECOMPOSITION_VERSION
+    assert legacy["version"] == claims_module.decomposition_generation()
     assert [item.text for item in parsed[0].elements[0].limitations] == [
         "프로세싱 시간 정보를 업데이트함", "업데이트 시점을 비디오 편집 수행 중으로 한정함",
     ]
@@ -198,7 +198,7 @@ def _pinned_file(tmp_path, version: int, text: str = "큐에 저장함"):
 
 def test_a_pinned_decomposition_is_used_even_across_a_version_bump(tmp_path, monkeypatch):
     """실험은 대개 버전을 올린 뒤에 한다. 버전으로 막으면 비교 대상 분해를 쓸 수 없다."""
-    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION - 1)
+    path = _pinned_file(tmp_path, version="옛 분해 세대")
     monkeypatch.setattr(claims, "DECOMPOSITION_FILE", str(path))
     monkeypatch.setattr(claims, "run_cli",
                         lambda *a, **k: pytest.fail("고정 분해가 있는데 LLM을 불렀습니다."))
@@ -212,7 +212,7 @@ def test_a_pinned_decomposition_is_used_even_across_a_version_bump(tmp_path, mon
 
 def test_a_pinned_decomposition_is_ignored_when_the_claim_text_differs(tmp_path, monkeypatch):
     """버전 검사는 건너뛰어도 구성 원문 대조는 남는다. 다른 청구항에 씌우면 안 된다."""
-    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION)
+    path = _pinned_file(tmp_path, version=decomposition_generation())
     monkeypatch.setattr(claims, "DECOMPOSITION_FILE", str(path))
     called: list[str] = []
 
@@ -229,7 +229,7 @@ def test_a_pinned_decomposition_is_ignored_when_the_claim_text_differs(tmp_path,
 def test_an_explicit_pinned_decomposition_takes_priority_over_the_environment(tmp_path,
                                                                               monkeypatch):
     """회귀 하니스의 사건별 분해가 프로세스 전역 고정 파일과 섞이면 안 된다."""
-    path = _pinned_file(tmp_path, version=DECOMPOSITION_VERSION - 1, text="사건별 분해")
+    path = _pinned_file(tmp_path, version="옛 분해 세대", text="사건별 분해")
     pinned = json.loads(path.read_text(encoding="utf-8"))
     monkeypatch.setattr(
         claims, "_pinned_decomposition",

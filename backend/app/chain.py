@@ -6,12 +6,14 @@
 from .claims import ancestry
 from .consistency import antecedents
 from .coverage import (
-    JUDGMENT_RANK, PRIMARY_CANDIDATE_RATIO,
-    best_match, combined_similarity, core_direct_score, core_elements, difference_labels,
-    disclosed_limitations, filled_limitations, has_correspondence, ineligible_reason,
-    is_better_match, is_complete, is_eligible_supplement, judgment_at_rank, limitation_gain,
-    no_correspondence_labels, residual_difference, rows_for, score_document, supplement_gain,
-    supplement_needed_labels, supplement_reason, well_known_labels,
+    JUDGMENT_RANK, PRIMARY_CANDIDATE_RATIO, SUBSTANTIVE_IMPORTANCE,
+    best_match, combination_supported, combined_similarity, core_direct_score, core_elements,
+    derive_judgment,
+    difference_labels, disclosed_limitations, evidenced_limitations, filled_limitations,
+    has_correspondence, ineligible_reason, is_better_match, is_complete,
+    is_eligible_supplement, judgment_at_rank, limitation_gain, no_correspondence_labels,
+    pending_labels, residual_difference, rows_for, score_document,
+    supplement_gain, supplement_needed_labels, supplement_reason, well_known_labels,
 )
 from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
                      NoveltyScreen, SupplementCandidate)
@@ -214,13 +216,10 @@ def _no_primary_chain(claim: Claim, matrix: Matrix, chain: ChainInfo, cause: str
     """세울 조합이 없는 상태. 결론만 접고 구성대비는 그대로 보고합니다.
 
     이 게이트가 답하는 것은 **거절 이유를 세울 수 있는가**이지, 문헌에 대응 기재가 있는가가
-    아닙니다. 종전에는 여기서 uncovered에 전 구성을 넣고 빈 조합(merged={})으로 마감했는데,
-    그러면 두 가지가 한꺼번에 무너집니다. 하나는 원문 대조까지 통과한 '실질적 동일·direct'
-    대응이 있는 구성까지 "어느 인용발명에서도 확인되지 않았다"고 단정하는 것이고, 다른 하나는
-    보고서 본문에서 구성대비 결과가 통째로 사라지는 것입니다(report.build_claim_report는
-    채택 문헌 목록으로 본문을 만듭니다). 실제로 세 문헌이 같은 구성을 '실질적 동일·direct·
-    검증됨'으로 개시한 분석이 "구성 A, B은 제시된 인용발명 어디에서도 대응 기재가 확인되지
-    않아 추가 검색이 필요합니다"로 나갔습니다.
+    아닙니다. 둘을 같은 칸에 넣어 빈 조합(merged={})으로 마감하면 두 가지가 함께 무너집니다.
+    원문 대조까지 통과한 '실질적 동일·direct' 대응이 있는 구성까지 "어느 인용발명에서도
+    확인되지 않았다"고 단정하게 되고, 보고서 본문에서 구성대비 결과가 통째로 사라집니다
+    (report.build_claim_report는 채택 문헌 목록으로 본문을 만듭니다).
 
     미판정을 '대응 없음'으로 흘려보내지 않는 것(_incomplete_chain)과 같은 이유로, 확인된
     대응을 없는 것으로 적지 않습니다. 채택은 하지 않으므로 primary·secondaries는 비운 채
@@ -243,14 +242,18 @@ def _no_primary_chain(claim: Claim, matrix: Matrix, chain: ChainInfo, cause: str
                     if element.label not in chain.uncovered]
     chain.reference_only = sorted({match.document_id for label in corresponded
                                    if (match := reference.get(label)) is not None})
+    pending = pending_labels(matrix, chain.uncovered)
+    chain.combination_pending = [label for label in chain.uncovered if label in pending]
+    chain.combination_pending_reasons = pending
     reasons = [cause or "차별적 핵심 구성을 직접 개시한 인용발명이 없어 주 인용발명을 세우지 못했습니다."]
     if corresponded:
         reasons.append(f"구성 {', '.join(corresponded)}에는 대응 기재가 확인되었으나, "
                        "주 인용발명이 서지 않아 인용발명 조합을 확정하지 않았습니다.")
-    blocking = blocking_labels(claim, chain.uncovered)
+    blocking = [label for label in blocking_labels(claim, chain.uncovered)
+                if label not in chain.combination_pending]
     if blocking:
         reasons.append(f"구성 {', '.join(blocking)}은 어느 인용발명에서도 대응 기재가 확인되지 않았습니다.")
-    chain.rationale = " ".join(reasons)
+    chain.rationale = " ".join(reasons) + _pending_clause(chain)
     return _finalize(claim, chain, reference, matrix)
 
 
@@ -283,12 +286,20 @@ def _apply_gap_policy(claim: Claim, chain: ChainInfo, matrix: Matrix,
     chain.beyond_limit_documents = overflow
     chain.beyond_limit_residual = _residual_overflow(chain, matrix, merged, adopted)
 
+    # 축 결손으로 기각된 한정이 걸린 구성은 공백과 성격이 다릅니다(models.combination_pending).
+    # 결론을 막는 목록에서 먼저 떼어 내야, 결합 위에서 다시 물어야 할 것이 "어느 인용발명에도
+    # 없다"는 확정 진술로 굳지 않습니다.
+    pending = pending_labels(matrix, chain.uncovered)
+    chain.combination_pending = [label for label in chain.uncovered if label in pending]
+    chain.combination_pending_reasons = pending
+
     blocking = blocking_labels(claim, chain.uncovered)
     well_known = well_known_labels(claim, matrix, blocking)
     chain.well_known = [label for label in blocking if label in well_known]
     chain.well_known_documents = well_known
 
-    blocking = [label for label in blocking if label not in well_known]
+    blocking = [label for label in blocking
+                if label not in well_known and label not in chain.combination_pending]
     if not blocking:
         chain.rationale = _combination_rationale(chain)
         return
@@ -302,7 +313,8 @@ def _apply_gap_policy(claim: Claim, chain: ChainInfo, matrix: Matrix,
     if limited:
         reasons.append(f"구성 {', '.join(limited)}에는 대응 기재를 가진 인용발명이 있으나, "
                        f"{_unadopted_reason(chain)} 이 거절 이유에 세우지 않았습니다.")
-    chain.rationale = " ".join(reasons) + " 이대로는 거절 이유를 구성하기 어렵습니다."
+    chain.rationale = (" ".join(reasons) + " 이대로는 거절 이유를 구성하기 어렵습니다."
+                       + _pending_clause(chain))
 
 
 def _unadopted_reason(chain: ChainInfo) -> str:
@@ -325,9 +337,8 @@ def _residual_overflow(chain: ChainInfo, matrix: Matrix, merged: dict[str, Eleme
     beyond_limit이 지키는 것은 "(X) 구성에 대응되는 인용발명이 확인되지 않음" 줄이고, 이쪽이
     지키는 것은 "→ 차이점: …" 줄입니다. 둘은 같은 사실을 서로 다른 자리에서 부정합니다 —
     구성 전체가 빠졌든 한정 하나가 빠졌든, 업로드된 문헌에 원문이 있는데 없다고 적으면 심사관은
-    이미 손에 든 문헌을 다시 찾아 나서게 됩니다. 실측에서 전제부의 "길 안내 정보를 제공함"이
-    그렇게 적혔습니다. 그 한정을 원문으로 개시한 내비게이션 특허가 업로드되어 있었지만 채택
-    조합 밖이었고, 보고서는 그 사실을 적지 않은 채 남은 차이로만 적었습니다.
+    이미 손에 든 문헌을 다시 찾아 나서게 됩니다. 채택 조합 밖의 문헌이 그 한정을 원문으로
+    개시하고 있다면 그 사실을 남은 차이로만 적어서는 안 됩니다.
 
     **채택 조합이 이미 메운 한정은 여기 오지 않습니다.** merged를 보므로, _absorb_limitations가
     조합 안의 다른 문헌으로 메운 한정은 missing에서 빠져 애초에 후보가 되지 않습니다. 그것은
@@ -354,28 +365,44 @@ def _eligible_primaries(claim: Claim, matrix: Matrix, scores: list[DocumentScore
     다만 전체 점수가 낮아도 **다른 후보가 갖지 못한** 핵심 구성을 원문으로 직접 개시한
     문헌은 남깁니다. 평균 점수에 희석되어 유효한 후보가 탈락하지 않게 하기 위한 예외입니다.
 
-    두 가지가 종전 구현과 다릅니다.
+    임계는 절대 차가 아니라 **비율**입니다(PRIMARY_CANDIDATE_RATIO). core_direct는 최고
+    문헌도 0.5 안팎이라, 절대값을 빼는 방식으로는 점수 분포에 따라 임계의 뜻이 달라집니다.
 
-    1. 임계를 절대 차가 아니라 **비율**로 잡습니다(PRIMARY_CANDIDATE_RATIO). core_direct는
-       최고 문헌도 0.5 안팎이라, 0.20을 빼면 임계가 최고점의 60% 수준으로 내려앉았습니다.
-    2. 예외를 **고유 기여**로 좁힙니다. 종전에는 핵심 구성을 하나라도 직접 개시하면 무조건
-       되살렸는데, 핵심 구성 중에는 후보 대부분이 함께 개시하는 것이 있습니다. 실측 사건에서
-       핵심 구성 (C)를 4문헌 중 3문헌이 '실질적 동일·direct·검증됨'으로 개시했고, 그래서 이
-       예외가 임계와 무관하게 세 문헌을 전부 되살렸습니다. 모두가 가진 것을 가졌다는 사실은
-       주 인용발명 자격의 근거가 되지 못합니다. 이미 통과한 후보들이 **직접 개시하지 못한**
-       핵심 구성을 이 문헌이 개시할 때만 되살립니다.
+    예외는 **고유 기여**에만 적용합니다. 핵심 구성 중에는 후보 대부분이 함께 개시하는 것이
+    있어서, 하나라도 직접 개시하면 되살리는 규칙은 사실상 전 문헌을 통과시킵니다. 모두가
+    가진 것을 가졌다는 사실은 주 인용발명 자격의 근거가 되지 못하므로, 이미 통과한 후보들이
+    **직접 개시하지 못한** 핵심 구성을 이 문헌이 개시할 때만 되살립니다.
     """
     core_labels = [element.label for element in core_elements(claim)]
-    # 문헌 순위(score_document)와 **같은 정의**를 씁니다. 종전에는 여기만 중요도 가중이 아닌
-    # 단순 평균이라, 같은 이름의 지표가 두 곳에서 다른 값이었고 마진도 다른 척도 위에서
-    # 비교됐습니다.
+    # 문헌 순위(score_document)와 **같은 정의**를 씁니다. 한쪽만 중요도 가중을 빼면 같은
+    # 이름의 지표가 두 곳에서 다른 값이 되고, 마진도 서로 다른 척도 위에서 비교됩니다.
     core_direct = {document_id: core_direct_score(claim, matches)
                    for document_id, matches in matrix.items()}
     if not core_direct:
         return []
     top = max(core_direct.values())
     if top <= 0.0:
-        # 어느 문헌도 핵심 구성을 직접 개시하지 못한 상태. 비율 임계만 놓고 보면 0점 문헌이
+        # 핵심으로 분류된 구성 중 어느 것도, 어느 문헌에서도 직접 개시되지 않은 상태입니다.
+        # 그러면 중요도 4 이상이라는 선은 이 사건에서 아무 후보도 남기지 못한 것이므로 실질
+        # 구성(3 이상)까지 한 칸 넓혀 다시 잽니다.
+        #
+        # 중요도는 분해와 함께 LLM이 매 실행 새로 매기는 값이라 같은 청구항에서도 한 칸씩
+        # 흔들립니다. 4를 하드 게이트로 두면, 잘 개시된 구성 하나가 3으로 내려앉는 순간
+        # 게이트가 통째로 비어 전 문헌이 '미채택'이 됩니다. 자격 게이트가 답할 질문은 후보
+        # 사이의 우열이지 "거절 이유를 세울 수 있는가"가 아닙니다.
+        #
+        # **2 이하로는 내려가지 않습니다.** 분해 프롬프트가 1~2를 "어느 발명에나 나타나는 범용
+        # 부품"과 "통상의 인터페이스·입출력 구성"으로 정의하므로, 거기까지 넓히면 범용 구성
+        # 하나를 개시했다는 이유로 무관한 문헌이 주 인용발명으로 찍힙니다. 그것은 이 게이트가
+        # 애초에 막으려던 것입니다.
+        fallback = [element for element in claim.elements
+                    if element.importance >= SUBSTANTIVE_IMPORTANCE]
+        core_direct = {document_id: core_direct_score(claim, matches, fallback)
+                       for document_id, matches in matrix.items()} if fallback else {}
+        core_labels = [element.label for element in fallback]
+        top = max(core_direct.values(), default=0.0)
+    if top <= 0.0:
+        # 어느 문헌도 어떤 구성도 직접 개시하지 못했습니다. 비율 임계만 놓고 보면 0점 문헌이
         # 전부 자격을 얻어 무관한 문헌이 "주 인용발명"으로 보고서에 찍힙니다.
         return []
     eligible = [score.document_id for score in scores
@@ -415,18 +442,16 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
 
     세 번째가 없으면 결합이 서지 않습니다. 부 인용발명은 구성 전체를 주 인용발명보다 잘
     개시하는 문헌이 아니라 빠진 한정 하나를 대는 문헌이므로, 구성 단위 우열(is_better_match)
-    하나로 문을 지키면 주 인용발명이 '일부 차이'만 되어도 보완이 사실상 불가능해집니다.
-    실측 사건에서 도파관 한정을 원문으로 개시한 문헌 3건이 전부 이 문에서 탈락했고, 조합은
-    1건에 머문 채 "다른 문헌에서도 더 강한 직접 근거는 확인하지 못했습니다"로 나갔습니다
+    하나로 문을 지키면 주 인용발명이 '일부 차이'만 되어도 보완이 사실상 불가능해집니다
     (coverage.filled_limitations 참조).
 
     공백에 유사도 하한을 걸지 않는 이유: 그 구성의 유일한 대응 기재를 가진 문헌이라도
     판정이 '일부 차이'면 하한에 걸려 탈락하고, 결과적으로 "어느 문헌에도 대응이 없다"는
     보고서가 나옵니다. 결합해서 남는 차이는 버리지 않고 보고서의 차이점으로 남깁니다.
 
-    **동률 처리.** 같은 한정을 여러 문헌이 개시하면 증분 이득이 정확히 같아집니다(실측 사건에서
-    도파관 한정이 3건에 있었습니다). 그때 문헌 번호가 빠른 것을 집으면 청구항과 거의 무관한
-    문헌이 번호만 앞선다는 이유로 부 인용발명이 됩니다. 기여도가 같다면 **청구항에 전체적으로
+    **동률 처리.** 같은 한정을 여러 문헌이 개시하면 증분 이득이 정확히 같아집니다. 그때 문헌
+    번호가 빠른 것을 집으면 청구항과 거의 무관한 문헌이 번호만 앞선다는 이유로 부 인용발명이
+    됩니다. 기여도가 같다면 **청구항에 전체적으로
     더 가까운 문헌**(단독 적합도)을 세우는 것이 더 방어 가능한 거절 이유이므로 그것을 다음
     기준으로 둡니다. 그래도 같으면 문헌 번호 순이라 결과는 항상 재현됩니다.
     """
@@ -445,10 +470,9 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
             step = _supplement_step(candidate, current)
             if step <= 0.0:
                 continue
+            if label in gap_labels and not _fills_a_gap(candidate, current):
+                continue
             if label in gap_labels:
-                # 공백에는 '검증된 대응 기재가 실제로 생겼는지'만 요구합니다.
-                if not has_correspondence(best_match([current, candidate])):
-                    continue
                 weight = GAP_PRIORITY
             else:
                 weight = 1.0
@@ -460,6 +484,35 @@ def _best_secondary(claim: Claim, matrix: Matrix, merged: dict[str, ElementMatch
         if best_key is None or key > best_key:
             best, best_key = document_id, key
     return best if best_key and best_key[0] >= MIN_SUPPLEMENT_GAIN else None
+
+
+def _fills_a_gap(candidate: ElementMatch | None, current: ElementMatch | None) -> bool:
+    """공백 구성에서 이 후보를 데려올 이유가 실제로 있는지. **한정 단위로** 묻습니다.
+
+    구성 단위 판정 라벨(has_correspondence)로 문을 지켜서는 안 됩니다. 공백이라는 말은 채택
+    셀의 라벨이 이미 '차이'·'대응 없음'이라는 뜻이고, 부 인용발명은 구성 전체가 아니라 빠진
+    한정 하나를 대는 문헌이라 후보의 라벨도 낮은 것이 정상입니다. 그러면 두 셀을 어떻게 합쳐도
+    조건이 참이 될 수 없습니다 — 공백을 메울 후보만 골라 놓고 공백이 이미 메워져 있을 것을
+    요구하는 순환이고, 보조 인용발명이 한 건도 서지 못합니다.
+
+    그렇다고 "검증된 발췌가 있으면 통과"로 열어서도 안 됩니다. 그러면 구성이 공백으로 남는데
+    문헌만 보조 인용발명으로 이름이 올라갑니다 — 거절 이유에 세운 문헌이 정작 그 구성에는
+    아무것도 보태지 못한 상태입니다. 그래서 **개시된 한정이 실제로 있을 것**을 요구합니다.
+    개시로 확정된 것이든, 원문 근거를 내고 축 결손으로만 기각된 것이든(결합 위에서 다시 물을
+    대상이므로) 둘 다 기여입니다.
+
+    **filled_limitations로 재지 않습니다.** 그것은 후보가 개시한 한정 문언과 채택 셀의 누락
+    한정 문언이 **문자열로 같을 것**을 요구하는데, 두 셀을 각각 판정한 결과라 같은 요구사항도
+    표현이 갈립니다. 공백 구성에서는 채택 셀이 애초에 아무것도 개시하지 않았으므로 대조할
+    상대가 없고, 물어야 할 것은 "후보가 여기에 원문을 보태는가" 하나뿐입니다.
+
+    한정 점검이 아예 없는 셀은 잴 재료가 없으므로 구성 단위 판정으로 되돌아갑니다.
+    """
+    if candidate is None or not is_eligible_supplement(candidate):
+        return False
+    if candidate.limitation_checks:
+        return bool(evidenced_limitations(candidate))
+    return has_correspondence(best_match([current, candidate]))
 
 
 def _supplement_step(candidate: ElementMatch | None, current: ElementMatch | None) -> float:
@@ -486,16 +539,20 @@ def _absorb_limitations(chosen: ElementMatch | None,
                         cells: list[ElementMatch | None]) -> ElementMatch | None:
     """채택 셀이 빠뜨린 한정을 같은 조합의 다른 문헌이 개시했다면 결합 결과에 반영합니다.
 
-    best_match는 구성 하나를 문헌 하나에 통째로 넘깁니다. 그러면 진 쪽 셀이 원문으로 개시한
-    한정까지 함께 버려지고, 이긴 셀의 missing_limitations가 그대로 "결합 후에도 남는 차이"가
-    됩니다. 그 한정을 개시한 문헌을 **같은 조합 안에** 세워 두고도 그렇습니다. _best_secondary가
-    바로 그 기여를 보고 문헌을 채택했는데 결과에는 반영되지 않는, 앞뒤가 맞지 않는 상태였습니다.
+    best_match는 구성 하나를 문헌 하나에 통째로 넘깁니다. 그대로 두면 진 쪽 셀이 원문으로
+    개시한 한정까지 함께 버려지고, 이긴 셀의 missing_limitations가 그대로 "결합 후에도 남는
+    차이"가 됩니다 — 그 한정을 개시한 문헌을 **같은 조합 안에** 세워 두고도 그렇습니다.
+    _best_secondary가 바로 그 기여를 보고 채택한 문헌인데 결과에는 반영되지 않는 셈입니다.
 
-    **판정 라벨은 올리지 않습니다.** 여기서 하는 말은 "그 한정의 기재가 조합 안에 있다"까지이고,
-    "두 문헌을 결합할 동기가 있다"거나 "결합하면 구성이 완성된다"는 그 다음 판단입니다. 후자는
-    이 도구가 확인하지 않으므로 등급에 손대지 않습니다. 결과적으로 그 구성은 '일부 차이'로 남아
-    residual에 계속 오르고, 보고서에는 남은 차이 대신 **어느 문헌이 그 한정을 댔는지**가
-    적힙니다(report._resolved_note). _restore_combination_antecedents와 같은 fail-closed입니다.
+    **판정 라벨은 채운 한정에서 다시 유도합니다.** 등급은 한정별 개시 여부의 결정론적
+    함수이므로(coverage.derive_judgment), 한정을 채워 놓고 등급만 그대로 두면 같은 셀 안에서
+    두 값이 서로 모순합니다. 그 모순된 등급은 has_correspondence를 거쳐 "이 구성은 어느
+    인용발명에도 없다"는 **사실 진술**로 나갑니다. 조합이 그 한정의 원문을 들고 있는데도
+    그렇습니다.
+
+    유보해야 할 것은 등급이 아니라 결론입니다. 결합의 동기·용이성·저해 요인은 여전히 평가하지
+    않고, 그 사실은 rationale과 보고서 결론이 계속 말합니다(_combination_rationale). 어느 문헌이
+    무엇을 댔는지도 combination_resolved에 그대로 남습니다.
 
     원본 matrix 셀은 감사용 단독 판정이므로 사본에만 기록합니다.
     """
@@ -509,6 +566,13 @@ def _absorb_limitations(chosen: ElementMatch | None,
     for cell in cells:
         if cell is None:
             continue
+        # 결합 심사가 인정한 한정은 그 자리에서 해소된 것으로 봅니다. 이 인정은 채택 조합 전체의
+        # 근거 위에서 내린 판단이고(entailment.validate_combination), 어느 문헌이 빠진 축을
+        # 댔는지도 함께 확인된 상태입니다. **진 쪽 셀도 봅니다** — 기각은 특정 문헌의 판정에
+        # 붙는 사실이라, 그 문헌이 병합에서 지면 인정까지 함께 버려집니다.
+        for limitation, sources in combination_supported(cell).items():
+            if limitation in missing and sources:
+                resolved.setdefault(limitation, sources[0])
         for limitation, document_id in cell.combination_resolved.items():
             if limitation in missing:
                 resolved.setdefault(limitation, document_id)
@@ -524,6 +588,22 @@ def _absorb_limitations(chosen: ElementMatch | None,
     copy.missing_limitations = [limitation for limitation in copy.missing_limitations
                                 if limitation not in resolved]
     copy.combination_resolved = resolved
+    # 채운 한정을 반영해 등급을 다시 유도하되, **동일급으로는 올리지 않습니다.**
+    #
+    # 끝까지 다시 유도하면 과합니다. '동일'·'실질적 동일'은 "이 인용발명이 이
+    # 구성을 개시한다"는 **단일 문헌 진술**이라 결합 결과에 붙일 수 있는 말이 아닙니다. 그래서
+    # 상한을 '일부 차이'로 둡니다. 그 아래에서 올라오는 것("관련 기재만 있음" → "대응은 하되
+    # 차이가 남음")은 조합 안에 원문이 있다는 사실 진술이므로 안전하고, 정확히 그 구간에서
+    # 거짓 공백이 발생합니다.
+    for check in copy.limitation_checks:
+        if check.limitation in resolved and not check.disclosed:
+            check.disclosed = True
+    derived = derive_judgment(
+        copy.limitation_checks, has_evidence=bool(copy.quote or copy.evidence),
+        terminology=copy.terminology, different_purpose=copy.different_purpose)
+    ceiling = JUDGMENT_RANK["일부 차이"]
+    if JUDGMENT_RANK.get(derived, 0) > JUDGMENT_RANK.get(copy.judgment, 0):
+        copy.judgment = judgment_at_rank(min(JUDGMENT_RANK.get(derived, 0), ceiling))
     return copy
 
 
@@ -540,8 +620,8 @@ def _restore_combination_antecedents(
     그 주장이 참인지 확인할 교차문헌 검증 단계가 아직 없습니다. 확인할 수 없는 것은 풀지 않는
     쪽이 기본값이어야 하므로, 상한을 푸는 조건을 다음 두 가지로 좁힙니다.
 
-      1. 선행 구성이 결합 안에서 **완전 개시**(is_complete)일 것. 종전에는 has_correspondence만
-         요구했는데, 그것은 '일부 유사'·'일부 차이'도 통과시킵니다. 상한이 걸린 이유가 "지시
+      1. 선행 구성이 결합 안에서 **완전 개시**(is_complete)일 것. has_correspondence로는
+         부족합니다 — 그것은 '일부 유사'·'일부 차이'도 통과시킵니다. 상한이 걸린 이유가 "지시
          대상이 이 문헌에 세워지지 않았다"인데, 부분적으로만 개시된 대상은 결합에서도 그
          대상을 세우지 못합니다. 그런 상태에서 상한을 풀면 결합 커버리지를 과대평가합니다.
       2. 복원 상한은 **선행 구성 중 가장 약한 판정을 넘지 못할 것.** 어떤 구성도 자기가
@@ -638,13 +718,11 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
     # 종속항도 독립항과 **같은 보완 탐색**을 돌립니다. 공백(uncovered)뿐 아니라 '보완 검토
     # 대상'(supplement_needed) 전체를 후보 대상으로 삼습니다.
     #
-    # 종전에는 대상을 공백으로만 한정했습니다("새 문헌을 끌어오는 이유는 공백뿐"). 그러면
-    # 상속한 문헌이 어떤 구성을 **약하게라도** 커버한 순간 그 구성은 탐색에서 빠지고, 같은
-    # 구성을 원문으로 직접 개시한 다른 문헌이 있어도 영원히 채택되지 않습니다. 실제로 한
-    # 보고서에서 "고유 식별값에 매칭된 영상을 호출하는 제어부"가, 그런 기재가 전혀 없는
-    # 문헌의 "컴퓨팅 장치를 사용할 수 있다"는 총론 문단에 '일부 유사'로 붙었습니다. 그
-    # 구성을 실제로 개시한 문헌은 '실질적 동일·direct·검증됨'이었는데도 미채택으로 남았습니다.
-    # README가 독립항에 대해 "보완 검토 대상 ≠ 미커버"라고 정한 것과 같은 이유입니다.
+    # 대상을 공백으로만 한정하면, 상속한 문헌이 어떤 구성을 **약하게라도** 커버한 순간 그
+    # 구성은 탐색에서 빠지고 같은 구성을 원문으로 직접 개시한 다른 문헌이 있어도 영원히
+    # 채택되지 않습니다. 총론 문단 하나에 '일부 유사'로 붙은 대응이 '실질적 동일·direct·
+    # 검증됨'을 밀어내는 상태입니다. README가 독립항에 대해 "보완 검토 대상 ≠ 미커버"라고
+    # 정한 것과 같은 이유입니다.
     #
     # 다만 **새로 더하는 문헌은 1건까지**입니다(MAX_DEPENDENT_ADDITIONS). 종속항의 추가 한정은
     # 대개 한 줄인데 그것 하나를 위해 문헌을 여러 건 끌어오면 거절 이유가 실무에서 설득력을
@@ -718,6 +796,13 @@ def _finalize(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch],
     # 미판정 상태에서는 "대응이 확인되지 않았다"고 적을 근거가 없으므로 비워 둡니다.
     if chain.track != "analysis_incomplete":
         chain.preamble_undisclosed = preamble_gaps(claim, no_correspondence_labels(claim, merged))
+        # 결합을 세운 경로는 _apply_gap_policy가 이미 채웠습니다. 나머지 경로(단일문헌 신규성,
+        # 주 인용발명 미성립)도 같은 사실을 남겨야 보고서가 한 곳에서만 유보를 적습니다.
+        if not chain.combination_pending:
+            gaps = no_correspondence_labels(claim, merged)
+            pending = pending_labels(matrix, gaps)
+            chain.combination_pending = [label for label in gaps if label in pending]
+            chain.combination_pending_reasons = pending
     chain.candidates = sorted(chain.candidates, key=lambda score: (-score.main_score, score.document_id))
     for score in chain.candidates:
         score.detail = {**score.detail, "role": _role_of(score.document_id, chain)}
@@ -823,7 +908,22 @@ def _combination_rationale(chain: ChainInfo) -> str:
             "작용효과는 평가하지 않았으므로 진보성 결론이 아닙니다.")
     if chain.residual:
         base += f" 결합 후에도 구성 {', '.join(chain.residual)}에는 차이가 남습니다."
-    return base + _well_known_clause(chain)
+    return base + _pending_clause(chain) + _well_known_clause(chain)
+
+
+def _pending_clause(chain: ChainInfo) -> str:
+    """축 결손으로 유보한 구성이 있으면 그 사실을 결론에 드러냅니다.
+
+    조용히 넘기면 보고서만 보고는 그 구성이 개시된 것인지 판단이 유보된 것인지 알 수
+    없습니다. 반대로 이것을 공백으로 적으면 원문 근거가 있는 기재를 없다고 단정하게 됩니다.
+    둘 다 피하려면 유보를 유보라고 적는 수밖에 없습니다.
+    """
+    if not chain.combination_pending:
+        return ""
+    return (f" 구성 {', '.join(chain.combination_pending)}은 인용발명에 원문 근거가 있으나 "
+            "의미검증이 문헌 단독으로는 한정의 일부 축을 확인하지 못했습니다. 그 축을 같은 "
+            "조합의 다른 인용발명이 대는지는 이 도구가 판단하지 않았으므로 결론을 유보합니다 — "
+            "미개시로 읽지 마십시오.")
 
 
 def matrix_for(matches: list[ElementMatch]) -> Matrix:

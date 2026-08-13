@@ -6,7 +6,12 @@ Judgment = Literal["동일", "실질적 동일", "일부 차이", "일부 유사
 Directness = Literal["direct", "inferred", "absent"]
 VerifyStatus = Literal["verified", "partial", "not_found", "empty", "short"]
 EvidenceAlignment = Literal["unverified", "exact", "recovered", "not_found"]
-SemanticStatus = Literal["not_run", "accepted", "rejected", "error"]
+# 의미검증 상태. "rejected"는 **문헌 단독** 심사의 결과이며 결론이 아닙니다. 축 하나가 그
+# 문헌에 없을 뿐 같은 조합의 다른 인용발명이 그 축을 댈 수 있고, 그것이 진보성 결합의
+# 정의입니다. 그래서 채택 조합이 확정된 뒤 결합 근거 위에서 한 번 더 묻고, 그 결과를
+# "…_in_combination"으로 갈라 적습니다 — 어느 단계가 무엇을 판단했는지 섞이지 않게 합니다.
+SemanticStatus = Literal["not_run", "accepted", "rejected",
+                         "accepted_in_combination", "rejected_in_combination", "error"]
 SemanticRelation = Literal["explicit", "necessary_implicit", "functional_equivalent", "unsupported"]
 
 
@@ -114,6 +119,9 @@ class LimitationCheck(BaseModel):
     semantic_status: SemanticStatus = "not_run"
     semantic_relation: SemanticRelation = "unsupported"
     semantic_note: str = ""
+    # 결합 심사에서 이 한정의 빠진 축을 실제로 댄 인용발명. accepted_in_combination일 때만
+    # 채워지며, 보고서가 "어느 문헌이 무엇을 댔는지"를 지어내지 않고 적을 수 있게 합니다.
+    combination_documents: list[str] = []
 
 
 def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
@@ -123,10 +131,9 @@ def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
     통째로 점검한 경우(whole_element)의 실패는 누락 '한정'이 아니라 구성 자체의 미개시라서
     목록에 올리지 않습니다.
 
-    비교 단계와 검증 단계가 각자 이 목록을 만들면 규칙이 갈라집니다. 실제로 검증 단계가
-    미개시 항목을 그대로 다시 채워 넣어, 비교 단계에서 걸러 낸 대안이 보고서의 차이점으로
-    되살아났습니다. 검증은 check.disclosed를 뒤집을 수 있으므로 두 단계 모두 이 함수를
-    같은 입력에 대해 다시 호출합니다.
+    비교 단계와 검증 단계가 각자 이 목록을 만들면 규칙이 갈라져, 비교 단계에서 걸러 낸 대안이
+    검증 단계에서 되살아나 보고서의 차이점으로 나갑니다. 검증은 check.disclosed를 뒤집을 수
+    있으므로 두 단계 모두 이 함수를 같은 입력에 대해 다시 호출합니다.
     """
     satisfied = {check.alternative_group for check in checks
                  if check.disclosed and check.alternative_group}
@@ -147,8 +154,8 @@ class ElementMatch(BaseModel):
     document_id: str
     # judgment는 **모델이 고르지 않습니다.** limitation_checks에서 coverage.derive_judgment가
     # 산출합니다. 모델에게는 아래 두 가지 좁은 질문만 묻고, 그 답과 한정별 개시 여부로
-    # 등급이 정해집니다. 라벨을 자유롭게 받던 종전에는 같은 근거에서도 실행마다 등급이
-    # 흔들렸고, 그 값 하나가 유사도·문헌 순위·신규성 게이트를 전부 좌우했습니다.
+    # 등급이 정해집니다. 라벨을 자유롭게 받으면 같은 근거에서도 실행마다 등급이 흔들리는데,
+    # 그 값 하나가 유사도·문헌 순위·신규성 게이트를 전부 좌우합니다.
     judgment: Judgment = "대응 없음"
     # 청구항 문언과 문헌 표기의 관계. 한정이 전부 개시된 경우에만 동일/실질적 동일을 가릅니다.
     terminology: Literal["identical", "equivalent"] = "equivalent"
@@ -190,12 +197,10 @@ class ElementMatch(BaseModel):
     # 기록하고 원본 matrix 셀(감사용 단독 판정)은 건드리지 않습니다.
     combination_resolved: dict[str, str] = {}
     # --- 표본 합의 계측 -------------------------------------------------------
-    # COMPARE_SAMPLES를 3으로 두는 근거는 "같은 셀이 실행마다 다른 판정을 낸다"입니다. 그런데
-    # 종전에는 그 불안정성을 **실행 뒤에 확인할 방법이 없었습니다.** compare._merge_votes가
-    # sample_agreement를 만들기는 했지만 `vote is winner` 항등 비교라 언제나 "1/3"이었고,
-    # _build_matches가 그 키를 읽지도 않아 계산 즉시 버려졌습니다. 3배 비용을 내면서 그 효과를
-    # 관측할 수 없는 상태였습니다. 아래 세 값은 judgment.json까지 실려, 표본 수를 몇으로 둘지와
-    # 조기 종료가 실제로 얼마나 먹을지를 데이터로 답할 수 있게 합니다.
+    # COMPARE_SAMPLES를 3으로 두는 근거는 "같은 셀이 실행마다 다른 판정을 낸다"입니다. 그
+    # 불안정성을 **실행 뒤에 확인할 수 있어야** 3배 비용이 정당화됩니다. 아래 세 값은
+    # judgment.json까지 실려, 표본 수를 몇으로 둘지와 조기 종료가 실제로 얼마나 먹을지를
+    # 데이터로 답할 수 있게 합니다.
     sample_count: int = 0                     # 이 셀을 합친 표본 수(0=합의 경로를 타지 않음)
     sample_agreement: float = 0.0             # 전 표본이 같은 disclosed를 낸 한정의 비율(0~1)
     # 앞선 두 표본이 **모든** 한정에서 일치한 셀. 그때는 세 번째 표본이 다수결을 바꿀 수 없어
@@ -309,12 +314,28 @@ class ChainInfo(BaseModel):
     # 인정 자체는 심사관의 판단이므로 근거 문헌을 함께 남겨 다툴 수 있게 합니다.
     well_known: list[str] = []
     well_known_documents: dict[str, list[str]] = {}
+    # 단독 문헌으로는 개시가 확인되지 않았지만, **결합 위에서 다시 물어야** 결론이 나는 라벨.
+    #
+    # 의미검증(entailment)은 문헌 하나만 놓고 한정을 봅니다. 그래서 "동작은 이 문헌에 있는데
+    # 그 동작의 대상이 이 문헌에 없다"는 축 결손이 나오면 그 한정을 개시에서 뺍니다. 문헌
+    # 단독 판단으로는 옳습니다. 그러나 진보성 결합에서 빠진 축을 다른 인용발명이 대는 것은
+    # 정상이고, 그것이 결합을 세우는 이유 자체입니다. 축 결손을 uncovered로 흘려보내면
+    # 보고서가 "어느 인용발명에서도 확인되지 않았다"고 적는데, 그 문헌에는 원문 근거가
+    # 있습니다 — 도구가 확인하지 못한 것을 없다고 단정한 진술입니다.
+    #
+    # 전형적인 형태는 이렇습니다. 어느 인용발명이 청구된 동작을 원문으로 개시하는데 그 동작의
+    # 대상만 그 문헌에 없고, 정작 그 대상은 같은 조합의 다른 인용발명이 개시하고 있습니다.
+    # 문헌별로만 물으면 앞의 문헌은 미채택, 그 구성은 미대응으로 나갑니다.
+    #
+    # 그래서 여기 담기는 라벨은 uncovered가 아닙니다. 결론을 확정하지 않고 유보한다는
+    # 뜻이고, 사유(어느 축이 왜 빠졌는지)를 그대로 달아 사람이 판단할 수 있게 합니다.
+    combination_pending: list[str] = []
+    combination_pending_reasons: dict[str, list[str]] = {}
     combination_limit: int = 0                # 이 청구항에 적용한 결합 문헌 수 상한
     # 그 상한이 **실제로 걸렸는지**. beyond_limit·beyond_limit_residual이 "채택하지 않은
     # 문헌에 그 기재가 있다"만 말하고 그 이유는 말하지 않으므로, 보고서가 이유를 지어내지
     # 않으려면 이 값이 필요합니다. 거짓이면 자리가 남아 있는데도 채택되지 않은 것이고
     # (보완 후보 평가에서 탈락), 참일 때만 "상한을 넘어 세우지 않았다"고 쓸 수 있습니다.
-    # 실측에서 1건짜리 조합을 두고 "상한(2건)을 넘어 세우지 않았다"고 적힌 적이 있습니다.
     limit_binding: bool = False
     supplement_needed: list[str] = []         # 주 인용발명만으로는 불완전해 보완을 검토한 라벨
     residual: list[str] = []                  # 커버는 되었으나 결합 후에도 차이가 남는 라벨
@@ -346,9 +367,8 @@ class Evidence(BaseModel):
     #
     # 없으면 보고서가 독자를 오도합니다. 의미검증은 발췌 한 문장이 아니라 그 문장이 속한 청크
     # 원문(_source_context)과 형제 한정의 인용문(element_context)까지 함께 읽고 판단하는데,
-    # 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐입니다. 그래서 실측에서 "HoloNet은 sRGB
-    # 이미지를 입력으로 받는다"가 "균일도 보정 이미지를 획득함"의 근거로 제시됐습니다 —
-    # 인정의 실제 근거는 같은 청크의 광원 강도 보정 서술이었는데 그것은 보고서에 없었습니다.
+    # 보고서에 찍히는 것은 짧은 대표 발췌 하나뿐입니다. 그러면 인정의 실제 근거가 보고서에
+    # 없는 채로 엉뚱한 발췌만 남아, 왜 개시로 인정됐는지 읽는 사람이 알 수 없습니다.
     # 판단을 감추지 않고 함께 내보내야 심사관이 그 다리를 다툴 수 있습니다.
     semantic_relation: str = ""
     semantic_note: str = ""
@@ -374,10 +394,10 @@ class ClaimResult(BaseModel):
     corresponded: bool = False                # 대응 기재가 확인된 구성인지
     # 이 구성의 하위 한정 중 원문으로 개시가 확인된 수 / 전체 수.
     #
-    # 종전에는 등급 밴드(90~94 등) 안의 위치를 백분율로 찍었습니다. 그 값은 대응된 구성에서
-    # 거의 항상 밴드 최댓값이라 등급 이름을 되풀이할 뿐이었고, 무엇보다 "%"가 "청구항의
-    # 94%가 개시되었다"로 읽히는데 실제 뜻은 그것이 아니었습니다. 분자·분모를 그대로 내보내면
-    # 독자가 아래 근거 목록과 대조해 검증할 수 있고, 값도 실제로 움직입니다.
+    # 등급 밴드(90~94 등) 안의 위치를 백분율로 찍지 않습니다. 그 값은 대응된 구성에서 거의
+    # 항상 밴드 최댓값이라 등급 이름을 되풀이할 뿐이고, 무엇보다 "%"가 "청구항의 94%가
+    # 개시되었다"로 읽히는데 실제 뜻은 그것이 아닙니다. 분자·분모를 그대로 내보내면 독자가
+    # 아래 근거 목록과 대조해 검증할 수 있고, 값도 실제로 움직입니다.
     # 대안 묶음("A, B 또는 C 중 적어도 하나")은 하나로 셉니다.
     disclosed_limitations: int = 0
     total_limitations: int = 0
@@ -388,8 +408,7 @@ class ClaimResult(BaseModel):
     difference: str | None = None
     # 채택된 셀에 실제로 남은 누락 한정. difference는 이것을 문장으로 옮긴 것이므로, 둘이
     # 어긋나면 보고서가 스스로를 반박합니다(report.report_invariants가 이 값으로 확인합니다).
-    # 실측에서 "1/5 개시"인데 차이점 줄에는 지시 관계 사유만 있고 빠진 네 한정이 한 줄도
-    # 없던 보고서가 나갔습니다.
+    # "1/5 개시"라고 적어 놓고 차이점 줄에는 빠진 한정이 한 줄도 없는 상태가 그것입니다.
     missing_limitations: list[str] = []
     combination: bool = False                 # 두 건 이상의 인용발명을 결합해 대응시켰는지
     evidence: list[Evidence] = []

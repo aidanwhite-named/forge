@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from . import cache
+from .cache import fingerprint
 from .agy import run_cli
 from .config import DECOMPOSITION_FILE, FORCE_REDECOMPOSE
 from .models import Claim, ClaimElement, Limitation
@@ -92,6 +93,27 @@ qualifier로 분리하십시오.
 문헌의 한 모델은 광학계를 모사하고 다른 뉴럴 네트워크는 영상을 생성하는 경우, 둘을 합쳐
 청구된 하나의 뉴럴 네트워크로 읽어서는 안 됩니다. 독립 동작을 원자화하되 **같은 주체에
 동시에 귀속되어야 하는 역할과 입력→출력 방향**은 core에서 끊지 마십시오.
+
+**그 관계를 떼어낼지 말지는 다음 한 가지로 정하십시오 — 관계를 뺀 나머지가 그 자체로
+입증할 값어치가 있는 동작인가, 아니면 그 분야 문헌이면 대개 충족하는 총칭인가.**
+
+- 남는 것이 **독립적으로 확인할 값어치가 있는 동작**이면 관계를 qualifier로 떼십시오.
+  "상기 도파관 광학 시스템을 모델링하는 뉴럴 네트워크를 학습함"에서 "뉴럴 네트워크를 학습함"은
+  그것만으로도 문헌에서 확인할 의미가 있는 동작입니다. core "뉴럴 네트워크를 학습함",
+  qualifier "학습되는 네트워크가 모델링하는 대상을 상기 도파관 광학 시스템으로 한정함"입니다.
+- 남는 것이 **관계를 빼면 아무 문헌이나 충족하는 총칭**이면 떼지 말고 core에 그대로 두십시오.
+  "학습된 모델에 입력되어 그 모델로부터 목표 영상을 출력시키는 보정 영상을 획득함"에서
+  "보정 영상을 획득함"은 어떤 보정값이든 얻기만 하면 충족됩니다. 이때 관계를 떼면 뉴럴
+  네트워크가 전혀 없는 보정행렬 문헌이 핵심 동작을 개시한 것으로 올라갑니다. 이 경우에는
+  관계를 포함한 문장 전체를 하나의 core로 남기십시오.
+
+**앞 구성이 이미 도입한 대상이라는 사실만으로는 떼는 근거가 되지 않습니다.** 위 두 예의
+"도파관 광학 시스템"과 "학습된 모델"은 둘 다 앞 구성이 세운 것인데 결론이 반대입니다.
+기준은 어디서 도입되었는지가 아니라 남는 동작이 총칭인지 여부입니다.
+
+떼어야 할 것을 떼지 않으면 어느 문헌도 그 core를 혼자 충족하지 못해 구성이 통째로 미개시가
+되고, 실제로 성립하는 인용발명 결합이 사라집니다. 반대로 떼지 말아야 할 것을 떼면 그 구성과
+아무 관계 없는 문헌이 핵심 동작을 개시한 것으로 올라갑니다. 양쪽 다 판정을 무너뜨립니다.
 
 여러 대안에 공통인 문구는 각 대안에 되풀이하지 마십시오. "디코딩·비디오·인코딩·디스플레이·
 전송 처리시간 중 적어도 하나에 근거하여 편집용 버퍼 개수를 결정함"은 처리시간 종류만 대안
@@ -249,18 +271,14 @@ def ancestry(claims: list[Claim], number: int) -> list[int]:
     return chain
 
 
-# 저장된 분해 결과의 형식 버전. 필드 구성뿐 아니라 원자 한정 분해 규칙이 바뀌어도 올립니다.
-# v5: 같은 모델·구성요소의 정체성을 이루는 역할과 입력→출력 관계를 core에 보존합니다.
-#     v4는 "보정 이미지를 획득함"만 core로 떼고 "학습된 NN에 입력되어 목표 영상을 출력시킴"을
-#     qualifier로 보냈습니다. 그 결과 NN이 전혀 없는 보정행렬 문헌이 핵심 동작을 개시한 것으로
-#     올라가, 관계 전체가 없는 구성도 '일부 유사'가 되었습니다.
-# v4: core 하나에 독립적으로 확인 가능한 두 동작을 합치지 않도록 원자성을 요구합니다. 같은
-#     청구항이 실행마다 다르게 분해되어(입력 획득 + 출력 획득 → core 1개로 병합) 판정과
-#     문헌 선정까지 흔들린 사례가 있었습니다.
-# v3: 공통 목적·용도 문구를 선택지마다 반복하지 않고, 동작·기준·용도·대안을 분리합니다.
-# v2: 시점·트리거·판단 기준을 core에 섞고 qualifier에 다시 적던 중복 분해를 금지합니다.
-#     같은 조건 하나가 빠졌다는 이유로 핵심 동작까지 함께 미개시가 되는 판정을 바로잡습니다.
-DECOMPOSITION_VERSION = 5
+def decomposition_generation() -> str:
+    """분해 프롬프트의 세대. 저장된 분해가 지금 규칙으로 만든 것인지 가리는 값입니다.
+
+    분해 결과는 비교 캐시 키에 그대로 들어가므로(cache.cache_key), 이 값이 갈리면 판정
+    캐시도 함께 갈립니다. 그래서 손으로 관리하면 안 됩니다 — 올리는 것을 잊으면 옛 규칙으로
+    쪼갠 한정 위에 새 규칙의 판정이 얹힙니다.
+    """
+    return fingerprint(IMPORTANCE_PROMPT)
 
 
 def _pinned_decomposition() -> dict | None:
@@ -309,7 +327,7 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None,
 
     shared_key = ""
     if claims_text and not FORCE_REDECOMPOSE:
-        shared_key = cache.decomposition_key(claims_text, DECOMPOSITION_VERSION)
+        shared_key = cache.decomposition_key(claims_text, decomposition_generation())
         shared = cache.load_decomposition(shared_key)
         restored |= {claim.number for claim in claims
                      if claim.number not in restored and _restore_elements(claim, shared)}
@@ -340,7 +358,7 @@ def dump_decomposition(claims: list[Claim], existing: dict | None = None) -> dic
              "limitations": [limitation.model_dump() for limitation in element.limitations]}
             for element in claim.elements
         ]
-    return {"version": DECOMPOSITION_VERSION, "claims": stored}
+    return {"version": decomposition_generation(), "claims": stored}
 
 
 def _restore_elements(claim: Claim, decomposition: dict | None,
@@ -350,13 +368,13 @@ def _restore_elements(claim: Claim, decomposition: dict | None,
     구성 원문까지 대조합니다. 청구항 문언이 바뀌었는데 라벨만 보고 예전 분해를 씌우면,
     보고서에는 새 문언이 실리고 판정은 옛 한정을 기준으로 내려집니다.
 
-    strict_version=False는 **고정 분해 파일 전용**입니다. 실험은 대개 분해 버전을 올린 뒤에
-    하는데, 버전으로 막으면 정작 비교 대상인 이전 분해를 쓸 수 없습니다. 구성 원문 대조는
+    strict_version=False는 **고정 분해 파일 전용**입니다. 실험은 대개 분해 프롬프트를 고친 뒤에
+    하는데, 세대로 막으면 정작 비교 대상인 이전 분해를 쓸 수 없습니다. 구성 원문 대조는
     이때도 그대로 하므로 다른 청구항의 분해가 잘못 씌워지지는 않습니다.
     """
     if not decomposition:
         return False
-    if strict_version and decomposition.get("version") != DECOMPOSITION_VERSION:
+    if strict_version and decomposition.get("version") != decomposition_generation():
         return False
     stored = (decomposition.get("claims") or {}).get(str(claim.number))
     if not isinstance(stored, list) or len(stored) != len(claim.elements) or not claim.elements:

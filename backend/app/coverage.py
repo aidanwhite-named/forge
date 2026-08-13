@@ -27,15 +27,18 @@ REPORT_GRADES = {
 UNCORRESPONDED_GRADE = ("대응 안됨", "⚪")
 
 CORE_IMPORTANCE_THRESHOLD = 4     # 이 이상이면 차별적 핵심 구성
+# 주 인용발명 자격 게이트가 후보를 한 건도 남기지 못했을 때 되돌아가는 하한입니다.
+# 분해 프롬프트가 1~2를 "범용 부품"·"통상의 인터페이스"로 정의하므로 그 아래로는 넓히지
+# 않습니다. 중요도는 매 실행 LLM이 새로 매기는 값이라 4 하나만 하드 게이트로 두면 한 칸
+# 흔들릴 때 전 문헌이 미채택으로 떨어집니다(chain._eligible_primaries).
+SUBSTANTIVE_IMPORTANCE = 3
 DIRECT_STRONG = 0.55              # 직접 근거가 이 이상이면 유효한 직접 개시
 CRITICAL_GAP = 0.35               # 이 미만이면 핵심 공백
 # 주 인용발명 후보로 남기려면 최고 문헌의 핵심 직접 개시량 대비 이 **비율** 이상이어야 합니다.
 #
-# 종전에는 절대 차(0.20)였습니다. 그런데 core_direct는 실측에서 최고 문헌도 0.5 안팎이라
-# 임계가 최고점의 60% 수준으로 내려앉아, 사실상 0점 문헌만 걸러졌습니다. 한 실측 사건에서는
-# 4문헌 중 3문헌이 그대로 통과했고 결국 main_score 1위가 뽑혔습니다 — 게이트가 있는 척만
-# 하는 상태였습니다. 비율로 두면 점수 분포가 좁든 넓든 같은 뜻("최고 문헌에 크게 못 미침")을
-# 유지합니다.
+# 절대 차로 잡으면 안 됩니다. core_direct는 최고 문헌도 0.5 안팎이라 0.20을 빼는 순간 임계가
+# 최고점의 60% 수준으로 내려앉고, 사실상 0점 문헌만 걸러져 게이트가 있는 척만 하게 됩니다.
+# 비율로 두면 점수 분포가 좁든 넓든 같은 뜻("최고 문헌에 크게 못 미침")을 유지합니다.
 PRIMARY_CANDIDATE_RATIO = 0.75
 
 # --- 대응의 우열 -------------------------------------------------------------
@@ -58,9 +61,8 @@ LIMITATION_GAIN_WEIGHT = 0.60
 def judgment_at_rank(rank: int) -> str:
     """서열값을 판정 라벨로 되돌립니다.
 
-    상한을 씌우는 단계가 네 곳(verify·consistency·entailment·chain)이고, 종전에는 각자
-    같은 역인덱스를 다시 만들었습니다. verify는 JUDGMENT_RANK를 import하지 않고 같은 표를
-    한 벌 더 들고 있어서, 라벨을 하나 바꾸면 다섯 곳을 함께 고쳐야 했습니다.
+    상한을 씌우는 단계가 네 곳(verify·consistency·entailment·chain)입니다. 각자 역인덱스를
+    따로 만들면 라벨을 하나 바꿀 때마다 다섯 곳을 함께 고쳐야 하므로 여기 한 벌만 둡니다.
     """
     return _JUDGMENT_BY_RANK[rank]
 
@@ -73,10 +75,10 @@ def counted_checks(checks: list) -> list:
     나옵니다. 그래서 한 묶음은 언제나 정확히 한 자리를 차지하고, 개시 여부는 그 묶음의
     아무 대안이나 개시되었는지로 정합니다.
 
-    종전에는 **충족된 묶음에서 미개시 대안만** 뺐습니다. 그러면 같은 묶음에서 모델이 대안을
-    몇 개 개시로 표시했느냐에 따라 분모가 흔들려, 보고서에 (1,1)·(2,2)·(3,3)이 제각각
-    찍혔습니다. 비율은 셋 다 1.0이라 점수와 선정에는 영향이 없었지만, 같은 청구항을
-    충족한 두 문헌이 서로 다른 개시 수를 달고 나갔습니다.
+    **충족된 묶음에서 미개시 대안만** 빼는 방식은 쓰지 않습니다. 그러면 같은 묶음에서 모델이
+    대안을 몇 개 개시로 표시했느냐에 따라 분모가 흔들려 (1,1)·(2,2)·(3,3)이 제각각 찍힙니다.
+    비율은 셋 다 1.0이라 점수와 선정은 같지만, 같은 청구항을 충족한 두 문헌이 서로 다른
+    개시 수를 달고 나갑니다.
     """
     counted: list = []
     seen: set[str] = set()
@@ -99,8 +101,8 @@ def disclosed_count(checks: list, resolved: set[str] | None = None) -> tuple[int
     """(개시가 확인된 하위 한정 수, 분모). 대안 묶음은 양쪽에서 한 자리만 차지합니다.
 
     커버율(atomic_coverage)과 보고서 정량 지표(limitation_counts)가 **같은 셈법**을 쓰도록
-    한 곳에 둡니다. 종전에는 두 함수와 counted_checks가 각자 대안 묶음 처리를 다시 적어,
-    같은 뜻의 계산이 세 벌 있었습니다.
+    한 곳에 둡니다. 부르는 쪽마다 대안 묶음 처리를 다시 적으면 같은 뜻의 계산이 여러 벌
+    생기고, 그중 하나만 고쳐지는 순간 두 지표가 어긋납니다.
 
     resolved는 채택 조합의 다른 문헌이 개시한 한정입니다. 원본 문헌 셀에서는 항상 비어
     있고, chain._merge가 만든 결합 사본에서만 들어옵니다. 대안 묶음 중 하나가 다른 문헌으로
@@ -122,8 +124,8 @@ def atomic_coverage(match: ElementMatch) -> float | None:
 
     반드시 limitation_checks만 셉니다. evidence는 compare.py의 근거 규칙상 **누락 한정에
     가장 가까운 보조 발췌**라서, 그것을 커버된 항목으로 세면 "이 한정은 문헌에 없다"는
-    증거를 많이 모을수록 커버율이 올라가는 역전이 생깁니다. quote 1건을 커버 1건으로
-    세던 것도 같은 문제였습니다. 하위 제한이 10개든 1개든 분자가 1이었습니다.
+    증거를 많이 모을수록 커버율이 올라가는 역전이 생깁니다. quote 1건을 커버 1건으로 세는
+    것도 같은 문제입니다 — 하위 제한이 10개든 1개든 분자가 1이 됩니다.
 
     점검 결과가 없을 때 None을 쓰는 근거: 누락 한정 수만으로는 분모(전체 하위 제한 수)를
     알 수 없습니다. 누락이 있으면 _build_matches가 이미 판정을 '일부 차이' 이하로 강등하고
@@ -144,10 +146,10 @@ def _is_disclosed(check, satisfied: set[str]) -> bool:
 
 
 # --- 판정 등급 산출 -----------------------------------------------------------
-# 등급은 **코드가 계산합니다.** 종전에는 LLM이 6개 라벨 중 하나를 직접 골랐는데, 그 값 하나가
+# 등급은 **코드가 계산합니다.** 모델이 6개 라벨 중 하나를 직접 고르게 하면, 그 값 하나가
 # JUDGMENT_SIMILARITY·JUDGMENT_RANK·has_correspondence·chain._directly_disclosed를 전부
-# 좌우하면서도 근거에 묶여 있지 않았습니다. 같은 문헌·같은 발췌에서도 실행마다 '실질적 동일'과
-# '대응 없음' 사이를 오갔고, 그 흔들림이 그대로 결론까지 갔습니다.
+# 좌우하면서도 근거에는 묶이지 않습니다. 같은 문헌·같은 발췌에서도 실행마다 '실질적 동일'과
+# '대응 없음' 사이를 오가고, 그 흔들림이 그대로 결론까지 갑니다.
 #
 # 재료는 이미 전부 있습니다. limitation_checks의 core/qualifier별 개시 여부는 항목마다 발췌를
 # 요구하고 독립 의미검증(entailment.py)까지 거치므로 라벨보다 훨씬 단단히 묶여 있습니다.
@@ -243,14 +245,18 @@ def core_elements(claim: Claim) -> list[ClaimElement]:
     return [element for element in claim.elements if is_core(element)] or list(claim.elements)
 
 
-def core_direct_score(claim: Claim, matches: dict[str, ElementMatch]) -> float:
+def core_direct_score(claim: Claim, matches: dict[str, ElementMatch],
+                      elements: list[ClaimElement] | None = None) -> float:
     """핵심 구성의 **직접** 개시량(0~1). 중요도 가중 평균입니다.
 
     문헌 순위(score_document)와 주 인용발명 자격 게이트가 같은 정의를 쓰도록 한 곳에 둡니다.
-    종전에는 자격 게이트만 단순 평균이라, 같은 '핵심 직접 개시량'이라는 이름으로 두 곳이
-    다른 값을 쓰고 임계(PRIMARY_CANDIDATE_RATIO)도 서로 다른 척도 위에서 비교됐습니다.
+    한쪽만 단순 평균을 쓰면 같은 '핵심 직접 개시량'이라는 이름으로 두 곳이 다른 값을 쓰게 되고,
+    임계(PRIMARY_CANDIDATE_RATIO)도 서로 다른 척도 위에서 비교됩니다.
+
+    elements를 주면 그 구성들로 잽니다. 중요도 분류가 이 사건에서 신호를 갖지 못할 때
+    전 구성으로 다시 재기 위한 것입니다(chain._eligible_primaries).
     """
-    core = core_elements(claim)
+    core = elements or core_elements(claim)
     weight = sum(element.importance for element in core) or 1
     return sum(element.importance * direct_similarity(matches.get(element.label))
                for element in core) / weight
@@ -432,6 +438,108 @@ def disclosed_limitations(match: ElementMatch | None) -> set[str]:
             if check.disclosed and check.limitation and check.verify in VERIFY_OK}
 
 
+# --- 한정 단위 사실 계층 -------------------------------------------------------
+# 이 아래 함수들은 **판정 라벨을 보지 않습니다.** 라벨(judgment)은 한정별 개시 여부에서
+# 유도한 표시값인데(derive_judgment), 그 유도값이 다시 결합·선정의 하드 게이트로 올라가면서
+# 1차 사실이 두 번 압축됐습니다. 압축은 비가역이라, 새 사건마다 다른 곳에서 절벽이 납니다.
+#
+# 그래서 결합 판단은 라벨 대신 여기를 봅니다. 라벨은 보고서에 찍는 데만 씁니다.
+
+
+def combination_supported(match: ElementMatch | None) -> dict[str, list[str]]:
+    """결합 심사가 인정한 한정과 빠진 축을 실제로 댄 인용발명.
+
+    entailment.validate_combination이 채택 조합 전체의 근거 위에서 다시 물어 인정한 것만
+    담깁니다. 문헌 단독으로는 여전히 개시가 아니므로 그 셀의 disclosed는 건드리지 않고,
+    결합 결과에서만 메워진 것으로 셉니다(chain._absorb_limitations).
+    """
+    if match is None or match.error:
+        return {}
+    return {check.limitation: list(check.combination_documents)
+            for check in match.limitation_checks
+            if check.semantic_status == "accepted_in_combination" and check.limitation}
+
+
+def rejected_limitations(match: ElementMatch | None) -> set[str]:
+    """1차 판정은 개시였는데 **의미검증이 축 결손으로 기각한** 한정.
+
+    아직 결합 심사를 거치지 않은 것만 셉니다. 결합 위에서 확인이 끝난 것은 인정이든 기각이든
+    더 이상 유보가 아니므로(accepted_in_combination / rejected_in_combination) 여기 오지
+    않습니다. 그러지 않으면 확정된 공백이 영영 유보로 남습니다.
+
+    entailment.validate_entailment는 기각할 때 check.disclosed를 False로 덮어씁니다.
+    그러면 "이 문헌에 근거가 아예 없다"와 "근거는 있는데 축 하나가 이 문헌에 없다"가
+    같은 값이 되어, 결합 단계에서는 둘을 구별할 수 없습니다. 다행히 판단 자체는
+    semantic_status에 남으므로 여기서 되살려 읽습니다.
+
+    두 상태를 가르는 것이 왜 중요한가: 전자는 다른 문헌을 찾아야 하고, 후자는 **이미 손에
+    든 다른 인용발명이 그 축을 대고 있는지**를 물어야 합니다. 진보성 결합이 정확히 그
+    작업입니다. 뭉뚱그리면 결합으로 세울 수 있는 거절 이유가 "구성 곤란"으로 나갑니다.
+    """
+    if match is None or match.error:
+        return set()
+    return {check.limitation for check in match.limitation_checks
+            if check.semantic_status == "rejected" and check.limitation
+            and check.verify in VERIFY_OK}
+
+
+def evidenced_limitations(match: ElementMatch | None) -> set[str]:
+    """이 문헌이 그 한정에 대해 **원문 대조를 통과한 근거를 실제로 낸** 것 전부.
+
+    개시로 확정된 것과 축 결손으로 기각된 것을 함께 봅니다. 결합 후보를 고를 때 물어야 할
+    질문은 "이 문헌이 이 구성을 개시했는가"가 아니라 "이 문헌이 여기에 보탤 원문이 있는가"
+    이기 때문입니다. 부 인용발명은 원래 구성 전체로는 주 인용발명보다 약합니다.
+    """
+    return disclosed_limitations(match) | rejected_limitations(match)
+
+
+def has_evidence(match: ElementMatch | None) -> bool:
+    """결합 탐색 전용의 대응 유무. has_correspondence와 달리 라벨을 보지 않습니다.
+
+    has_correspondence는 보고서에 "이 구성은 대응된다"고 적어도 되는지를 답하므로 보수적인
+    채로 두어야 합니다. 반면 "다른 문헌을 더 볼 가치가 있는가"에 그 기준을 쓰면, 아직
+    대응이 서지 않았다는 이유로 대응을 세울 문헌을 탈락시키는 순환이 됩니다.
+
+    한정 점검이 없는 셀에는 잴 재료가 없으므로 여기서는 거짓입니다. 그 경우의 처리는 부르는
+    쪽이 정합니다(chain._fills_a_gap) — 재료가 없다는 사실과 근거가 없다는 사실을 같은 값으로
+    돌려주면, 부르는 쪽이 둘을 구별할 방법이 없습니다.
+    """
+    return bool(evidenced_limitations(match))
+
+
+def pending_labels(matrix: dict[str, dict[str, ElementMatch]],
+                   labels: list[str]) -> dict[str, list[str]]:
+    """labels 중 **축 결손 기각이 걸려 있어** 결합 위에서 다시 물어야 하는 것과 그 사유.
+
+    공백으로 넘어온 라벨 중 이 목록에 든 것은 "어느 인용발명에서도 확인되지 않았다"고 적을
+    수 없습니다. 원문 근거는 있고, 이 도구가 결합 위에서 그것을 확인하는 단계를 아직 거치지
+    않았을 뿐입니다.
+
+    **병합 셀이 아니라 매트릭스를 봅니다.** 기각은 특정 문헌의 판정에 붙는 사실인데, 병합은
+    구성 하나를 문헌 하나에 통째로 넘기므로(best_match) 진 쪽 셀의 기각 기록은 병합 결과에
+    남지 않습니다. 그러면 축 결손을 안고 있는 문헌이 우연히 병합에서 지는 것만으로 유보가
+    공백으로 바뀝니다. beyond_limit·well_known이 같은 이유로 매트릭스를 보는 것과 같습니다.
+    """
+    found: dict[str, list[str]] = {}
+    for label in labels:
+        reasons = [f"인용발명 {document_id}: {reason}"
+                   for document_id in sorted(matrix)
+                   for reason in pending_reasons(matrix[document_id].get(label))]
+        if reasons:
+            found[label] = reasons
+    return found
+
+
+def pending_reasons(match: ElementMatch | None) -> list[str]:
+    """축 결손으로 기각된 한정과 그 사유. 보고서가 유보를 사실대로 적기 위한 재료입니다."""
+    if match is None or match.error:
+        return []
+    return [f"{check.limitation} — {check.semantic_note}".strip(" —")
+            for check in match.limitation_checks
+            if check.semantic_status == "rejected" and check.limitation
+            and check.verify in VERIFY_OK]
+
+
 def combined_similarity(claim: Claim, chain_matches: dict[str, ElementMatch]) -> float:
     """결합 후 청구항 전체 유사도(0~100). 구성별로 가장 좋은 판정을 채택한 결과입니다."""
     return round(weighted(rows_for(claim, chain_matches)) * 100, 2)
@@ -554,10 +662,9 @@ def filled_limitations(candidate: ElementMatch | None,
     대는 문헌입니다. 그래서 구성 단위 우열(is_better_match)만 물으면 이 기여는 보이지
     않습니다 — 오히려 부 인용발명 쪽 등급이 낮은 것이 정상입니다.
 
-    실측에서 이것 때문에 결합이 서지 못했습니다. 주 인용발명이 '일부 차이'(rank 3)로 구성
-    전체를 덮고 도파관 한정 하나만 빠뜨렸는데, 그 한정을 원문으로 개시한 문헌 3건은 구성
-    전체로는 '차이'(rank 1)라 is_better_match에서 전부 탈락했습니다. 결과는 1건짜리 조합과
-    "다른 문헌에서도 더 강한 직접 근거는 확인하지 못했습니다"라는 결론이었습니다.
+    주 인용발명이 '일부 차이'(rank 3)로 구성 전체를 덮고 한정 하나만 빠뜨린 상태에서, 그
+    한정을 원문으로 개시한 문헌이 구성 전체로는 '차이'(rank 1)인 경우가 전형입니다. 구성
+    단위 우열만 물으면 그 문헌이 전부 탈락해 결합이 1건에 머뭅니다.
     """
     if candidate is None or current is None:
         return set()
@@ -640,9 +747,9 @@ def well_known_labels(claim: Claim, matrix: dict[str, dict[str, ElementMatch]],
                       labels: list[str]) -> dict[str, list[str]]:
     """공백 구성 중 주지관용기술로 다룰 수 있는 것과, 그 관용성을 실증하는 문헌.
 
-    **중요도만으로 가르지 않습니다.** 종전 구현은 "중요도 2 이하"라는 기준 하나로 별도 절을
-    만들었는데, 그것만으로는 무엇도 실제로 인정되지 않으면서 미개시 사실만 흐려졌습니다.
-    여기서는 업로드된 문헌 **여러 건이 같은 구성을 실제로 언급한다**는 실증을 함께 요구합니다.
+    **중요도만으로 가르지 않습니다.** "중요도 2 이하"라는 기준 하나로 별도 절을 만들면 무엇도
+    실제로 인정되지 않으면서 미개시 사실만 흐려집니다. 업로드된 문헌 **여러 건이 같은 구성을
+    실제로 언급한다**는 실증을 함께 요구합니다.
     한 문헌에만 있으면 그것은 주지관용이 아니라 그냥 인용발명이고, 어느 문헌에도 없으면 이
     도구가 주지관용이라고 말할 근거를 가지고 있지 않습니다.
 

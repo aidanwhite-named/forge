@@ -991,3 +991,168 @@ def test_an_alternative_group_always_occupies_exactly_one_slot():
     assert limitation_counts(alternatives(True, True, True)) == (1, 1)
     # 아무 대안도 개시되지 않으면 묶음 하나가 통째로 미개시다.
     assert limitation_counts(alternatives(False, False, False)) == (0, 1)
+
+
+# --- 축 결손 기각과 결합 -------------------------------------------------------
+# 의미검증(entailment)은 문헌 하나만 놓고 한정을 본다. "동작은 있는데 그 동작의 대상이 이
+# 문헌에 없다"는 축 결손이 그래서 나오고, 빠진 축을 다른 인용발명이 대는 것이 진보성 결합의
+# 정의다. 아래 세 테스트는 그 경로가 살아 있는지를 지킨다.
+
+def axis_rejected(document_id: str, label: str, disclosed: list[str],
+                  rejected: list[str], *, direct: bool = False) -> ElementMatch:
+    """1차 판정은 개시였는데 의미검증이 축 결손으로 뺀 셀.
+
+    entailment는 기각할 때 check.disclosed를 False로 덮어쓰고 판단만 semantic_status에
+    남긴다. 그 상태를 그대로 만든다.
+    """
+    match = cell(document_id, label, "차이", direct=direct, missing=list(rejected))
+    match.limitation_checks = [
+        LimitationCheck(index=index, limitation=text, kind="qualifier", disclosed=True,
+                        quote=match.quote, chunk_id=match.chunk_id, verify="verified",
+                        semantic_status="accepted")
+        for index, text in enumerate(disclosed)
+    ] + [
+        LimitationCheck(index=len(disclosed) + index, limitation=text, kind="core",
+                        disclosed=False, quote=match.quote, chunk_id=match.chunk_id,
+                        verify="verified", semantic_status="rejected",
+                        semantic_note="대상 축 결손")
+        for index, text in enumerate(rejected)
+    ]
+    return match
+
+
+def blank(document_id: str, label: str, *, core: list[str], qualifier: list[str]) -> ElementMatch:
+    """같은 분해 결과로 판정됐지만 아무것도 개시하지 못한 셀. 한정 문언과 kind가 맞물려야
+    다른 문헌의 셀과 실제로 비교된다."""
+    match = cell(document_id, label, "차이", missing=[*core, *qualifier])
+    match.limitation_checks = [
+        LimitationCheck(index=index, limitation=text, kind=kind, disclosed=False, verify="empty")
+        for index, (text, kind) in enumerate(
+            [(text, "core") for text in core] + [(text, "qualifier") for text in qualifier])
+    ]
+    return match
+
+
+def test_a_document_rejected_only_on_a_missing_axis_is_still_adopted():
+    """실측(neareye-waveguide). 이 문헌이 빠지면 청구항 전체가 "거절 이유 구성 곤란"이 된다.
+
+    구성 (B)의 뉴럴 네트워크 학습을 인용발명 3이 원문으로 개시했고 1차 판정은 '실질적 동일
+    2/2'였다. 의미검증이 "학습 대상이 도파관 광학 시스템임은 이 문헌에 없다"고 그 한정을
+    뺐고, 도파관은 같은 조합의 다른 문헌이 개시하고 있었다. 종전 게이트는 공백 구성에
+    has_correspondence(합친 결과)를 요구했는데, 공백이라는 말은 양쪽 라벨이 이미 낮다는
+    뜻이라 무엇을 합쳐도 참이 될 수 없었다 — 공백을 메울 후보에게 공백이 이미 메워져
+    있기를 요구하는 순환이다.
+    """
+    # 두 셀은 **같은 분해 결과**로 판정되므로 한정 문언이 서로 같다. 주 인용발명은 그 둘을
+    # 모두 놓쳤고, 보완 후보는 하나를 개시하고 하나는 축 결손으로 기각됐다.
+    matches = ([disclosing("1", "A", "실질적 동일", ["구성 A를 개시함"]),
+                disclosing("1", "B", "차이", [],
+                           missing=["뉴럴 네트워크를 학습함", "도파관 광학계를 모델링함"]),
+                cell("1", "C", "동일")]
+               + [cell("2", "A", "대응 없음"),
+                  axis_rejected("2", "B", ["뉴럴 네트워크를 학습함"], ["도파관 광학계를 모델링함"]),
+                  cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+    assert chain.primary == "1"
+    assert chain.secondaries == ["2"]
+
+
+def test_an_axis_rejected_element_is_reserved_not_declared_absent():
+    """원문 근거가 있는 구성을 "어느 인용발명에서도 확인되지 않았다"고 적을 수는 없다.
+
+    도구가 확인하지 못한 것과 문헌에 없는 것은 다른 사실이고, 읽는 사람이 취할 다음 행동도
+    다르다. 앞은 결합 위에서 다시 묻는 일이고 뒤는 추가 검색이다.
+
+    실측과 같은 모양으로 세운다 — 기각된 한정이 core라서, 결합이 qualifier를 채워도 그
+    구성은 여전히 대응이 서지 않는다. 그 상태에서도 공백이 아니라 유보여야 한다.
+    """
+    matches = ([disclosing("1", "A", "실질적 동일", ["구성 A를 개시함"]),
+                blank("1", "B", core=["도파관 광학계를 모델링함"],
+                      qualifier=["뉴럴 네트워크를 학습함"]),
+                cell("1", "C", "동일")]
+               + [cell("2", "A", "대응 없음"),
+                  axis_rejected("2", "B", ["뉴럴 네트워크를 학습함"], ["도파관 광학계를 모델링함"]),
+                  cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+    assert "B" in chain.uncovered                      # 대응은 여전히 서지 않는다
+    assert chain.combination_pending == ["B"]          # 그러나 공백으로 단정하지 않는다
+    assert "대상 축 결손" in " ".join(chain.combination_pending_reasons["B"])
+    # 유보는 결론을 막지 않는다. 막으면 유보가 곧 미개시와 같은 값이 된다.
+    assert chain.track == "inventive_step_combination"
+    assert "유보" in chain.rationale
+
+
+def test_the_combination_grade_rises_with_the_facts_but_stops_below_identity():
+    """결합으로 한정을 채우면 등급도 따라 움직이되 동일급에는 닿지 않는다.
+
+    등급을 옛 값으로 못 박아 두면 같은 셀 안에서 한정과 등급이 서로 모순하고, 그 모순된
+    등급이 has_correspondence를 거쳐 "이 구성은 어느 인용발명에도 없다"는 사실 진술로
+    나간다. 반대로 끝까지 다시 유도하면 '실질적 동일'이 되는데, 그것은 단일 문헌이 그 구성을
+    개시한다는 진술이라 결합 결과에 붙일 수 있는 말이 아니다.
+    """
+    gap = "도파관 광학계를 통해 출력함"
+    matches = ([disclosing("1", "A", "차이", [], missing=[gap]),
+                cell("1", "B", "동일"), cell("1", "C", "동일")]
+               + [disclosing("2", "A", "차이", [gap], direct=False),
+                  cell("2", "B", "대응 없음"), cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+    merged = merge_selected(claim(), matrix_for(matches), ["1", "2"])
+    assert merged["A"].combination_resolved.get(gap) == "2"
+    assert merged["A"].judgment == "일부 차이"
+    assert "A" not in chain.uncovered
+
+
+def test_a_wobbling_importance_score_cannot_empty_the_primary_gate():
+    """중요도가 한 칸 달라졌다고 인용발명이 전부 미채택이 되어서는 안 된다.
+
+    중요도는 분해와 함께 LLM이 매 실행 새로 매기는 값이다. 실측에서 같은 청구항의 구성 (A)가
+    한 실행에서 4, 다음 실행에서 3을 받았다. 3을 받은 실행에서는 핵심 구성이 (B),(C)만 남았고
+    둘 다 어느 문헌에서도 직접 개시되지 않아 주 인용발명 자격 게이트가 통째로 비었다 —
+    (A)를 '실질적 동일·direct·검증됨·누락 0'으로 개시한 문헌을 눈앞에 두고 전 문헌이
+    '미채택'으로 나갔다. 자격 게이트가 답할 질문은 후보 사이의 우열이지 "거절 이유를 세울 수
+    있는가"가 아니다.
+    """
+    target = claim(importances=(3, 4, 5))          # (A)만 잘 개시되는데 (A)가 핵심에서 빠졌다
+    matches = ([cell("1", "A", "실질적 동일"), cell("1", "B", "차이"), cell("1", "C", "차이")]
+               + [cell("2", "A", "차이"), cell("2", "B", "차이"), cell("2", "C", "차이")])
+    chain = build(target, matches, all_claims=[target])
+    assert chain.primary == "1"
+    assert chain.track != "rejection_impossible" or chain.primary
+
+
+def test_the_primary_gate_still_refuses_when_nothing_is_disclosed_anywhere():
+    """되돌아갈 곳까지 비면 세우지 않는다. 무관한 문헌에 '주 인용발명'을 찍지 않기 위해서다."""
+    target = claim(importances=(3, 4, 5))
+    matches = [cell(document_id, label, "대응 없음")
+               for document_id in ("1", "2") for label in "ABC"]
+    chain = build(target, matches, all_claims=[target])
+    assert chain.primary is None
+    assert chain.track == "rejection_impossible"
+
+
+def test_a_limitation_accepted_in_combination_stops_being_a_gap():
+    """결합 심사가 인정한 한정은 조합 결과에서 메워진 것으로 센다.
+
+    인정은 채택 조합 전체의 근거 위에서 내린 판단이므로(entailment.validate_combination),
+    문헌 단독 셀의 disclosed는 그대로 두고 결합 결과에서만 해소로 처리한다. 그러지 않으면
+    그 문헌 혼자 그 한정을 개시한 것처럼 감사 데이터에 남는다.
+    """
+    axis = "도파관 광학계를 모델링함"
+    supplement = axis_rejected("2", "B", ["뉴럴 네트워크를 학습함"], [axis])
+    # 결합 심사가 문헌 1을 빠진 축의 출처로 지목한 상태.
+    rejected_check = next(item for item in supplement.limitation_checks if item.limitation == axis)
+    rejected_check.semantic_status = "accepted_in_combination"
+    rejected_check.combination_documents = ["1"]
+
+    matches = ([disclosing("1", "A", "실질적 동일", ["구성 A를 개시함"]),
+                blank("1", "B", core=[axis], qualifier=["뉴럴 네트워크를 학습함"]),
+                cell("1", "C", "동일")]
+               + [cell("2", "A", "대응 없음"), supplement, cell("2", "C", "대응 없음")])
+    chain = build(claim(), matches)
+
+    assert "B" not in chain.uncovered              # 조합 안에 그 한정의 근거가 있다
+    assert chain.combination_pending == []         # 확인이 끝났으므로 유보도 아니다
+    merged = merge_selected(claim(), matrix_for(matches), ["1", "2"])
+    assert merged["B"].combination_resolved.get(axis) == "1"
+    # 문헌 단독 판정은 손대지 않는다.
+    assert rejected_check.disclosed is False

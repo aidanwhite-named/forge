@@ -36,10 +36,9 @@ app = FastAPI(title="Patent Evidence Analyzer", lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5374"], allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
 # 작업이 아직 돌고 있어 결과를 건드리면 안 되는 상태. 후속 작업 엔드포인트가 **같은 집합**을
-# 봐야 합니다. 종전에는 선행기술 검색만 여기에 "cancelled"를 더 넣어 두어서, 종속항 대비를
-# 취소해 보고서가 보존된 뒤에도(그 취소는 히스토리를 일부러 남깁니다) 그 보고서에서는
-# 검색을 다시 누를 수 없었습니다. 종속항 추가는 같은 상태에서 그대로 허용되었으므로,
-# 한 상태를 두 엔드포인트가 반대로 해석하고 있었습니다.
+# 봐야 합니다. 한 엔드포인트만 여기에 "cancelled"를 더 넣어 두면, 취소로 보고서가 보존된
+# 상태(그 취소는 히스토리를 일부러 남깁니다)를 두 엔드포인트가 반대로 해석하게 됩니다 —
+# 한쪽은 후속 작업을 허용하고 다른 쪽은 막습니다.
 _ACTIVE_STATUSES = {"preparing", "running", "cancelling"}
 # 걷어내면 안 되는 상태는 이보다 좁습니다. "preparing"은 후속 작업을 막아야 하는 상태이면서
 # 동시에 **버려진 작업이 영원히 머무는 상태**이기도 합니다(prepare만 하고 탭을 닫은 경우).
@@ -685,8 +684,8 @@ def _persist_analysis(job_id: str, result: AnalysisResult, claims_text: str,
                       created_at: str | None = None, priority_date: str | None = None) -> None:
     """결과·리포트·감사 데이터와 원 입력 메타데이터를 히스토리에 한 벌로 남깁니다.
 
-    최초 분석과 종속항 추가가 **같은 경로**를 씁니다. 종전에는 같은 6개 파일을 두 함수가
-    따로 썼고, 그 사이에서 이미 mkdir 인자가 갈라져 있었습니다.
+    최초 분석과 종속항 추가가 **같은 경로**를 씁니다. 같은 6개 파일을 두 함수가 따로 쓰면
+    한쪽만 고쳐지는 순간 히스토리 형식이 갈라집니다.
     """
     history = HISTORY_DIR / job_id
     history.mkdir(parents=True, exist_ok=True)
@@ -775,7 +774,7 @@ def remove_job_record(job_id: str) -> int:
 
     지워야 할 것이 히스토리 폴더만이 아닙니다.
       - backend/data/history의 레거시 사본: 남겨 두면 _migrate_legacy_storage가 다음 기동에
-        그대로 되살립니다. 사용자가 지웠는데 재시작하면 돌아오는 상태였습니다.
+        그대로 되살려, 사용자가 지운 항목이 재시작과 함께 돌아옵니다.
       - 판정 캐시: 그 안에 문헌 **원문 발췌**가 들어 있습니다. 히스토리만 지우면 사용자가
         지웠다고 생각한 문장이 디스크에 그대로 남습니다.
       - 작업 상태 파일.
