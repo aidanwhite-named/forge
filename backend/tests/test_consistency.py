@@ -22,11 +22,96 @@ def cell(label: str, judgment: str, *, quote: str = "원문 발췌 문장입니�
                         verify=verify if quote else "empty")
 
 
+def chained_claim() -> Claim:
+    """같은 대상을 여러 구성이 되풀이 참조하는 청구항. 실무에서는 이쪽이 기본값이다.
+
+    구성 두 개짜리 청구항으로는 지시 관계 버그가 하나도 드러나지 않는다. 되풀이 참조도,
+    "…로부터" 형태의 참조도, 전제부와 겹치는 용어도 구성이 셋 이상이어야 나타난다.
+    """
+    return Claim(number=1, elements=[
+        ClaimElement(label="P0", importance=1, is_preamble=True,
+                     text="결함 인지형 건축물 외벽 3차원 모델링 시스템에 있어서"),
+        ClaimElement(label="A", importance=2,
+                     text="카메라로 촬영된 건물 외벽 영상 데이터를 수집하는 데이터수집부"),
+        ClaimElement(label="B", importance=5,
+                     text="상기 데이터수집부에 수집된 건물 외벽 영상 데이터로부터 균열 특징을 "
+                          "산출하는 결함탐지부"),
+        ClaimElement(label="C", importance=4,
+                     text="상기 데이터수집부에 수집된 건물 외벽 영상 데이터와 상기 결함탐지부로부터 "
+                          "생성된 균열정보를 근거로 3차원 모델을 생성하는 3차원모델생성부"),
+        ClaimElement(label="D", importance=4,
+                     text="상기 데이터수집부에 수집된 건물 외벽 영상 데이터에서 수평 구조물을 "
+                          "검출하는 수평구조물검출부"),
+        ClaimElement(label="E", importance=5,
+                     text="상기 3차원 모델의 결함 인스턴스에 층 인덱스를 할당하는 층인덱스할당부"),
+    ])
+
+
 def test_anaphora_ignores_spacing_between_claim_and_specification():
     """같은 용어를 띄어쓰기만 달리 적는 일이 흔하다("제1반사부재" ↔ "제1 반사부재")."""
     assert anaphora("상기 제1 반사부재 및 상기 제2 반사부재 사이에 배치되는 광원") == [
         "제1반사부재", "제2반사부재"]
     assert antecedents(claim()) == {"B": ["A"]}
+
+
+def test_stacked_particles_do_not_swallow_the_referenced_term():
+    """"…로부터"는 조사가 겹쳐 붙는다. 하나만 끊으면 지시 어구가 "결함탐지부로"가 된다.
+
+    앞 구성의 문언은 "…결함탐지부"라 그 어구는 어디에도 걸리지 않고, 그 구성은 지시 관계가
+    아예 없는 것으로 처리된다. 상한이 걸려야 할 자리에서 조용히 안 걸리는 쪽이라 보고서만
+    보고는 알 수 없다.
+    """
+    assert anaphora("상기 결함탐지부로부터 생성된 균열정보를 입력받고") == ["결함탐지부"]
+    assert anaphora("상기 수평구조물검출부로부터 검출된 수평 구조물을") == ["수평구조물검출부"]
+    assert anaphora("상기 문자인식부로부터 인식된 층수와") == ["문자인식부"]
+
+
+def test_only_the_element_that_introduced_the_term_is_the_antecedent():
+    """뒤 구성이 같은 대상을 되풀이 참조해도 지시 대상은 그것을 도입한 구성 하나다.
+
+    B·C·D가 모두 "상기 데이터수집부에 수집된 …"으로 시작한다. 어구를 담은 앞 구성을 모두
+    이으면 D의 지시 대상이 [A, B, C]가 되고, enforce_antecedents가 min(선행 구성 판정)으로
+    상한을 잡으므로 D와 아무 관계 없는 B의 미대응이 D의 등급을 끌어내린다. 실측에서 한정이
+    2/2 전부 개시된 구성이 그렇게 강등된 채 결론의 '차이가 남는 구성'에 실렸다.
+    """
+    links = antecedents(chained_claim())
+
+    assert links["D"] == ["A"]                  # 데이터수집부를 도입한 구성만
+    assert links["B"] == ["A"]
+    assert links["C"] == ["A", "B"]             # 결함탐지부는 실제로 B가 도입했다
+
+
+def test_the_preamble_is_the_antecedent_only_when_nothing_else_introduced_the_term():
+    """전제부는 발명의 명칭이라 뒤 구성이 쓰는 용어의 부분 문자열을 거의 언제나 품는다.
+
+    "…3차원 모델링 시스템에 있어서"가 "3차원 모델"을 품는다. 전제부를 지시 대상으로 잡으면
+    상한이 사실상 풀린다 — 전제부는 "컴퓨터로 실행되는 …시스템"이라 어느 문헌에서나 완전
+    개시로 나오기 때문이다.
+    """
+    links = antecedents(chained_claim())
+
+    assert links["E"] == ["C"]                  # 그 3차원 모델을 실제로 생성한 구성
+
+
+def test_an_unrelated_earlier_element_never_caps_the_grade():
+    """지시 관계가 없는 구성의 미대응이 등급을 끌어내리면 안 된다.
+
+    이 방향의 오류는 P3 불변식이 잡지 못한다(등급이 유도값보다 **높은** 쪽만 본다). 여기서
+    새면 보고서가 "한정 2/2 개시"와 "차이가 남는 구성"을 동시에 적고도 전부 통과한다.
+    """
+    target = chained_claim()
+    matrix = {"1": {"P0": cell("P0", "실질적 동일"), "A": cell("A", "실질적 동일"),
+                    "B": cell("B", "대응 없음", quote="", direct=False),
+                    "C": cell("C", "일부 유사"), "D": cell("D", "실질적 동일"),
+                    "E": cell("E", "대응 없음", quote="", direct=False)}}
+    for label, match in matrix["1"].items():
+        match.claim_number, match.label = 1, label
+
+    enforce_antecedents(target, matrix)
+
+    assert matrix["1"]["D"].judgment == "실질적 동일"      # D가 참조하는 것은 A뿐이다
+    assert matrix["1"]["D"].antecedent_note == ""
+    assert matrix["1"]["C"].judgment == "일부 유사"        # C는 실제로 B를 참조한다
 
 
 def test_element_referring_to_an_undisclosed_antecedent_is_capped():

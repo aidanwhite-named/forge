@@ -24,9 +24,15 @@ from .models import Claim, ElementMatch
 # 위치 관계를 나타내는 명사(사이·중·간·내·외)는 뒤에 조사가 바로 붙어 공백이 없으므로
 # 따로 끊습니다. 끊지 않으면 "제2 반사부재 사이"가 통째로 지시 대상이 되어, 정작 앞
 # 구성에 있는 "제2반사부재"와 문자열이 어긋납니다.
+#
+# **조사는 겹쳐 붙습니다(`+`).** 하나만 끊으면 "상기 결함탐지부로부터"에서 '로' 뒤가 공백이
+# 아니라 '부터'라 그 자리를 넘기고, 다음 경계인 '부터 '에서 끊어 지시 대상이 "결함탐지부로"가
+# 됩니다. 앞 구성의 문언은 "…결함탐지부"이므로 이 어구는 어디에도 걸리지 않고, 그 구성은
+# **지시 관계가 아예 없는 것**으로 처리됩니다. 실측에서 로부터/으로부터 형태의 참조
+# (결함탐지부·수평구조물검출부·3차원모델생성부·문자인식부)가 이렇게 통째로 유실됐습니다.
 _BOUNDARY = re.compile(
     r"(?:사이|중|간|내부|외부|내|외)(?=[에의를은는]|\s|$)"
-    r"|(?:은|는|이|가|을|를|에|의|와|과|로|으로|및|또는|에서|부터|까지)(?:\s|$)")
+    r"|(?:은|는|이|가|을|를|에|의|와|과|로|으로|및|또는|에서|부터|까지)+(?:\s|$)")
 # 상한의 하한선. 원문 대조를 통과한 발췌가 있으면 **부분 대응**까지는 남깁니다.
 #
 # '차이'까지 내리면 그 구성은 미대응이 되고, 그 문헌은 조합에서 빠져 근거 목록에서도
@@ -87,17 +93,57 @@ def antecedent_terms(claim: Claim) -> dict[str, list[str]]:
 def antecedents(claim: Claim) -> dict[str, list[str]]:
     """구성마다 그것이 "상기 …"로 참조하는 **앞선 구성**의 라벨을 찾습니다.
 
-    앞선 구성에서 처음 등장한 어구만 지시 대상으로 인정합니다. 부모 청구항에서 온 용어는
-    이 청구항의 행렬에 없으므로 자연히 걸리지 않습니다.
+    지시 대상은 그 어구가 **처음 등장한 구성 하나**입니다. 부모 청구항에서 온 용어는 이
+    청구항의 행렬에 없으므로 자연히 걸리지 않습니다.
+
+    **어구를 담은 앞 구성을 모두 잇지 않습니다.** 그렇게 하면 그 어구를 자기도 "상기 …"로
+    참조하고 있을 뿐인 구성까지 지시 대상이 됩니다. 청구항은 같은 대상을 여러 구성이 반복해
+    참조하므로 이것은 예외가 아니라 기본값입니다.
+
+        (A) … 데이터수집부                      ← 여기서 도입
+        (B) 상기 데이터수집부에 수집된 … 결함탐지부   ← A를 참조할 뿐
+        (D) 상기 데이터수집부에 수집된 … 수평구조물검출부
+
+    D의 지시 대상은 A 하나인데 모두 이으면 [A, B, C]가 되고, enforce_antecedents는
+    min(선행 구성 판정)으로 상한을 잡으므로 **D와 아무 관계 없는 B의 미대응이 D의 등급을
+    끌어내립니다.** 실측에서 한정이 2/2 전부 개시된 구성이 "실질적 동일 → 일부 유사"로
+    강등된 채 보고서 결론의 '차이가 남는 구성'에 실렸습니다 — 본문의 집계와 결론이 서로
+    모순하는 상태입니다.
+
+    이 방향의 오류는 P3 불변식이 잡지 못합니다(report._grades_never_exceed_their_own_evidence는
+    등급이 유도값보다 **높은** 쪽만 봅니다). 여기서 틀리면 어디서도 걸리지 않습니다.
     """
-    collapsed = [(element.label, re.sub(r"\s+", "", element.text)) for element in claim.elements]
+    collapsed = [(element.label, re.sub(r"\s+", "", element.text), element.is_preamble)
+                 for element in claim.elements]
     links: dict[str, list[str]] = {}
     for index, element in enumerate(claim.elements):
         for target in anaphora(element.text):
-            for label, text in collapsed[:index]:
-                if target in text and label not in links.setdefault(element.label, []):
-                    links[element.label].append(label)
+            source = _introducer(target, collapsed[:index])
+            if source is None:
+                continue
+            bucket = links.setdefault(element.label, [])
+            if source not in bucket:
+                bucket.append(source)
     return links
+
+
+def _introducer(target: str, preceding: list[tuple[str, str, bool]]) -> str | None:
+    """지시 어구를 처음 도입한 구성. 전제부는 그것밖에 없을 때만 씁니다.
+
+    전제부는 발명의 명칭을 그대로 옮겨 적으므로 뒤 구성이 쓰는 용어의 **부분 문자열**을
+    거의 언제나 품습니다. "결함 인지형 건축물 외벽 3차원 모델링 시스템에 있어서"가 "3차원
+    모델"을 품는 식입니다. 그러면 "상기 3차원 모델"의 지시 대상이 그 모델을 실제로 생성하는
+    구성이 아니라 전제부로 잡히고, 전제부는 "컴퓨터로 실행되는 …시스템"이라 어느 문헌에서나
+    완전 개시로 나오므로 상한이 사실상 풀립니다.
+
+    전제부가 한정적 의미를 갖는지는 사건마다 다른 법적 판단이라 이 파이프라인은 전제부를
+    결론 게이트에서도 빼냅니다(chain.blocking_labels). 지시 관계에서도 같은 자리에 둡니다 —
+    실제 구성이 그 어구를 도입했다면 그쪽이 지시 대상입니다.
+    """
+    for label, text, is_preamble in preceding:
+        if target in text and not is_preamble:
+            return label
+    return next((label for label, text, _ in preceding if target in text), None)
 
 
 # --- 교차문헌 일관성 ----------------------------------------------------------
@@ -112,10 +158,8 @@ def cross_document_notes(matches: list[ElementMatch],
 
     의미검증(entailment.validate_entailment)은 **문헌별로 따로 호출**됩니다. 어떤 문헌을
     심사하는 호출은 다른 문헌에 대해 무엇을 인정했는지 볼 수 없으므로, 같은 성격의 기재가
-    한쪽에서는 인정되고 다른 쪽에서는 기각되는 일이 구조적으로 생깁니다. 실측에서 한 문헌의
-    보정 행렬은 개시로 인정되고, 같은 한정에 대해 다른 문헌의 보정 맵은 "그 동작이 없다"는
-    이유로 기각됐습니다. 프롬프트에 "일관되게 판단하라"고 적어도 호출이 갈려 있으면 닿지
-    않습니다.
+    한쪽에서는 인정되고 다른 쪽에서는 기각되는 일이 구조적으로 생깁니다. 프롬프트에
+    "일관되게 판단하라"고 적어도 호출이 갈려 있으면 닿지 않습니다.
 
     **자동으로 되돌리지 않습니다.** 어느 쪽이 옳은지는 원문을 읽어야 정해지고, 코드가 한쪽으로
     맞추면 지금까지 되풀이된 과잉 교정·과소 교정을 한 번 더 하게 됩니다. 갈린 사실과 양쪽
