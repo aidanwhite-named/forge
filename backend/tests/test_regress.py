@@ -304,17 +304,24 @@ def test_repeated_runs_bypass_the_decomposition_cache(monkeypatch, tmp_path):
 
 
 def test_every_run_keeps_its_own_artifacts(monkeypatch, tmp_path):
-    """마지막 회차만 남기면 불안정을 발견하고도 회차별 진단에 판정을 다시 받아야 한다."""
+    """마지막 회차만 남기면 불안정을 발견하고도 회차별 진단에 판정을 다시 받아야 한다.
+
+    핀 실행의 슬롯도 갈라야 한다. 관측 파일만 가르고 산출물을 같은 자리에 쓰면 핀 실행이
+    직전 일반 실행의 result/judgment/report를 덮어써 비교 대상 한쪽이 사라진다.
+    """
     slots_seen: list = []
 
-    def fake_run_case(case, progress=None, save=True, pin=False, slots=("latest",)):
+    def fake_run_case(case, progress=None, save=True, pin=False, slots=None):
         slots_seen.append(slots)
         return _observation("동일") | {"invariants": []}
 
     monkeypatch.setattr(regress, "run_case", fake_run_case)
     regress.run_case_repeatedly({"id": "x", "dir": tmp_path}, 3)
-
     assert slots_seen == [("run-1",), ("run-2",), ("run-3", "latest")]
+
+    slots_seen.clear()
+    regress.run_case_repeatedly({"id": "x", "dir": tmp_path}, 2, pin=True)
+    assert slots_seen == [("run-1-pinned",), ("run-2-pinned", "latest-pinned")]
 
 
 def test_a_decomposition_that_keeps_its_count_but_changes_content_is_unstable():

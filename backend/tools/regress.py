@@ -348,7 +348,7 @@ def load_case(directory: pathlib.Path) -> dict:
 
 
 def run_case(case: dict, progress=None, save: bool = True, pin: bool = False,
-             slots: tuple[str, ...] = ("latest",)) -> dict:
+             slots: tuple[str, ...] | None = None) -> dict:
     """사건 하나를 동결된 문헌으로 다시 판정합니다. PDF 재추출은 하지 않습니다.
 
     **분해는 기본적으로 동결하지 않습니다.** pinned_decomposition을 항상 넘기면 하니스가 도는
@@ -379,7 +379,9 @@ def run_case(case: dict, progress=None, save: bool = True, pin: bool = False,
     # 관측은 셀 판정만 담습니다. 어느 한정이 왜 빠졌는지는 거기 없어서, 등급이 한 칸
     # 달라진 이유를 물으려면 판정을 다시 받아야 했습니다. 전체 산출물을 함께 남겨 두면
     # 진단이 공짜가 됩니다. cases/는 저장소 밖이라 원문 발췌가 새어 나가지 않습니다.
-    _save_artifacts(case, result, summarize_matrix(result), slots)
+    # 슬롯 이름도 실행 종류를 따라갑니다. 관측 파일만 가르고 산출물을 같은 자리에 쓰면,
+    # 핀 실행이 직전 일반 실행의 result/judgment/report를 덮어써 두 벌 중 하나가 사라집니다.
+    _save_artifacts(case, result, summarize_matrix(result), slots or (_kind("latest", pin),))
     return observation
 
 
@@ -424,7 +426,8 @@ def run_case_repeatedly(case: dict, runs: int, progress=None, pin: bool = False)
                     directory.mkdir(parents=True, exist_ok=True)
                 # 회차마다 전체 산출물을 남깁니다. 마지막 회차만 남기면 불안정을 발견하고도
                 # 어느 회차가 어떻게 달랐는지 물으려면 판정을 다시 받아야 합니다.
-                slots = (f"run-{index + 1}",) + (("latest",) if index == runs - 1 else ())
+                slots = (_kind(f"run-{index + 1}", pin),) + (
+                    (_kind("latest", pin),) if index == runs - 1 else ())
                 observations.append(run_case(case, progress, pin=pin, slots=slots))
     finally:
         (cache_module.CACHE_DIR, cache_module.ENTAILMENT_CACHE_DIR,
