@@ -25,7 +25,7 @@ class DecompositionConfirm(BaseModel):
     비워 두면 제안을 그대로 확정한 것으로 봅니다 — 대부분의 실행은 "이대로 확정" 한 번이고,
     그때마다 전체 분해를 되돌려 보내게 하면 화면이 쓸데없이 커집니다.
     """
-    decomposition: dict = {}
+    decomposition: dict = Field(default_factory=dict)
 
 
 class Chunk(BaseModel):

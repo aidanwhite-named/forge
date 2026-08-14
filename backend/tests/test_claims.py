@@ -270,6 +270,8 @@ def test_the_user_may_edit_limitations_kind_importance_and_search_terms():
                        limitations=[{"text": "쓰기 요청을 받음", "kind": "core",
                                      "alternative_group": ""},
                                     {"text": "저장 대상을 큐로 한정함", "kind": "qualifier",
+                                     "alternative_group": "g1"},
+                                    {"text": "저장 대상을 버퍼로 한정함", "kind": "qualifier",
                                      "alternative_group": "g1"}])
     assert validate_confirmed_decomposition(_proposal(), edited) == []
 
@@ -333,3 +335,88 @@ def test_values_that_would_be_silently_truncated_are_rejected():
 
     assert "중요도는 1~5" in " ".join(
         validate_confirmed_decomposition(_proposal(), _proposal(importance=9)))
+
+
+def test_a_non_string_search_term_is_rejected():
+    """숫자·객체는 str()로 바뀌어 통과한다. 검색어는 문헌 청크 순위를 정하므로 엉뚱한 값이
+    들어가면 모델이 읽는 근거가 달라진다."""
+    assert "문자열이어야 합니다" in " ".join(
+        validate_confirmed_decomposition(_proposal(), _proposal(search_terms=["큐", 3])))
+
+
+def test_a_non_boolean_is_sub_is_rejected():
+    """bool("false")는 참이다. 조용히 뒤집히는 값이라 진짜 boolean만 받는다."""
+    assert "is_sub는 true 또는 false" in " ".join(
+        validate_confirmed_decomposition(_proposal(), _proposal(is_sub="false")))
+
+
+def test_duplicates_that_would_be_silently_dropped_are_rejected():
+    """_build_limitations는 같은 문언의 뒤엣것을, _unique_strings는 중복 검색어를 조용히 버린다."""
+    twice = _proposal(limitations=[{"text": "쓰기 요청을 큐에 저장함", "kind": "core",
+                                    "alternative_group": ""},
+                                   {"text": "쓰기 요청을 큐에 저장함", "kind": "qualifier",
+                                    "alternative_group": ""}])
+    assert "같은 문언의 한정이 중복" in " ".join(
+        validate_confirmed_decomposition(_proposal(), twice))
+    assert "검색어가 중복" in " ".join(
+        validate_confirmed_decomposition(_proposal(), _proposal(search_terms=["큐", "큐"])))
+
+
+def test_a_lone_alternative_group_is_rejected():
+    """항목이 하나뿐인 대안군은 _drop_lone_groups가 표시를 지운다.
+
+    사용자가 대안으로 적어 둔 것이 단독 필수 한정으로 바뀌는데 아무 말도 남지 않는다.
+    """
+    lonely = _proposal(limitations=[{"text": "쓰기 요청을 큐에 저장함", "kind": "core",
+                                     "alternative_group": "g1"}])
+    assert "항목이 하나뿐" in " ".join(validate_confirmed_decomposition(_proposal(), lonely))
+
+
+# --- 확정본 정규화 ----------------------------------------------------------------
+# 검증을 통과해도 복원 과정에서 값이 달라진다. 그 상태로 확정본을 그대로 저장하면 "사용자가
+# 확정한 것"과 "분석이 쓴 것"이 조용히 갈린다.
+
+def test_canonical_form_matches_what_the_pipeline_will_actually_use():
+    text = "쓰기 요청을 큐에 저장하는 것"
+    messy = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": text, "importance": 4, "is_sub": False,
+        "search_terms": ["  우선순위   큐 ", "priority queue;"],
+        "limitations": [{"text": "  쓰기 요청을  받음 ;", "kind": "core",
+                         "alternative_group": ""}]}]}}
+
+    canonical, problems = claims_module.canonical_decomposition(f"(A) {text}", messy)
+
+    assert problems == []
+    element = canonical["claims"]["1"][0]
+    assert element["search_terms"] == ["우선순위 큐", "priority queue"]     # 공백·꼬리표 정리
+    # 한정은 이 경로에서 다듬지 않는다. _restore_elements가 Limitation.model_validate만
+    # 거치므로 _build_limitations의 정리가 돌지 않는다 — 사용자가 적은 문언이 그대로 쓰인다.
+    assert element["limitations"][0]["text"] == "  쓰기 요청을  받음 ;"
+    assert canonical["version"] == decomposition_generation()
+
+
+def test_canonicalising_is_idempotent():
+    """정규화 결과를 다시 넣어도 같아야 한다. 아니면 저장본과 분석 입력이 또 갈린다."""
+    text = "쓰기 요청을 큐에 저장하는 것"
+    source = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": text, "importance": 4, "is_sub": False,
+        "search_terms": [" 큐 "],
+        "limitations": [{"text": "저장함;", "kind": "core", "alternative_group": ""}]}]}}
+
+    once, _ = claims_module.canonical_decomposition(f"(A) {text}", source)
+    twice, _ = claims_module.canonical_decomposition(f"(A) {text}", once)
+
+    assert once == twice
+
+
+def test_a_decomposition_that_cannot_be_restored_is_reported():
+    """되씌우지 못하면 분석이 LLM 재분해로 넘어가 사용자가 확인하지 않은 분해로 판정이 돈다."""
+    mismatched = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "전혀 다른 구성 원문", "importance": 4, "is_sub": False,
+        "search_terms": [], "limitations": [{"text": "무엇을 함", "kind": "core",
+                                             "alternative_group": ""}]}]}}
+
+    canonical, problems = claims_module.canonical_decomposition(
+        "(A) 쓰기 요청을 큐에 저장하는 것", mismatched)
+
+    assert canonical == {} and problems and "되씌우지 못했습니다" in problems[0]

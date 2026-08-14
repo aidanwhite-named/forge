@@ -589,7 +589,7 @@ def test_the_confirmed_decomposition_is_what_the_analysis_runs_on(monkeypatch):
 
     confirm_decomposition(job_id, edited)
 
-    assert seen["pinned"] == edited
+    assert seen["pinned"]["claims"] == edited["claims"]
     client.delete(f"/api/history/{job_id}")
 
 
@@ -610,7 +610,7 @@ def test_the_edit_between_proposal_and_confirmation_is_recorded(monkeypatch):
     assert review["edited"] is True
     assert review["edits"][0]["label"] == "A"
     assert review["edits"][0]["after"]["importance"] == 5
-    assert review["confirmed"] == edited
+    assert review["confirmed"]["claims"] == edited["claims"]
     client.delete(f"/api/history/{job_id}")
 
 
@@ -624,7 +624,7 @@ def test_confirming_without_edits_keeps_the_proposal(monkeypatch):
     review = json.loads((main.HISTORY_DIR / job_id / "decomposition_review.json")
                         .read_text(encoding="utf-8"))
     assert review["edited"] is False and review["edits"] == []
-    assert review["confirmed"] == review["proposed"]
+    assert review["confirmed"]["claims"] == review["proposed"]["claims"]
     client.delete(f"/api/history/{job_id}")
 
 
@@ -786,3 +786,61 @@ def test_a_restart_while_waiting_says_the_upload_is_gone():
     assert job["status"] == "interrupted"
     assert "처음부터 다시 시작" in job["error"] and "저장되기 전" in job["error"]
     main.remove_job_record(job_id)
+
+
+def test_the_stored_decomposition_is_the_normalised_one(monkeypatch):
+    """검증을 통과해도 복원 과정에서 값이 달라진다. 저장본과 분석 입력이 갈리면 안 된다."""
+    seen: dict = {}
+
+    def capture(job_id, claims_text, documents, analysis_prompt="", progress=None,
+                decomposition=None, cache_keys=None, priority_date="",
+                pinned_decomposition=None):
+        seen["pinned"] = pinned_decomposition
+        return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
+
+    monkeypatch.setattr(main, "analyze", capture)
+    job_id, _ = start_job(confirm=False)
+    messy = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 4, "is_sub": False,
+        "search_terms": ["  우선순위   큐 "],
+        "limitations": [{"text": " 쓰기 요청을  받음 ;", "kind": "core",
+                         "alternative_group": ""}]}]}}
+
+    response = confirm_decomposition(job_id, messy)
+
+    canonical = response.json()["decomposition"]
+    element = canonical["claims"]["1"][0]
+    assert element["search_terms"] == ["우선순위 큐"]
+    # 한정 문언은 다듬지 않는다. 사용자가 확정한 그대로가 캐시 키와 프롬프트로 간다.
+    assert element["limitations"][0]["text"] == " 쓰기 요청을  받음 ;"
+    # 저장본·분석 입력·응답이 모두 같은 값이어야 한다.
+    assert seen["pinned"] == canonical
+    review = json.loads((main.HISTORY_DIR / job_id / "decomposition_review.json")
+                        .read_text(encoding="utf-8"))
+    assert review["confirmed"] == canonical
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_staged_uploads_live_under_the_managed_directory():
+    """tempfile 기본 위치에 만들면 서버가 죽었을 때 경로가 메모리와 함께 사라져 아무도 그
+    폴더를 찾지 못한다. 폴더 자체는 디스크에 그대로 남는다."""
+    job_id, _ = start_job(confirm=False)
+    work = main.jobs[job_id]["_work"]
+
+    assert work.parent == main.STAGING_DIR and work.exists()
+
+    client.delete(f"/api/jobs/{job_id}")
+    main.remove_job_record(job_id)
+
+
+def test_orphan_staging_folders_are_swept_at_startup():
+    """기동 시점에는 돌고 있는 작업이 없으므로 남은 것은 정의상 전부 고아다."""
+    main.STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    orphan = main.STAGING_DIR / "left-over-from-a-crash"
+    orphan.mkdir()
+    (orphan / "1.pdf").write_bytes(b"%PDF-1.4")
+
+    main._sweep_orphan_staging()
+
+    assert not orphan.exists()
+    assert main.STAGING_DIR.exists()

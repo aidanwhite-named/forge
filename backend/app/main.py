@@ -12,10 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from .config import (DATA_DIR, HISTORY_DIR, JOBS_DIR, JOB_RECORD_TTL_MINUTES, LOG_DIR,
                      LOG_MAX_BYTES, MAX_PDF_SIZE_MB, MAX_TOTAL_UPLOAD_SIZE_MB, AGY_MODEL,
-                     load_runtime_settings, save_runtime_settings)
+                     STAGING_DIR, load_runtime_settings, save_runtime_settings)
 from . import agy, cache, priorart
 from .agy import _build_command, available_models
-from .claims import ancestry, parse_claims, validate_confirmed_decomposition
+from .claims import (ancestry, canonical_decomposition, parse_claims,
+                     validate_confirmed_decomposition)
 from .models import AnalysisResult, DecompositionConfirm, DependentClaimsAdd, Document
 from .pdf import extract_pdf
 from .pipeline import (analyze, extend_with_dependent_claims, propose_decomposition,
@@ -25,6 +26,7 @@ from .report import to_markdown
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    _sweep_orphan_staging()
     recovered = recover_interrupted_jobs()
     if recovered:
         for job_id, record in jobs.items():
@@ -233,6 +235,19 @@ def sweep_job_records() -> None:
             drop_job_state(job_id)
 
 
+def _sweep_orphan_staging() -> None:
+    """기동할 때 남아 있는 업로드 폴더를 전부 걷어냅니다.
+
+    이 시점에는 돌고 있는 작업이 없으므로 staging에 남은 것은 정의상 전부 고아입니다 —
+    서버가 죽으면서 경로가 메모리와 함께 사라져 아무도 지우지 못한 것들입니다. 폴더 자체는
+    프로세스가 끝나도 디스크에 그대로 남으므로, 걷어내지 않으면 재시작마다 쌓입니다.
+    """
+    if not STAGING_DIR.is_dir():
+        return
+    for path in STAGING_DIR.iterdir():
+        shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
+
+
 def _discard_staged_upload(record: dict) -> None:
     """확정 전 단계가 붙들고 있던 임시 업로드를 지웁니다.
 
@@ -282,7 +297,10 @@ async def start_job(job_id: str, claims: str = Form(...),
     if not 1 <= len(pdf_files) <= 7:
         raise HTTPException(400, "PDF는 1~7개만 업로드할 수 있습니다.")
 
-    work = Path(tempfile.mkdtemp(prefix=f"patent-{job_id}-"))
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    # 앱이 아는 자리에 둡니다. tempfile 기본 위치에 만들면 서버가 죽었을 때 경로가
+    # 메모리와 함께 사라져 아무도 그 폴더를 찾지 못합니다(_sweep_orphan_staging).
+    work = Path(tempfile.mkdtemp(prefix=f"{job_id}-", dir=STAGING_DIR))
     documents: list[Document] = []
     total = 0
     started = False
@@ -499,6 +517,11 @@ def confirm_decomposition(job_id: str, payload: DecompositionConfirm):
     if problems:
         raise HTTPException(400, "확정한 분해가 제안과 어긋납니다 — "
                                  + " / ".join(problems[:5]))
+    # 검증을 통과해도 복원 과정에서 값이 달라집니다(공백·중복·대안군·bool 변환). 저장본과
+    # 분석 입력이 갈리지 않도록 **정규화한 하나**를 두 곳에 같이 씁니다.
+    canonical, canonical_problems = canonical_decomposition(record.get("claims", ""), confirmed)
+    if canonical_problems:
+        raise HTTPException(400, " / ".join(canonical_problems))
 
     # 상태 확인과 워커 기동을 한 덩어리로 묶습니다. 확정 요청이 겹치거나 확정과 취소가 겹치면
     # 둘 다 "awaiting_decomposition"을 읽고 각자 워커를 띄울 수 있습니다 — 같은 job에 분석이
@@ -513,18 +536,20 @@ def confirm_decomposition(job_id: str, payload: DecompositionConfirm):
         work = record.get("_work")
         if not documents or work is None:
             raise HTTPException(409, "업로드된 문헌을 찾을 수 없습니다. 처음부터 다시 실행하십시오.")
-        _save_decomposition_review(job_id, proposed, confirmed)
+        _save_decomposition_review(job_id, proposed, canonical)
         set_job_status(job_id, status="running", stage="구성대비 준비 중")
         worker = threading.Thread(
             target=_run_async_analysis,
             args=(job_id, record.get("claims", ""), documents,
                   record.get("_analysis_prompt", ""), Path(work),
-                  record.get("_priority_date", ""), confirmed),
+                  record.get("_priority_date", ""), canonical),
             name=f"forge-{job_id[:8]}", daemon=True,
         )
         record["_worker"] = worker
         worker.start()
-    return {"job_id": job_id, "status": "running"}
+    # 정규화 결과를 함께 돌려줍니다. 화면이 "확정한 것"으로 보여 줄 값은 사용자가 보낸
+    # 원본이 아니라 분석이 실제로 쓰는 이 값이어야 합니다.
+    return {"job_id": job_id, "status": "running", "decomposition": canonical}
 
 
 def _save_decomposition_review(job_id: str, proposed: dict, confirmed: dict) -> None:

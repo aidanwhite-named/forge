@@ -16,7 +16,12 @@ LOG_DIR = Path(os.getenv("FORGE_LOG_DIR") or PROJECT_DIR / "logs")
 # 진행 중인 작업의 상태. 서버가 재시작되어도 프런트가 "작업을 찾을 수 없습니다" 대신
 # 중단 사실을 볼 수 있어야 합니다.
 JOBS_DIR = DATA_DIR / "jobs"
-for directory in (DATA_DIR, JOBS_DIR, HISTORY_DIR, LOG_DIR):
+# 분해 확정을 기다리는 동안 업로드한 PDF가 머무는 자리. tempfile.mkdtemp로 만들면 서버가
+# 죽어도 폴더가 디스크에 그대로 남는데, 경로는 메모리에만 있어서 앱이 다시 찾지 못합니다 —
+# 아무도 지우지 않는 고아 폴더가 재시작마다 쌓입니다. 앱이 아는 자리에 두어야 기동할 때
+# 걷어낼 수 있습니다(main._sweep_orphan_staging).
+STAGING_DIR = DATA_DIR / "staging"
+for directory in (DATA_DIR, JOBS_DIR, STAGING_DIR, HISTORY_DIR, LOG_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 

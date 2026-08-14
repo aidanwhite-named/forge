@@ -450,6 +450,37 @@ def validate_confirmed_decomposition(proposed: dict, confirmed: dict) -> list[st
     return problems
 
 
+def canonical_decomposition(claims_text: str, confirmed: dict) -> tuple[dict, list[str]]:
+    """확정본을 **파이프라인이 실제로 쓰게 될 형태**로 정규화합니다.
+
+    검증을 통과한 입력도 복원 과정에서 값이 달라집니다 — _unique_strings가 검색어를 문자열로
+    바꿔 공백을 접고 중복을 지우며, importance는 1~5로 조이고, is_sub는 bool()을 거칩니다.
+    그 상태로 확정본을 그대로 저장하면 "사용자가 확정한 것"과 "분석이 쓴 것"이 조용히 갈립니다.
+
+    정규화를 여기서 다시 구현하지 않고 **복원 경로를 그대로 태워** 결과를 받습니다. 규칙을
+    베껴 쓰면 한쪽이 바뀔 때 다른 쪽이 따라가지 못하고, 그 어긋남은 다시 조용합니다.
+    되돌려받은 값은 정의상 파이프라인이 쓸 값과 같습니다.
+
+    **한정은 이 경로에서 손대지 않습니다.** _restore_elements는 Limitation.model_validate만
+    거치므로, 분해 응답을 다듬는 _build_limitations(공백 접기·끝의 ;· 제거·같은 문언 제거·
+    혼자뿐인 대안군 풀기)는 여기서 돌지 않습니다. 사용자가 적은 문언이 그대로 쓰이는 것이
+    맞지만, 뒤에 손봐 주는 단계가 없다는 뜻이기도 합니다 — 중복 한정이나 어긋난 대안군은
+    그대로 비교 캐시 키와 프롬프트로 들어갑니다. validate_confirmed_decomposition이 유일한
+    방어선인 이유입니다.
+
+    복원이 실패하면 사유를 돌려줍니다. 이 단계에서 잡지 못하면 분석이 LLM 재분해로 넘어가
+    사용자가 확인하지 않은 분해로 판정이 돕니다.
+    """
+    claims = parse_claims(claims_text)
+    if not claims:
+        return {}, ["청구항을 인식하지 못했습니다."]
+    for claim in claims:
+        if not _restore_elements(claim, confirmed, strict_version=False):
+            return {}, [f"청구항 {claim.number}의 확정 분해를 되씌우지 못했습니다. "
+                        "라벨과 구성 원문이 제안과 같은지 확인하십시오."]
+    return dump_decomposition(claims), []
+
+
 def _element_problems(number: str, original: dict, edited: dict) -> list[str]:
     label = str(original.get("label", ""))
     where = f"청구항 {number} ({label})"
@@ -460,11 +491,23 @@ def _element_problems(number: str, original: dict, edited: dict) -> list[str]:
     importance = edited.get("importance", 3)
     if not isinstance(importance, int) or isinstance(importance, bool) or not 1 <= importance <= 5:
         problems.append(f"{where}: 중요도는 1~5의 정수여야 합니다")
+    # is_sub는 bool()을 거치므로 문자열 "false"가 참이 됩니다. 조용히 뒤집히는 값이라
+    # 진짜 boolean만 받습니다.
+    if not isinstance(edited.get("is_sub", False), bool):
+        problems.append(f"{where}: is_sub는 true 또는 false여야 합니다")
+
     terms = edited.get("search_terms") or []
     if not isinstance(terms, list):
         problems.append(f"{where}: 검색어는 목록이어야 합니다")
-    elif len(terms) > MAX_SEARCH_TERMS:
-        problems.append(f"{where}: 검색어는 {MAX_SEARCH_TERMS}개까지입니다")
+    else:
+        if len(terms) > MAX_SEARCH_TERMS:
+            problems.append(f"{where}: 검색어는 {MAX_SEARCH_TERMS}개까지입니다")
+        # 숫자·객체는 str()로 바뀌어 통과합니다. 검색어는 문헌 청크 순위를 정하므로
+        # (compare._element_terms) 엉뚱한 값이 들어가면 읽는 근거가 달라집니다.
+        if any(not isinstance(term, str) for term in terms):
+            problems.append(f"{where}: 검색어는 문자열이어야 합니다")
+        elif len(_unique_strings(terms)) != len(terms):
+            problems.append(f"{where}: 검색어가 중복되었습니다")
 
     limitations = edited.get("limitations")
     if not isinstance(limitations, list) or not limitations:
@@ -473,14 +516,34 @@ def _element_problems(number: str, original: dict, edited: dict) -> list[str]:
         return problems + [f"{where}: 한정이 최소 하나는 있어야 합니다"]
     if len(limitations) > MAX_LIMITATIONS:
         problems.append(f"{where}: 한정은 {MAX_LIMITATIONS}개까지입니다")
+    texts: list[str] = []
+    groups: dict[str, int] = {}
     for index, limitation in enumerate(limitations):
         if not isinstance(limitation, dict):
             problems.append(f"{where}: 한정 {index}의 형식이 올바르지 않습니다")
             continue
-        if not str(limitation.get("text", "")).strip():
+        text = str(limitation.get("text", "")).strip()
+        if not text:
             problems.append(f"{where}: 한정 {index}의 문언이 비어 있습니다")
+        else:
+            texts.append(text)
         if limitation.get("kind", "core") not in {"core", "qualifier"}:
             problems.append(f"{where}: 한정 {index}의 kind는 core 또는 qualifier여야 합니다")
+        group = limitation.get("alternative_group", "")
+        if not isinstance(group, str):
+            problems.append(f"{where}: 한정 {index}의 대안군은 문자열이어야 합니다")
+        elif group.strip():
+            groups[group.strip()] = groups.get(group.strip(), 0) + 1
+    # 확정 경로에는 _build_limitations가 돌지 않아 중복이 걸러지지 않습니다. 같은 문언이
+    # 둘 남으면 total_limitations가 부풀어 개시율이 실제보다 낮게 집계됩니다.
+    if len(_unique_strings(texts)) != len(texts):
+        problems.append(f"{where}: 같은 문언의 한정이 중복되었습니다")
+    # 항목이 하나뿐인 대안군도 이 경로에서는 그대로 남습니다(_drop_lone_groups 미적용).
+    # 대안이 아닌 것에 대안 표시가 붙으면 그 한정이 미개시일 때 '묶음이 충족되지 않았을
+    # 뿐'으로 읽혀 누락 판정이 흐려집니다. 짝을 채우거나 표시를 빼도록 돌려보냅니다.
+    lonely = sorted(name for name, count in groups.items() if count < 2)
+    if lonely:
+        problems.append(f"{where}: 대안군 {', '.join(lonely)}에 항목이 하나뿐입니다")
     return problems
 
 
