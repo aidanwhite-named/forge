@@ -16,17 +16,37 @@ def pdf_bytes(text: str = "메모리 컨트롤러는 쓰기 요청을 큐에 저
         return doc.tobytes()
 
 
-def start_job(filename: str = "prior.pdf", content_type: str = "application/pdf"):
-    """준비 → 시작 경로로 작업 하나를 만듭니다. 프런트엔드가 쓰는 경로와 같습니다."""
+def join_worker(job_id: str, timeout: float = 5) -> None:
+    worker = main.jobs.get(job_id, {}).get("_worker")
+    if worker is not None:
+        worker.join(timeout=timeout)
+
+
+def confirm_decomposition(job_id: str, decomposition: dict | None = None, join: bool = True):
+    """분해를 확정해 구성대비를 시작합니다. 확정 전에는 한 셀도 판정하지 않습니다."""
+    response = client.post(f"/api/jobs/{job_id}/decomposition/confirm",
+                           json={"decomposition": decomposition or {}})
+    if join:
+        join_worker(job_id)
+    return response
+
+
+def start_job(filename: str = "prior.pdf", content_type: str = "application/pdf",
+              confirm: bool = True):
+    """준비 → 시작 → (분해 확정) 경로로 작업 하나를 만듭니다.
+
+    시작만으로는 구성대비가 돌지 않습니다. 분해 확정이 실제 분석의 방아쇠라, 프런트엔드가
+    쓰는 경로도 두 단계입니다.
+    """
     job_id = client.post("/api/jobs/prepare").json()["job_id"]
     response = client.post(
         f"/api/jobs/{job_id}/start",
         data={"claims": "(A) 쓰기 요청을 큐에 저장하는 것"},
         files={"pdf_files": (filename, pdf_bytes(), content_type)},
     )
-    worker = main.jobs.get(job_id, {}).get("_worker")
-    if worker is not None:
-        worker.join(timeout=5)
+    join_worker(job_id)                                   # 분해 제안
+    if confirm and main.jobs.get(job_id, {}).get("status") == "awaiting_decomposition":
+        response = confirm_decomposition(job_id)
     return job_id, response
 
 
@@ -36,7 +56,8 @@ def post_job():
 
 
 def fake_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                decomposition=None, cache_keys=None, priority_date=""):
+                decomposition=None, cache_keys=None, priority_date="",
+                pinned_decomposition=None):
     if progress:
         progress("구성대비 1/1")
     if decomposition is not None:
@@ -76,7 +97,8 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
     entered = threading.Event()
 
     def slow_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                    decomposition=None, cache_keys=None, priority_date=""):
+                    decomposition=None, cache_keys=None, priority_date="",
+                    pinned_decomposition=None):
         entered.set()
         while not agy.is_cancelled(job_id):
             time.sleep(0.01)
@@ -90,6 +112,8 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
         files={"pdf_files": ("prior.pdf", pdf_bytes(), "application/pdf")},
     )
     assert response.status_code == 202
+    join_worker(job_id)                                   # 분해 제안
+    assert confirm_decomposition(job_id, join=False).status_code == 202
     assert entered.wait(timeout=2)
 
     cancelled = client.delete(f"/api/jobs/{job_id}")
@@ -217,7 +241,8 @@ def test_an_interrupted_job_reports_why_instead_of_404(monkeypatch):
 def test_cell_progress_is_exposed_as_numbers(monkeypatch):
     """진행률을 문자열에만 담으면 화면이 진행 바를 그릴 수 없습니다."""
     def analyze_with_progress(job_id, claims_text, documents, analysis_prompt="", progress=None,
-                              decomposition=None, cache_keys=None, priority_date=""):
+                              decomposition=None, cache_keys=None, priority_date="",
+                              pinned_decomposition=None):
         progress("구성대비 3/8 — 청구항 1 × prior.pdf", 3, 8)
         assert client.get(f"/api/jobs/{job_id}").json()["progress"] == {"done": 3, "total": 8}
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
@@ -431,6 +456,8 @@ def test_a_cancelled_dependent_run_keeps_the_claims_it_already_judged(monkeypatc
         raise agy.AnalysisCancelled("보고서 생성을 취소했습니다.")
 
     monkeypatch.setattr(main, "extend_with_dependent_claims", slow_extend)
+    # 종속항 추가는 이미 확정된 분해 위에서 도는 후속 작업이라 확정 단계를 다시 거치지
+    # 않습니다. 분해 확정은 최초 분석에만 있는 관문입니다.
     response = client.post(f"/api/jobs/{job_id}/dependent-claims",
                            json={"claims": "【청구항 2】\n제1항에 있어서, (A) 우선순위 큐"})
     assert response.status_code == 202
@@ -509,3 +536,128 @@ def test_rejected_upload_marks_the_job_failed():
     job_id, response = start_job("prior.txt", "text/plain")
     assert response.status_code == 400
     assert main.jobs[job_id]["status"] == "failed"
+
+
+# --- 분해 확정 관문 --------------------------------------------------------------
+# 분해는 한정 문언·검색어를 정하고, 그 둘이 비교 캐시 키와 문헌에서 읽어 올 청크를 좌우한다.
+# 확정 전에 구성대비를 시작하면 사람이 고칠 기회를 갖기도 전에 판정이 끝나 있고, 고치는
+# 순간 그 판정은 전부 버려진다.
+
+def test_start_stops_at_the_decomposition_and_judges_nothing(monkeypatch):
+    """확정 전에는 **한 셀도** 판정하지 않는다."""
+    called: list[str] = []
+    monkeypatch.setattr(main, "analyze", lambda *args, **kwargs: called.append("analyze"))
+
+    job_id, response = start_job(confirm=False)
+
+    assert response.status_code == 202
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "awaiting_decomposition"
+    assert called == []
+    main.remove_job_record(job_id)
+
+
+def test_the_proposal_is_returned_next_to_the_original_claim_text():
+    """원문 없이 분해만 보여 주면 확인이 성립하지 않는다 — 모델이 보탠 한정인지 알 수 없다."""
+    job_id, _ = start_job(confirm=False)
+
+    payload = client.get(f"/api/jobs/{job_id}/decomposition").json()
+
+    assert payload["status"] == "awaiting_decomposition"
+    assert payload["claims_text"] == "(A) 쓰기 요청을 큐에 저장하는 것"
+    assert payload["decomposition"]["claims"]["1"][0]["label"] == "A"
+    assert payload["confirmed"] is False
+    main.remove_job_record(job_id)
+
+
+def test_the_confirmed_decomposition_is_what_the_analysis_runs_on(monkeypatch):
+    """확정본은 공유 캐시와 LLM 재분해를 모두 이겨야 한다. 그러지 않으면 확인이 무의미하다."""
+    seen: dict = {}
+
+    def capture(job_id, claims_text, documents, analysis_prompt="", progress=None,
+                decomposition=None, cache_keys=None, priority_date="",
+                pinned_decomposition=None):
+        seen["pinned"] = pinned_decomposition
+        return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
+
+    monkeypatch.setattr(main, "analyze", capture)
+    job_id, _ = start_job(confirm=False)
+    edited = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 5, "is_sub": False,
+        "search_terms": ["우선순위 큐"],
+        "limitations": [{"text": "쓰기 요청을 우선순위 큐에 저장함", "kind": "core",
+                         "alternative_group": ""}]}]}}
+
+    confirm_decomposition(job_id, edited)
+
+    assert seen["pinned"] == edited
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_the_edit_between_proposal_and_confirmation_is_recorded(monkeypatch):
+    """무엇을 고쳤는지가 다음 개선의 자료다. 확정본만 남기면 그 사실이 사라진다."""
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id, _ = start_job(confirm=False)
+    edited = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 5, "is_sub": False,
+        "search_terms": ["우선순위 큐"],
+        "limitations": [{"text": "쓰기 요청을 우선순위 큐에 저장함", "kind": "core",
+                         "alternative_group": ""}]}]}}
+
+    confirm_decomposition(job_id, edited)
+
+    review = json.loads((main.HISTORY_DIR / job_id / "decomposition_review.json")
+                        .read_text(encoding="utf-8"))
+    assert review["edited"] is True
+    assert review["edits"][0]["label"] == "A"
+    assert review["edits"][0]["after"]["importance"] == 5
+    assert review["confirmed"] == edited
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_confirming_without_edits_keeps_the_proposal(monkeypatch):
+    """대부분의 실행은 '이대로 확정' 한 번이다. 그때 전체 분해를 되돌려 보내게 하면 안 된다."""
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id, _ = start_job(confirm=False)
+
+    confirm_decomposition(job_id)
+
+    review = json.loads((main.HISTORY_DIR / job_id / "decomposition_review.json")
+                        .read_text(encoding="utf-8"))
+    assert review["edited"] is False and review["edits"] == []
+    assert review["confirmed"] == review["proposed"]
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_confirming_twice_is_rejected(monkeypatch):
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id, _ = start_job(confirm=False)
+    assert confirm_decomposition(job_id).status_code == 202
+    assert client.post(f"/api/jobs/{job_id}/decomposition/confirm", json={}).status_code == 409
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_cancelling_while_waiting_removes_the_staged_upload():
+    """확정을 기다리다 취소하면 돌고 있는 워커가 없어 아무도 임시 파일을 지우지 않는다."""
+    job_id, _ = start_job(confirm=False)
+    work = main.jobs[job_id]["_work"]
+    assert work.exists()
+
+    client.delete(f"/api/jobs/{job_id}")
+
+    assert not work.exists()
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "cancelled"
+    main.remove_job_record(job_id)
+
+
+def test_a_failed_decomposition_leaves_no_history(monkeypatch):
+    """아직 아무것도 쓰지 않은 단계다. 실패했다고 지울 히스토리가 있으면 안 된다."""
+    def boom(claims_text):
+        raise RuntimeError("청구항을 인식하지 못했습니다.")
+
+    monkeypatch.setattr(main, "propose_decomposition", boom)
+    job_id, _ = start_job(confirm=False)
+
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "failed" and "인식하지" in job["error"]
+    assert not (main.HISTORY_DIR / job_id).exists()
+    main.remove_job_record(job_id)

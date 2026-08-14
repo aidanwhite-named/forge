@@ -16,9 +16,10 @@ from .config import (DATA_DIR, HISTORY_DIR, JOBS_DIR, JOB_RECORD_TTL_MINUTES, LO
 from . import agy, cache, priorart
 from .agy import _build_command, available_models
 from .claims import ancestry, parse_claims
-from .models import AnalysisResult, DependentClaimsAdd, Document
+from .models import AnalysisResult, DecompositionConfirm, DependentClaimsAdd, Document
 from .pdf import extract_pdf
-from .pipeline import analyze, extend_with_dependent_claims, summarize_matrix, uncovered_elements
+from .pipeline import (analyze, extend_with_dependent_claims, propose_decomposition,
+                       summarize_matrix, uncovered_elements)
 from .report import to_markdown
 
 
@@ -39,11 +40,18 @@ jobs: dict[str, dict] = {}
 # 봐야 합니다. 한 엔드포인트만 여기에 "cancelled"를 더 넣어 두면, 취소로 보고서가 보존된
 # 상태(그 취소는 히스토리를 일부러 남깁니다)를 두 엔드포인트가 반대로 해석하게 됩니다 —
 # 한쪽은 후속 작업을 허용하고 다른 쪽은 막습니다.
-_ACTIVE_STATUSES = {"preparing", "running", "cancelling"}
+# decomposing/awaiting_decomposition도 활성입니다. 분해를 받는 중이거나 사용자 확정을
+# 기다리는 작업 위에서 종속항 추가 같은 후속 작업이 시작되면, 아직 확정되지 않은 분해로
+# 판정이 돌아갑니다.
+_ACTIVE_STATUSES = {"preparing", "decomposing", "awaiting_decomposition", "running", "cancelling"}
 # 걷어내면 안 되는 상태는 이보다 좁습니다. "preparing"은 후속 작업을 막아야 하는 상태이면서
 # 동시에 **버려진 작업이 영원히 머무는 상태**이기도 합니다(prepare만 하고 탭을 닫은 경우).
 # 업로드가 실제로 들어오는 중인지는 _staging으로 따로 봅니다.
-_UNSWEEPABLE_STATUSES = {"running", "cancelling"}
+#
+# awaiting_decomposition은 **걷어냅니다.** 사람이 확정하기를 기다리는 상태라 버려지기 쉽고,
+# 그동안 추출한 문헌 본문을 레코드가 붙들고 있습니다. TTL이 지나면 정리하되, 임시 디렉터리도
+# 함께 지워야 하므로 sweep에서 따로 처리합니다.
+_UNSWEEPABLE_STATUSES = {"decomposing", "running", "cancelling"}
 
 def safe_job_id(job_id: str) -> str:
     try: return str(uuid.UUID(job_id))
@@ -198,9 +206,23 @@ def sweep_job_records() -> None:
         except ValueError:
             created = cutoff                  # 형식이 깨진 레코드는 곧바로 정리 대상입니다.
         if created <= cutoff:
+            # 확정을 기다리다 버려진 작업은 업로드 임시 디렉터리를 아직 들고 있습니다.
+            # 레코드만 지우면 디스크에 남아 서버를 켜 둔 만큼 쌓입니다.
+            _discard_staged_upload(record)
             jobs.pop(job_id, None)
             agy.finish_job(job_id)
             drop_job_state(job_id)
+
+
+def _discard_staged_upload(record: dict) -> None:
+    """확정 전 단계가 붙들고 있던 임시 업로드를 지웁니다.
+
+    분해 확정을 기다리는 동안에는 PDF가 히스토리로 옮겨지지 않은 상태입니다(옮기는 것은
+    분석이 실제로 돈 뒤입니다). 그래서 이 단계에서 버려진 작업은 임시 디렉터리를 남깁니다.
+    """
+    work = record.pop("_work", None)
+    if work:
+        shutil.rmtree(work, ignore_errors=True)
 
 @app.get("/api/health")
 def health(): return {"status": "ok", "llm": "agy-cli", "model": AGY_MODEL}
@@ -268,16 +290,20 @@ async def start_job(job_id: str, claims: str = Form(...),
             documents.append(document)
 
         effective_prompt = analysis_prompt.strip() or load_runtime_settings().get("prompt") or ""
-        set_job_status(job_id, status="running", stage="구성대비 준비 중")
+        # 분해 제안까지만 하고 멈춥니다. 구성대비는 사용자가 분해를 확정한 뒤에 시작합니다 —
+        # 분해가 한정 문언·검색어를 정하고 그 둘이 비교 캐시 키와 읽어 올 청크를 좌우하므로,
+        # 확정 전에 판정하면 고치는 순간 그 판정이 전부 버려집니다(pipeline.propose_decomposition).
+        record.update(_work=work, _analysis_prompt=effective_prompt,
+                      _priority_date=priority_date.strip())
+        set_job_status(job_id, status="decomposing", stage="청구항 분해 중")
         worker = threading.Thread(
-            target=_run_async_analysis,
-            args=(job_id, claims, documents, effective_prompt, work, priority_date.strip()),
-            name=f"forge-{job_id[:8]}", daemon=True,
+            target=_run_decomposition, args=(job_id, claims),
+            name=f"forge-split-{job_id[:8]}", daemon=True,
         )
         record["_worker"] = worker
         worker.start()
         started = True
-        return {"job_id": job_id, "status": "running"}
+        return {"job_id": job_id, "status": "decomposing"}
     except agy.AnalysisCancelled:
         set_job_status(job_id, status="cancelled", stage="취소됨")
         write_log(job_id, "job cancelled during upload")
@@ -299,8 +325,42 @@ async def start_job(job_id: str, claims: str = Form(...),
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _run_decomposition(job_id: str, claims: str) -> None:
+    """분해 제안만 받고 사용자 확정을 기다립니다. 구성대비 호출은 여기서 한 번도 없습니다.
+
+    실패해도 히스토리를 지우지 않습니다 — 아직 아무것도 쓰지 않았습니다. 업로드 임시
+    디렉터리는 확정 또는 취소 때까지 살려 둡니다(_discard_staged_upload).
+    """
+    agy.bind_job(job_id)
+    try:
+        agy.raise_if_cancelled(job_id)
+        decomposition, warnings = propose_decomposition(claims)
+        agy.raise_if_cancelled(job_id)
+        record = jobs.get(job_id)
+        if record is None:
+            return
+        record["_proposed"] = decomposition
+        record["_decomposition_warnings"] = warnings
+        set_job_status(job_id, status="awaiting_decomposition",
+                       stage="청구항 분해 확인 대기")
+        write_log(job_id, "decomposition proposed; awaiting confirmation")
+    except agy.AnalysisCancelled:
+        if job_id in jobs:
+            set_job_status(job_id, status="cancelled", stage="취소됨")
+            _discard_staged_upload(jobs[job_id])
+        write_log(job_id, "decomposition cancelled")
+        agy.finish_job(job_id)
+    except Exception as exc:
+        if job_id in jobs:
+            set_job_status(job_id, status="failed", stage="실패", error=str(exc))
+            _discard_staged_upload(jobs[job_id])
+        write_log(job_id, f"decomposition failed: {type(exc).__name__}: {exc}")
+        agy.finish_job(job_id)
+
+
 def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
-                        analysis_prompt: str, work: Path, priority_date: str = "") -> None:
+                        analysis_prompt: str, work: Path, priority_date: str = "",
+                        confirmed_decomposition: dict | None = None) -> None:
     agy.bind_job(job_id)
     try:
         agy.raise_if_cancelled(job_id)
@@ -312,8 +372,11 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
 
         decomposition: dict = {}
         cache_keys: set[str] = set()
+        # 확정본을 고정 분해로 넘깁니다. 공유 캐시와 LLM 재분해를 모두 이겨야, 사용자가
+        # 확인한 그 분해가 실제로 쓰인 분해가 됩니다.
         result = analyze(job_id, claims, documents, analysis_prompt, progress, decomposition,
-                         cache_keys, priority_date)
+                         cache_keys, priority_date,
+                         pinned_decomposition=confirmed_decomposition)
         agy.raise_if_cancelled(job_id)
         _persist_initial_analysis(job_id, result, claims, documents, analysis_prompt, work,
                                   decomposition, cache_keys, priority_date)
@@ -360,6 +423,111 @@ def _persist_initial_analysis(job_id: str, result: AnalysisResult, claims: str,
                       priority_date=priority_date)
 
 
+@app.get("/api/jobs/{job_id}/decomposition")
+def get_decomposition(job_id: str):
+    """확정 대기 중인 분해 제안. 원 청구항을 함께 돌려줍니다.
+
+    나란히 보지 않으면 확인이 성립하지 않습니다 — 한정이 청구항 문언을 옮긴 것인지, 모델이
+    보탠 것인지 판단하려면 원문이 옆에 있어야 합니다.
+    """
+    job_id = safe_job_id(job_id)
+    record = jobs.get(job_id)
+    if record is None:
+        raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    if record["status"] not in {"awaiting_decomposition", "running", "completed"}:
+        raise HTTPException(409, "아직 분해 제안이 준비되지 않았습니다.")
+    review = read_json(HISTORY_DIR / job_id / "decomposition_review.json")
+    proposed = record.get("_proposed") or (review or {}).get("proposed") or {}
+    # 분석이 끝나면 release_job_memory가 청구항 원문을 레코드에서 놓아 줍니다. 그때는
+    # 히스토리에서 되살립니다 — 원문 없이 분해만 보여 주면 확인이 성립하지 않습니다.
+    meta = read_json(HISTORY_DIR / job_id / "meta.json") or {}
+    return {
+        "job_id": job_id,
+        "status": record["status"],
+        "claims_text": record.get("claims") or meta.get("claims", ""),
+        "version": proposed.get("version", ""),
+        "decomposition": proposed,
+        "warnings": record.get("_decomposition_warnings", []),
+        "confirmed": bool((review or {}).get("confirmed_at")),
+    }
+
+
+@app.post("/api/jobs/{job_id}/decomposition/confirm", status_code=202)
+def confirm_decomposition(job_id: str, payload: DecompositionConfirm):
+    """사용자가 확정한 분해로 구성대비를 시작합니다.
+
+    **확정본이 이후 모든 단계의 기준입니다.** pinned_decomposition으로 넘기므로 공유 캐시와
+    LLM 재분해를 모두 이깁니다(claims.assign_importance의 우선순위). 사용자가 문언을 고치면
+    구성대비 캐시 키도 함께 달라지므로(cache.cache_key가 한정 문언·검색어를 키에 넣습니다)
+    옛 판정이 되살아나지 않습니다 — 별도 무효화가 필요 없습니다.
+
+    제안과 확정본의 차이를 함께 남깁니다. 어떤 청구항 문형에서 모델이 무엇을 자주 틀리는지는
+    이 기록에서만 알 수 있고, 그것이 다음 개선의 자료가 됩니다.
+    """
+    job_id = safe_job_id(job_id)
+    record = jobs.get(job_id)
+    if record is None:
+        raise HTTPException(404, "작업을 찾을 수 없습니다.")
+    if record["status"] != "awaiting_decomposition":
+        raise HTTPException(409, "분해 확정을 기다리는 작업이 아닙니다.")
+    proposed = record.get("_proposed") or {}
+    confirmed = payload.decomposition or proposed
+    if not confirmed.get("claims"):
+        raise HTTPException(400, "확정할 분해가 비어 있습니다.")
+
+    documents = record.get("documents") or []
+    work = record.get("_work")
+    if not documents or work is None:
+        raise HTTPException(409, "업로드된 문헌을 찾을 수 없습니다. 처음부터 다시 실행하십시오.")
+
+    _save_decomposition_review(job_id, proposed, confirmed)
+    set_job_status(job_id, status="running", stage="구성대비 준비 중")
+    worker = threading.Thread(
+        target=_run_async_analysis,
+        args=(job_id, record.get("claims", ""), documents,
+              record.get("_analysis_prompt", ""), Path(work),
+              record.get("_priority_date", ""), confirmed),
+        name=f"forge-{job_id[:8]}", daemon=True,
+    )
+    record["_worker"] = worker
+    worker.start()
+    return {"job_id": job_id, "status": "running"}
+
+
+def _save_decomposition_review(job_id: str, proposed: dict, confirmed: dict) -> None:
+    """제안·확정본과 그 차이를 남깁니다. claim_elements.json은 건드리지 않습니다.
+
+    claim_elements.json은 **실제로 사용된 분해**라는 뜻을 계속 지킵니다(회귀 하니스의
+    --adopt가 그것을 읽습니다). 검토 이력은 성격이 다르므로 옆 파일에 둡니다.
+    """
+    history = HISTORY_DIR / job_id
+    history.mkdir(parents=True, exist_ok=True)
+    edits = _decomposition_edits(proposed, confirmed)
+    write_json(history / "decomposition_review.json", {
+        "version": confirmed.get("version", ""),
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "edited": bool(edits),
+        "edits": edits,
+        "proposed": proposed,
+        "confirmed": confirmed,
+    })
+
+
+def _decomposition_edits(proposed: dict, confirmed: dict) -> list[dict]:
+    """제안 → 확정본의 구성 단위 차이. 무엇을 고쳤는지가 향후 평가 자료입니다."""
+    before = (proposed or {}).get("claims") or {}
+    after = (confirmed or {}).get("claims") or {}
+    edits: list[dict] = []
+    for number in sorted(set(before) | set(after)):
+        old = {item.get("label"): item for item in before.get(number) or []}
+        new = {item.get("label"): item for item in after.get(number) or []}
+        for label in sorted(set(old) | set(new)):
+            if old.get(label) != new.get(label):
+                edits.append({"claim": number, "label": label,
+                              "before": old.get(label), "after": new.get(label)})
+    return edits
+
+
 @app.delete("/api/jobs/{job_id}")
 def cancel_running_job(job_id: str):
     job_id = safe_job_id(job_id)
@@ -368,6 +536,10 @@ def cancel_running_job(job_id: str):
         raise HTTPException(404, "작업을 찾을 수 없습니다.")
     if record["status"] in {"completed", "failed", "cancelled"}:
         return {"job_id": job_id, "status": record["status"], "kill_requested": False}
+    # 확정 대기 중에 취소하면 돌고 있는 워커가 없습니다. 그때 업로드 임시 디렉터리를 남기면
+    # 아무도 지우지 않습니다 — 분석이 돌지 않았으니 _run_async_analysis의 정리도 없습니다.
+    if record["status"] == "awaiting_decomposition":
+        _discard_staged_upload(record)
     set_job_status(job_id, status="cancelling", stage="취소 중")
     killed = agy.cancel_job(job_id)
     write_log(job_id, "cancellation requested")

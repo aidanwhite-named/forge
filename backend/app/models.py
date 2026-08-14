@@ -19,6 +19,15 @@ class DependentClaimsAdd(BaseModel):
     claims: str = Field(min_length=1)
 
 
+class DecompositionConfirm(BaseModel):
+    """사용자가 확정한 청구항 분해. claims.dump_decomposition과 같은 형식입니다.
+
+    비워 두면 제안을 그대로 확정한 것으로 봅니다 — 대부분의 실행은 "이대로 확정" 한 번이고,
+    그때마다 전체 분해를 되돌려 보내게 하면 화면이 쓸데없이 커집니다.
+    """
+    decomposition: dict = {}
+
+
 class Chunk(BaseModel):
     """비교·검증의 최소 단위. chunk_id로만 근거 위치를 지목합니다."""
     document_id: str

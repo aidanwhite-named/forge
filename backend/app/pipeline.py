@@ -32,6 +32,32 @@ from .report import (build_claim_report, build_mappings, pipeline_invariants,
 from .verify import verify_matches
 
 
+def propose_decomposition(claims_text: str) -> tuple[dict, list[str]]:
+    """청구항 분해만 받고 멈춥니다. 구성대비는 시작하지 않습니다.
+
+    **이 함수가 따로 있는 이유는 비용이 아니라 순서입니다.** 분해는 한정 문언·core/qualifier
+    배분·검색어를 정하고, 그 셋이 비교 캐시 키와 문헌에서 읽어 올 청크를 좌우합니다
+    (cache.cache_key, compare._element_terms). 분해가 확정되기 전에 구성대비를 시작하면
+    사람이 고칠 기회를 갖기도 전에 그 분해 위에서 판정이 끝나 있고, 고치는 순간 그 판정은
+    전부 버려집니다. 그래서 확정 전에는 **한 셀도 판정하지 않습니다.**
+
+    같은 청구항을 여러 번 분해하면 매번 다른 결과가 나옵니다(실측: 사건 4건 전부에서 한정
+    수·문언·검색어가 회차마다 갈림). 그 흔들림을 표본 합의로 눌러 없애는 대신, 사람이 한 번
+    보고 확정하게 합니다 — 청구항 원문만 읽으면 되는 일이라 인용문헌을 통독하는 것과는
+    부담이 다릅니다.
+
+    돌려주는 dump는 claims.dump_decomposition 형식 그대로라 pinned_decomposition으로 다시
+    넣을 수 있습니다. 확정본을 그 자리에 넣으면 우선순위상 공유 캐시와 LLM을 모두 이깁니다.
+    """
+    claims = parse_claims(claims_text)
+    if not claims:
+        raise RuntimeError("청구항을 인식하지 못했습니다.")
+    decomposition: dict = {}
+    warnings = list(assign_importance(claims, decomposition, claims_text))
+    warnings += input_quality_warnings(claims)
+    return decomposition, warnings
+
+
 def analyze(job_id: str, claims_text: str, documents: list[Document],
             analysis_prompt: str = "", progress=None,
             decomposition: dict | None = None,

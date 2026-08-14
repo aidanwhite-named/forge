@@ -42,6 +42,22 @@ def single_sample(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def stub_decomposition_proposal(monkeypatch):
+    """분해 제안은 이제 **모든 작업의 첫 단계**다. 스텁하지 않으면 전 테스트가 CLI를 부른다.
+
+    분해 자체를 검사하는 테스트는 이 스텁을 자기 것으로 덮어쓴다.
+    """
+    def proposed(claims_text: str):
+        return {"version": "test", "claims": {"1": [{
+            "label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 4,
+            "is_sub": False, "search_terms": ["큐"],
+            "limitations": [{"text": "쓰기 요청을 큐에 저장함", "kind": "core",
+                             "alternative_group": ""}]}]}}, []
+
+    monkeypatch.setattr("app.main.propose_decomposition", proposed)
+
+
+@pytest.fixture(autouse=True)
 def block_the_real_cli(monkeypatch):
     """어떤 테스트도 실제 CLI를 실행하지 않도록 막는다.
 
