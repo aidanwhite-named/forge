@@ -15,7 +15,7 @@ from .config import (DATA_DIR, HISTORY_DIR, JOBS_DIR, JOB_RECORD_TTL_MINUTES, LO
                      load_runtime_settings, save_runtime_settings)
 from . import agy, cache, priorart
 from .agy import _build_command, available_models
-from .claims import ancestry, parse_claims
+from .claims import ancestry, parse_claims, validate_confirmed_decomposition
 from .models import AnalysisResult, DecompositionConfirm, DependentClaimsAdd, Document
 from .pdf import extract_pdf
 from .pipeline import (analyze, extend_with_dependent_claims, propose_decomposition,
@@ -36,6 +36,10 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Patent Evidence Analyzer", lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5374"], allow_methods=["*"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
+# 상태 전이를 원자화합니다. 확정 요청이 겹치거나 확정과 취소가 겹치면 둘 다 같은 상태를
+# 읽고 각자 워커를 띄울 수 있고, 그러면 같은 job에 분석이 두 벌 돌면서 같은 히스토리
+# 디렉터리에 서로의 결과를 덮어씁니다. 전이 자체는 짧으므로 전역 잠금 하나로 충분합니다.
+_TRANSITION_LOCK = threading.Lock()
 # 작업이 아직 돌고 있어 결과를 건드리면 안 되는 상태. 후속 작업 엔드포인트가 **같은 집합**을
 # 봐야 합니다. 한 엔드포인트만 여기에 "cancelled"를 더 넣어 두면, 취소로 보고서가 보존된
 # 상태(그 취소는 히스토리를 일부러 남깁니다)를 두 엔드포인트가 반대로 해석하게 됩니다 —
@@ -152,11 +156,24 @@ def record_progress(job_id: str, stage: str, done: int | None, total: int | None
 def drop_job_state(job_id: str) -> None:
     (JOBS_DIR / f"{job_id}.json").unlink(missing_ok=True)
 
+# 확정 전 단계에서 재시작되면 복구할 것이 없습니다. 업로드한 PDF는 임시 디렉터리에만
+# 있었고(히스토리로 옮기는 것은 분석이 돈 뒤입니다) 프로세스와 함께 사라졌으며, 판정은
+# 한 셀도 없어 캐시에서 되살릴 것도 없습니다. 복구를 흉내 내는 대신 재업로드가 필요하다고
+# 분명히 적습니다 — 캐시 재사용을 약속하는 일반 문구를 그대로 쓰면 사용자는 이어서 돌 수
+# 있다고 읽고 같은 화면에서 기다립니다.
+_RESTART_NEEDS_REUPLOAD = (
+    "청구항 분해를 확인하는 중에 서버가 재시작되었습니다. 업로드한 PDF는 아직 저장되기 전이라 "
+    "남아 있지 않습니다. 같은 청구항과 문헌으로 처음부터 다시 시작하십시오.")
+_RESTART_RESUMES_FROM_CACHE = (
+    "분석 도중 서버가 재시작되어 중단되었습니다. 같은 청구항과 문헌으로 다시 실행하면 이미 끝난 "
+    "판정은 캐시에서 재사용됩니다.")
+
+
 def recover_interrupted_jobs() -> int:
     """서버가 내려갈 때 돌고 있던 작업을 '중단됨'으로 표시해 되살립니다.
 
-    다시 실행하라고 안내할 수 있어야 합니다. 이미 끝난 (청구항 × 문헌) 판정은 캐시에
-    남아 있으므로, 같은 입력으로 다시 돌리면 남은 셀만 새로 대비합니다.
+    다시 실행하라고 안내할 수 있어야 합니다. 어디까지 되살아나는지는 어느 단계에서 끊겼는지에
+    달려 있으므로 사유를 갈라 적습니다.
     """
     recovered = 0
     for path in sorted(JOBS_DIR.glob("*.json")):
@@ -165,10 +182,12 @@ def recover_interrupted_jobs() -> int:
             path.unlink(missing_ok=True)
             continue
         if record.get("status") in _ACTIVE_STATUSES:
+            before_confirmation = record.get("status") in {"preparing", "decomposing",
+                                                           "awaiting_decomposition"}
             record.update(
                 status="interrupted", stage="중단됨",
-                error="분석 도중 서버가 재시작되어 중단되었습니다. 같은 청구항과 문헌으로 다시 "
-                      "실행하면 이미 끝난 판정은 캐시에서 재사용됩니다.",
+                error=(_RESTART_NEEDS_REUPLOAD if before_confirmation
+                       else _RESTART_RESUMES_FROM_CACHE),
             )
             recovered += 1
         jobs.setdefault(record["job_id"], dict(record))
@@ -474,23 +493,37 @@ def confirm_decomposition(job_id: str, payload: DecompositionConfirm):
     confirmed = payload.decomposition or proposed
     if not confirmed.get("claims"):
         raise HTTPException(400, "확정할 분해가 비어 있습니다.")
+    # 검증에 걸리면 **확정 대기 상태를 그대로 둡니다.** 고쳐서 다시 보내는 것이 정상 경로이고,
+    # 여기서 상태를 옮기면 사용자는 오타 하나에 업로드부터 다시 해야 합니다.
+    problems = validate_confirmed_decomposition(proposed, confirmed)
+    if problems:
+        raise HTTPException(400, "확정한 분해가 제안과 어긋납니다 — "
+                                 + " / ".join(problems[:5]))
 
-    documents = record.get("documents") or []
-    work = record.get("_work")
-    if not documents or work is None:
-        raise HTTPException(409, "업로드된 문헌을 찾을 수 없습니다. 처음부터 다시 실행하십시오.")
-
-    _save_decomposition_review(job_id, proposed, confirmed)
-    set_job_status(job_id, status="running", stage="구성대비 준비 중")
-    worker = threading.Thread(
-        target=_run_async_analysis,
-        args=(job_id, record.get("claims", ""), documents,
-              record.get("_analysis_prompt", ""), Path(work),
-              record.get("_priority_date", ""), confirmed),
-        name=f"forge-{job_id[:8]}", daemon=True,
-    )
-    record["_worker"] = worker
-    worker.start()
+    # 상태 확인과 워커 기동을 한 덩어리로 묶습니다. 확정 요청이 겹치거나 확정과 취소가 겹치면
+    # 둘 다 "awaiting_decomposition"을 읽고 각자 워커를 띄울 수 있습니다 — 같은 job에 분석이
+    # 두 벌 돌면서 같은 히스토리 디렉터리에 서로의 결과를 덮어씁니다.
+    with _TRANSITION_LOCK:
+        record = jobs.get(job_id)
+        if record is None:
+            raise HTTPException(404, "작업을 찾을 수 없습니다.")
+        if record["status"] != "awaiting_decomposition":
+            raise HTTPException(409, "분해 확정을 기다리는 작업이 아닙니다.")
+        documents = record.get("documents") or []
+        work = record.get("_work")
+        if not documents or work is None:
+            raise HTTPException(409, "업로드된 문헌을 찾을 수 없습니다. 처음부터 다시 실행하십시오.")
+        _save_decomposition_review(job_id, proposed, confirmed)
+        set_job_status(job_id, status="running", stage="구성대비 준비 중")
+        worker = threading.Thread(
+            target=_run_async_analysis,
+            args=(job_id, record.get("claims", ""), documents,
+                  record.get("_analysis_prompt", ""), Path(work),
+                  record.get("_priority_date", ""), confirmed),
+            name=f"forge-{job_id[:8]}", daemon=True,
+        )
+        record["_worker"] = worker
+        worker.start()
     return {"job_id": job_id, "status": "running"}
 
 
@@ -536,11 +569,16 @@ def cancel_running_job(job_id: str):
         raise HTTPException(404, "작업을 찾을 수 없습니다.")
     if record["status"] in {"completed", "failed", "cancelled"}:
         return {"job_id": job_id, "status": record["status"], "kill_requested": False}
-    # 확정 대기 중에 취소하면 돌고 있는 워커가 없습니다. 그때 업로드 임시 디렉터리를 남기면
-    # 아무도 지우지 않습니다 — 분석이 돌지 않았으니 _run_async_analysis의 정리도 없습니다.
-    if record["status"] == "awaiting_decomposition":
-        _discard_staged_upload(record)
-    set_job_status(job_id, status="cancelling", stage="취소 중")
+    # 확정과 같은 잠금을 씁니다. 취소가 상태를 옮기는 사이에 확정이 끼어들면 취소된 작업 위에서
+    # 분석 워커가 뜹니다.
+    with _TRANSITION_LOCK:
+        if record["status"] in {"completed", "failed", "cancelled"}:
+            return {"job_id": job_id, "status": record["status"], "kill_requested": False}
+        # 확정 대기 중에 취소하면 돌고 있는 워커가 없습니다. 그때 업로드 임시 디렉터리를 남기면
+        # 아무도 지우지 않습니다 — 분석이 돌지 않았으니 _run_async_analysis의 정리도 없습니다.
+        if record["status"] == "awaiting_decomposition":
+            _discard_staged_upload(record)
+        set_job_status(job_id, status="cancelling", stage="취소 중")
     killed = agy.cancel_job(job_id)
     write_log(job_id, "cancellation requested")
     worker = record.get("_worker")

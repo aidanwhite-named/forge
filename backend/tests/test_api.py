@@ -661,3 +661,128 @@ def test_a_failed_decomposition_leaves_no_history(monkeypatch):
     assert job["status"] == "failed" and "인식하지" in job["error"]
     assert not (main.HISTORY_DIR / job_id).exists()
     main.remove_job_record(job_id)
+
+
+def test_a_rejected_confirmation_keeps_the_job_waiting(monkeypatch):
+    """검증에 걸렸다고 상태를 옮기면 오타 하나에 업로드부터 다시 해야 한다."""
+    called: list[str] = []
+    monkeypatch.setattr(main, "analyze", lambda *args, **kwargs: called.append("analyze"))
+    job_id, _ = start_job(confirm=False)
+    broken = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "사용자가 바꿔 버린 구성 원문", "importance": 4, "is_sub": False,
+        "search_terms": [], "limitations": [{"text": "무엇을 함", "kind": "core",
+                                             "alternative_group": ""}]}]}}
+
+    response = client.post(f"/api/jobs/{job_id}/decomposition/confirm",
+                           json={"decomposition": broken})
+
+    assert response.status_code == 400
+    assert "구성 원문은 고칠 수 없습니다" in response.json()["detail"]
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "awaiting_decomposition"
+    assert called == []
+    # 고쳐서 다시 보내면 그대로 진행된다.
+    assert confirm_decomposition(job_id).status_code == 202
+    main.remove_job_record(job_id)
+
+
+def test_what_lands_in_claim_elements_is_exactly_what_was_confirmed(monkeypatch):
+    """확정본이 실제로 쓰였는지는 claim_elements.json으로만 확인할 수 있다.
+
+    _restore_elements가 조용히 실패하면 파이프라인은 LLM 재분해로 넘어가고, 저장되는 분해는
+    사용자가 확인한 것이 아니게 된다. 이 테스트는 실제 assign_importance를 태워 그 경로를
+    검사한다 — block_the_real_cli가 켜져 있으므로 재분해로 넘어가면 곧바로 실패한다.
+    """
+    from app.claims import assign_importance, parse_claims
+
+    def analyze_with_the_real_decomposition(
+            job_id, claims_text, documents, analysis_prompt="", progress=None,
+            decomposition=None, cache_keys=None, priority_date="", pinned_decomposition=None):
+        parsed = parse_claims(claims_text)
+        assign_importance(parsed, decomposition, claims_text,
+                          pinned_decomposition=pinned_decomposition)
+        return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
+
+    monkeypatch.setattr(main, "analyze", analyze_with_the_real_decomposition)
+    job_id, _ = start_job(confirm=False)
+    edited = {"version": "test", "claims": {"1": [{
+        "label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 5, "is_sub": False,
+        "search_terms": ["우선순위 큐", "priority queue"],
+        "limitations": [{"text": "쓰기 요청을 받음", "kind": "core", "alternative_group": ""},
+                        {"text": "저장 대상을 우선순위 큐로 한정함", "kind": "qualifier",
+                         "alternative_group": ""}]}]}}
+
+    confirm_decomposition(job_id, edited)
+
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "completed"
+    saved = json.loads((main.HISTORY_DIR / job_id / "claim_elements.json")
+                       .read_text(encoding="utf-8"))
+    assert saved["claims"] == edited["claims"]
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_only_one_worker_starts_when_confirmations_race(monkeypatch):
+    """두 확정이 겹치면 둘 다 awaiting을 읽고 각자 워커를 띄울 수 있다.
+
+    그러면 같은 job에 분석이 두 벌 돌면서 같은 히스토리 디렉터리에 서로의 결과를 덮어쓴다.
+    """
+    started = threading.Semaphore(0)
+    running = threading.Event()
+
+    def slow_analyze(job_id, claims_text, documents, analysis_prompt="", progress=None,
+                     decomposition=None, cache_keys=None, priority_date="",
+                     pinned_decomposition=None):
+        started.release()
+        running.wait(timeout=2)
+        return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
+
+    monkeypatch.setattr(main, "analyze", slow_analyze)
+    job_id, _ = start_job(confirm=False)
+
+    results: list[int] = []
+    barrier = threading.Barrier(2)
+
+    def confirm():
+        barrier.wait(timeout=2)
+        results.append(client.post(f"/api/jobs/{job_id}/decomposition/confirm",
+                                   json={}).status_code)
+
+    racers = [threading.Thread(target=confirm) for _ in range(2)]
+    for racer in racers:
+        racer.start()
+    for racer in racers:
+        racer.join(timeout=5)
+    running.set()
+    join_worker(job_id)
+
+    assert sorted(results) == [202, 409]                 # 하나만 통과한다
+    assert started.acquire(blocking=False) is True       # 워커는 한 번만 돌았다
+    assert started.acquire(blocking=False) is False
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_a_confirmation_that_loses_to_a_cancel_never_starts_a_worker(monkeypatch):
+    """취소가 상태를 옮기는 사이에 확정이 끼어들면 취소된 작업 위에서 워커가 뜬다."""
+    called: list[str] = []
+    monkeypatch.setattr(main, "analyze", lambda *args, **kwargs: called.append("analyze"))
+    job_id, _ = start_job(confirm=False)
+
+    assert client.delete(f"/api/jobs/{job_id}").status_code == 200
+    response = client.post(f"/api/jobs/{job_id}/decomposition/confirm", json={})
+
+    assert response.status_code == 409
+    assert called == []
+    main.remove_job_record(job_id)
+
+
+def test_a_restart_while_waiting_says_the_upload_is_gone():
+    """확정 전 재시작은 복구할 것이 없다. 캐시 재사용을 약속하는 문구를 쓰면 사용자는 이어서
+    돌 수 있다고 읽고 같은 화면에서 기다린다."""
+    job_id, _ = start_job(confirm=False)
+    main.jobs.clear()                                    # 서버 재시작과 같은 상태
+
+    assert main.recover_interrupted_jobs() == 1
+
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "interrupted"
+    assert "처음부터 다시 시작" in job["error"] and "저장되기 전" in job["error"]
+    main.remove_job_record(job_id)

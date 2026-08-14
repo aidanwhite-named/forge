@@ -403,6 +403,87 @@ def _restore_elements(claim: Claim, decomposition: dict | None,
     return True
 
 
+MAX_LIMITATIONS = 12
+MAX_SEARCH_TERMS = 16
+
+
+def validate_confirmed_decomposition(proposed: dict, confirmed: dict) -> list[str]:
+    """사용자가 확정한 분해가 제안과 같은 뼈대인지 확인합니다. 어긋난 사유를 모두 돌려줍니다.
+
+    **_restore_elements가 조용히 실패하는 것을 막는 것이 목적입니다.** 그 함수는 청구항 번호·
+    라벨·구성 원문이 하나라도 어긋나면 False를 돌려주고, 그러면 파이프라인은 확정본을 버리고
+    LLM 재분해로 넘어갑니다. 사용자가 확인한 것과 **다른 분해로 판정이 도는데 아무도 알아채지
+    못합니다** — 확정 단계를 둔 이유 자체가 사라집니다. 조용한 실패를 400으로 바꿉니다.
+
+    바꿀 수 있는 것과 없는 것을 가릅니다. 청구항 번호·라벨·구성 원문은 청구항 파서가 결정론적
+    으로 만든 뼈대라 여기서 고칠 대상이 아닙니다(고쳐야 한다면 청구항 원문을 고쳐 다시 시작할
+    일입니다). 한정 문언·kind·대안군·중요도·검색어가 사용자가 정할 자리입니다.
+
+    상한을 넘긴 것도 거절합니다. _restore_elements는 넘치는 만큼을 조용히 잘라 내는데, 확정
+    단계에서 그러면 사용자가 적어 넣은 한정이 말없이 사라진 채 분석이 돕니다.
+    """
+    problems: list[str] = []
+    before = (proposed or {}).get("claims") or {}
+    after = (confirmed or {}).get("claims") or {}
+    if set(before) != set(after):
+        missing = sorted(set(before) - set(after))
+        extra = sorted(set(after) - set(before))
+        if missing:
+            problems.append(f"청구항 {', '.join(missing)}이(가) 빠졌습니다")
+        if extra:
+            problems.append(f"제안에 없는 청구항 {', '.join(extra)}이(가) 있습니다")
+        return problems
+
+    for number in sorted(before):
+        expected = [item for item in before[number] if isinstance(item, dict)]
+        actual = after[number] if isinstance(after.get(number), list) else []
+        labels = [str(item.get("label", "")) for item in actual if isinstance(item, dict)]
+        if len(labels) != len(set(labels)):
+            problems.append(f"청구항 {number}: 구성 라벨이 중복되었습니다")
+            continue
+        if labels != [str(item.get("label", "")) for item in expected]:
+            problems.append(f"청구항 {number}: 구성 라벨과 순서가 제안과 다릅니다 "
+                            f"(제안 {[str(item.get('label','')) for item in expected]})")
+            continue
+        for original, edited in zip(expected, actual):
+            problems += _element_problems(number, original, edited)
+    return problems
+
+
+def _element_problems(number: str, original: dict, edited: dict) -> list[str]:
+    label = str(original.get("label", ""))
+    where = f"청구항 {number} ({label})"
+    if str(edited.get("text", "")) != str(original.get("text", "")):
+        return [f"{where}: 구성 원문은 고칠 수 없습니다"]
+
+    problems: list[str] = []
+    importance = edited.get("importance", 3)
+    if not isinstance(importance, int) or isinstance(importance, bool) or not 1 <= importance <= 5:
+        problems.append(f"{where}: 중요도는 1~5의 정수여야 합니다")
+    terms = edited.get("search_terms") or []
+    if not isinstance(terms, list):
+        problems.append(f"{where}: 검색어는 목록이어야 합니다")
+    elif len(terms) > MAX_SEARCH_TERMS:
+        problems.append(f"{where}: 검색어는 {MAX_SEARCH_TERMS}개까지입니다")
+
+    limitations = edited.get("limitations")
+    if not isinstance(limitations, list) or not limitations:
+        # 한정이 없으면 그 구성은 원문 한 줄을 통째로 점검하게 되어(whole_element), 사용자가
+        # 확정한 것이 무엇인지 알 수 없는 상태로 판정이 돕니다.
+        return problems + [f"{where}: 한정이 최소 하나는 있어야 합니다"]
+    if len(limitations) > MAX_LIMITATIONS:
+        problems.append(f"{where}: 한정은 {MAX_LIMITATIONS}개까지입니다")
+    for index, limitation in enumerate(limitations):
+        if not isinstance(limitation, dict):
+            problems.append(f"{where}: 한정 {index}의 형식이 올바르지 않습니다")
+            continue
+        if not str(limitation.get("text", "")).strip():
+            problems.append(f"{where}: 한정 {index}의 문언이 비어 있습니다")
+        if limitation.get("kind", "core") not in {"core", "qualifier"}:
+            problems.append(f"{where}: 한정 {index}의 kind는 core 또는 qualifier여야 합니다")
+    return problems
+
+
 def _request_importance(claims: list[Claim]) -> list[str]:
     """구성요소 중요도를 LLM에 1회만 물어봅니다."""
     payload = [

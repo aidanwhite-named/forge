@@ -5,7 +5,8 @@ import pytest
 from app import claims
 from app import claims as claims_module
 from app.claims import (ancestry, assign_importance, decomposition_generation,
-                        input_quality_warnings, parse_claims)
+                        input_quality_warnings, parse_claims,
+                        validate_confirmed_decomposition)
 
 
 def test_multiline_element_stays_one_component_and_keeps_its_label():
@@ -243,3 +244,92 @@ def test_an_explicit_pinned_decomposition_takes_priority_over_the_environment(tm
 
     assert [item.text for item in parsed[0].elements[0].limitations] == ["사건별 분해"]
     assert any("회귀 사건의 고정 분해" in note for note in notes)
+
+
+# --- 확정 분해 검증 --------------------------------------------------------------
+# _restore_elements는 청구항 번호·라벨·구성 원문이 하나라도 어긋나면 조용히 False를 돌려주고,
+# 파이프라인은 확정본을 버린 채 LLM 재분해로 넘어간다. 사용자가 확인한 것과 다른 분해로 판정이
+# 도는데 아무도 알아채지 못한다 — 조용한 실패를 400으로 바꾸는 것이 이 검증의 목적이다.
+
+def _proposal(**overrides) -> dict:
+    element = {"label": "A", "text": "쓰기 요청을 큐에 저장하는 것", "importance": 4,
+               "is_sub": False, "search_terms": ["큐"],
+               "limitations": [{"text": "쓰기 요청을 큐에 저장함", "kind": "core",
+                                "alternative_group": ""}]}
+    element.update(overrides)
+    return {"version": "test", "claims": {"1": [element]}}
+
+
+def test_an_unchanged_confirmation_passes():
+    assert validate_confirmed_decomposition(_proposal(), _proposal()) == []
+
+
+def test_the_user_may_edit_limitations_kind_importance_and_search_terms():
+    """사용자가 정할 자리다. 여기까지 막으면 확정 단계가 '확인' 버튼 하나로 줄어든다."""
+    edited = _proposal(importance=2, search_terms=["우선순위 큐", "priority queue"],
+                       limitations=[{"text": "쓰기 요청을 받음", "kind": "core",
+                                     "alternative_group": ""},
+                                    {"text": "저장 대상을 큐로 한정함", "kind": "qualifier",
+                                     "alternative_group": "g1"}])
+    assert validate_confirmed_decomposition(_proposal(), edited) == []
+
+
+def test_the_element_text_cannot_be_edited():
+    """구성 원문이 어긋나면 _restore_elements가 확정본을 통째로 버린다."""
+    problems = validate_confirmed_decomposition(_proposal(), _proposal(text="다른 문언"))
+    assert problems and "구성 원문은 고칠 수 없습니다" in problems[0]
+
+
+def test_a_missing_or_extra_claim_is_rejected():
+    assert "빠졌습니다" in " ".join(
+        validate_confirmed_decomposition(_proposal(), {"version": "test", "claims": {}}))
+    extra = _proposal()
+    extra["claims"]["2"] = list(extra["claims"]["1"])
+    assert "제안에 없는 청구항" in " ".join(
+        validate_confirmed_decomposition(_proposal(), extra))
+
+
+def test_duplicate_labels_are_rejected():
+    """_restore_elements는 라벨로 dict를 만들어 중복을 조용히 덮어쓴다."""
+    doubled = _proposal()
+    doubled["claims"]["1"] = doubled["claims"]["1"] * 2
+    assert "중복" in " ".join(validate_confirmed_decomposition(_proposal(), doubled))
+
+
+def test_a_reordered_or_missing_label_is_rejected():
+    dropped = {"version": "test", "claims": {"1": []}}
+    assert "라벨과 순서" in " ".join(validate_confirmed_decomposition(_proposal(), dropped))
+
+
+def test_an_element_without_limitations_is_rejected():
+    """한정이 없으면 구성 원문 한 줄을 통째로 점검하게 되어, 확정한 것이 무엇인지 알 수 없다."""
+    assert "한정이 최소 하나는" in " ".join(
+        validate_confirmed_decomposition(_proposal(), _proposal(limitations=[])))
+
+
+def test_an_empty_limitation_text_is_rejected():
+    blank = _proposal(limitations=[{"text": "   ", "kind": "core", "alternative_group": ""}])
+    assert "문언이 비어 있습니다" in " ".join(
+        validate_confirmed_decomposition(_proposal(), blank))
+
+
+def test_an_unknown_kind_is_rejected():
+    """kind가 판정 등급을 가른다. 모르는 값이 들어오면 Limitation 검증에서 늦게 터진다."""
+    wrong = _proposal(limitations=[{"text": "무엇을 함", "kind": "essential",
+                                    "alternative_group": ""}])
+    assert "core 또는 qualifier" in " ".join(
+        validate_confirmed_decomposition(_proposal(), wrong))
+
+
+def test_values_that_would_be_silently_truncated_are_rejected():
+    """_restore_elements는 넘치는 만큼을 말없이 잘라 낸다. 확정 단계에서 그러면 사용자가 적어
+    넣은 한정이 사라진 채 분석이 돈다."""
+    many = _proposal(limitations=[{"text": f"한정 {index}", "kind": "core",
+                                   "alternative_group": ""} for index in range(13)])
+    assert "한정은 12개까지" in " ".join(validate_confirmed_decomposition(_proposal(), many))
+
+    terms = _proposal(search_terms=[f"검색어{index}" for index in range(17)])
+    assert "검색어는 16개까지" in " ".join(validate_confirmed_decomposition(_proposal(), terms))
+
+    assert "중요도는 1~5" in " ".join(
+        validate_confirmed_decomposition(_proposal(), _proposal(importance=9)))
