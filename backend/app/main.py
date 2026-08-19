@@ -259,7 +259,10 @@ def _discard_staged_upload(record: dict) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 @app.get("/api/health")
-def health(): return {"status": "ok", "llm": "agy-cli", "model": AGY_MODEL}
+def health():
+    settings = load_runtime_settings()
+    return {"status": "ok", "llm": "agy-cli", "provider": settings["provider"],
+            "model": settings["model"]}
 
 @app.post("/api/jobs/prepare", status_code=201)
 def prepare_job():
@@ -326,7 +329,12 @@ async def start_job(job_id: str, claims: str = Form(...),
             document.source_file = f"sources/{index}-{filename}"
             documents.append(document)
 
-        effective_prompt = analysis_prompt.strip() or load_runtime_settings().get("prompt") or ""
+        # 한 보고서의 모든 CLI 호출은 같은 설정을 써야 합니다. 호출마다 settings.json을
+        # 다시 읽으면 실행 중 설정 변경 하나로 분해·비교·검증 모델이 섞이고, 어느 모델의
+        # 결과인지 사후에 재구성할 수도 없습니다(agy.runtime_settings).
+        runtime_settings = load_runtime_settings()
+        agy.configure_job(job_id, runtime_settings)
+        effective_prompt = analysis_prompt.strip() or runtime_settings.get("prompt") or ""
         # 분해 제안까지만 하고 멈춥니다. 구성대비는 사용자가 분해를 확정한 뒤에 시작합니다 —
         # 분해가 한정 문언·검색어를 정하고 그 둘이 비교 캐시 키와 읽어 올 청크를 좌우하므로,
         # 확정 전에 판정하면 고치는 순간 그 판정이 전부 버려집니다(pipeline.propose_decomposition).
@@ -689,7 +697,7 @@ def add_dependent_claims(job_id: str, payload: DependentClaimsAdd):
     # 종속항 대비도 초기 분석과 같은 길이의 작업입니다. 요청 스레드에서 끝까지 돌리면
     # 진행률도 보이지 않고 취소도 닿지 않으며, 중간에 멈추면 그때까지의 판정이 통째로
     # 사라집니다. 초기 분석과 같은 워커 + 폴링 구조로 맞춥니다.
-    agy.register_job(job_id)
+    agy.register_job(job_id, _settings_for_history(job_id, analysis_prompt))
     set_job_status(job_id, status="running", stage="종속항 구성대비 준비 중")
     write_log(job_id, f"dependent claims batch started: {incoming_numbers}")
     worker = threading.Thread(
@@ -822,7 +830,7 @@ def search_prior_art(job_id: str):
         if token in _prior_art_running:
             raise HTTPException(409, "이미 선행기술을 검색하고 있습니다.")
         _prior_art_running.add(token)
-    agy.register_job(token)
+    agy.register_job(token, _settings_for_history(job_id))
     # run_cli는 띄운 CLI 프로세스를 current_job()에 달아 둡니다. 이 스레드를 묶어 두지
     # 않으면 프로세스가 어디에도 등록되지 않아, 취소를 눌러도 죽일 대상을 찾지 못하고
     # 검색이 타임아웃까지 계속 돕니다.
@@ -936,6 +944,7 @@ def _persist_analysis(job_id: str, result: AnalysisResult, claims_text: str,
     write_json(history / "documents.json", [document.model_dump() for document in documents])
     meta = read_json(history / "meta.json")
     meta = meta if isinstance(meta, dict) else {}
+    runtime_settings = agy.runtime_settings()
     meta.update(
         job_id=job_id,
         # 종속항을 덧붙여도 최초 분석 시각을 유지합니다. 히스토리 정렬 기준입니다.
@@ -952,8 +961,26 @@ def _persist_analysis(job_id: str, result: AnalysisResult, claims_text: str,
         priority_date=(priority_date if priority_date is not None
                        else meta.get("priority_date", "")) or meta.get("priority_date", ""),
         documents=[document.filename for document in documents],
+        # 회귀 실행에서 결과를 모델별로 묶을 수 있어야 합니다. 이 값은 저장 순간의 전역
+        # 설정이 아니라, 작업 시작 때 고정돼 실제 모든 CLI 호출에 쓰인 스냅샷입니다.
+        provider=runtime_settings.get("provider", ""),
+        model=runtime_settings.get("model", ""),
     )
     write_json(history / "meta.json", meta)
+
+
+def _settings_for_history(job_id: str, prompt: str = "") -> dict:
+    """Reuse a report's model for follow-up work; legacy reports fall back to current settings."""
+    settings = load_runtime_settings()
+    meta = read_json(HISTORY_DIR / job_id / "meta.json")
+    if isinstance(meta, dict):
+        if meta.get("provider"):
+            settings["provider"] = meta["provider"]
+        if meta.get("model"):
+            settings["model"] = meta["model"]
+    if prompt:
+        settings["prompt"] = prompt
+    return settings
 
 @app.get("/api/jobs/{job_id}/download")
 def download(job_id: str, format: str = "md"):

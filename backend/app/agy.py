@@ -30,6 +30,7 @@ class AnalysisCancelled(RuntimeError):
 _job_local = threading.local()
 _job_lock = threading.RLock()
 _cancel_events: dict[str, threading.Event] = {}
+_job_settings: dict[str, dict] = {}
 # 작업 하나가 여러 CLI를 **동시에** 띄웁니다(구성대비 셀 병렬 처리). 프로세스를 하나만
 # 붙들고 있으면 나중에 뜬 것이 앞의 것을 덮어써서, 취소했을 때 살아남은 프로세스가
 # 계속 돌고 사용자는 멈춘 줄 압니다. 작업당 전부 들고 있다가 함께 정리합니다.
@@ -41,10 +42,36 @@ _active_processes: dict[str, set[subprocess.Popen]] = {}
 _cli_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLI)
 
 
-def register_job(job_id: str) -> None:
+def register_job(job_id: str, settings: dict | None = None) -> None:
     """Create the cancellation token before upload/analysis work starts."""
     with _job_lock:
         _cancel_events[job_id] = threading.Event()
+        if settings is not None:
+            _job_settings[job_id] = dict(settings)
+
+
+def configure_job(job_id: str, settings: dict) -> None:
+    """Freeze one provider/model snapshot for every CLI call in a job.
+
+    A report is assembled from many concurrent calls. Reading the mutable settings file for each
+    call can mix models inside one report when settings change midway, and makes its provenance
+    impossible to reconstruct later.
+    """
+    with _job_lock:
+        if job_id not in _cancel_events:
+            raise KeyError(f"등록되지 않은 작업입니다: {job_id}")
+        _job_settings[job_id] = dict(settings)
+
+
+def runtime_settings(job_id: str | None = None) -> dict:
+    """Return the frozen settings for a job, or current settings outside a job."""
+    job_id = job_id or current_job()
+    if job_id:
+        with _job_lock:
+            settings = _job_settings.get(job_id)
+        if settings is not None:
+            return dict(settings)
+    return load_runtime_settings()
 
 
 def bind_job(job_id: str) -> None:
@@ -61,6 +88,7 @@ def finish_job(job_id: str) -> None:
     with _job_lock:
         _active_processes.pop(job_id, None)
         _cancel_events.pop(job_id, None)
+        _job_settings.pop(job_id, None)
     if current_job() == job_id:
         del _job_local.job_id
 
@@ -156,7 +184,7 @@ def run_cli(prompt: str, expect: str = "claims") -> dict:
     expect는 응답 JSON에 반드시 있어야 하는 최상위 키입니다. 파이프라인이 단계마다
     다른 스키마를 요구하므로, 어떤 키를 기다리는지 호출부가 지정합니다.
     """
-    settings = load_runtime_settings()
+    settings = runtime_settings()
     # stdin으로 넘길 수 있으면 명령줄 길이 제한도, 파일을 읽기 위한 도구 권한도 필요 없습니다.
     stdin_prompt = prompt if _accepts_stdin(settings["provider"]) else None
     workspace = None if stdin_prompt is not None else _prompt_workspace(prompt, settings)

@@ -11,10 +11,10 @@ import re
 
 from .chain import chain_documents, merge_selected
 from .consistency import antecedents
-from .coverage import (FULL_JUDGMENTS, JUDGMENT_RANK, best_match, derive_judgment,
-                       evidence_locations, evidenced_limitations, is_reserved, is_unverified_check,
-                       limitation_counts, report_grade, residual_difference, unverified_count,
-                       unverified_limitations)
+from .coverage import (FULL_JUDGMENTS, JUDGMENT_RANK, all_requirements_evidenced, best_match,
+                       derive_judgment, evidence_locations, evidenced_limitations, is_reserved,
+                       is_unverified_check, limitation_counts, report_grade, residual_difference,
+                       unverified_count, unverified_limitations)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
                      DocumentMapping, ElementMatch, Evidence, LimitationCheck, SampleTally,
                      SemanticEvent, TrailStep, VerificationTrail)
@@ -228,7 +228,13 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
     상태인지도 알 수 없게 됩니다.
     """
     if not _corresponded(match) or match is None:
-        line = gap_note or f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
+        partial = bool(evidenced_limitations(match)) if match is not None else False
+        line = gap_note or (
+            f"({label}) 일부 하위 한정에는 원문 근거가 있으나 구성 전체를 충족하는 인용발명은 "
+            "확인되지 않음 — 나머지 한정 추가 검색 필요"
+            if partial else
+            f"({label}) 구성에 대응되는 인용발명이 확인되지 않음 — 추가 검색 필요"
+        )
         return f"{line}\n(가장 가까운 기재: {related} — 청구항 한정 전체를 개시하는 근거는 아님)" if related else line
     passage = _passage(match, mappings, documents)
     if bridge is not None:
@@ -1103,9 +1109,10 @@ def _evidence_is_never_erased(report: ClaimReport,
                               matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
     """P1. "어느 인용발명에서도 확인되지 않았다"는 진짜 공백에만 쓸 수 있습니다.
 
-    업로드된 문헌 중 하나라도 그 구성의 한정을 원문 대조를 통과한 근거로 개시했거나 축
-    결손으로만 기각했다면, 그 구성을 공백으로 적는 것은 **사실과 다른 진술**입니다. 읽는
-    사람은 이미 손에 든 문헌을 다시 찾아 나서게 됩니다.
+    업로드된 문헌 중 하나가 그 구성의 **모든 필수 한정**에 대해 원문 대조를 통과한 근거를
+    냈거나 축 결손으로만 기각했다면, 그 구성을 아무 근거도 없는 공백처럼 적는 것은 사실과
+    어긋납니다. 일부 한정만 근거가 있는 경우에는 구성 전체가 미대응일 수 있으므로, 본문에서
+    부분 근거를 밝히되 이 불변식 위반으로 보지는 않습니다.
 
     파이프라인이 이 진술을 만드는 경로가 여러 개(uncovered·rejection_impossible·미채택)라
     한 곳을 막아도 다른 곳으로 새어 나왔습니다. 그래서 경로가 아니라 **결과**를 봅니다.
@@ -1117,7 +1124,7 @@ def _evidence_is_never_erased(report: ClaimReport,
         if label in excused:
             continue
         holders = sorted(document_id for document_id, matches in matrix.items()
-                         if evidenced_limitations(matches.get(label)))
+                         if all_requirements_evidenced(matches.get(label)))
         if holders:
             notes.append(f"[불변식 P1] 청구항 {report.claim_number} ({label}): 공백으로 적었으나 "
                          f"문헌 {', '.join(holders)}에 원문 대조를 통과한 개시 근거가 있습니다.")

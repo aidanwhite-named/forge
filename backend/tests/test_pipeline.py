@@ -1487,6 +1487,25 @@ def test_p1_treats_an_axis_rejected_document_as_evidence_too():
     assert any("[불변식 P1]" in note for note in notes)
 
 
+def test_p1_allows_a_real_gap_when_only_one_of_several_limitations_has_evidence():
+    """E처럼 일부 한정의 근접 기재만 있어도 구성 전체는 정확히 미대응일 수 있다."""
+    partial = _evidenced("1", "E")
+    partial.limitation_checks.append(LimitationCheck(
+        index=1, limitation="융합 점군에서 가시 영역을 추출함", kind="core",
+        disclosed=False, semantic_status="not_run"))
+    partial.judgment = "차이"
+    chain = ChainInfo(claim_number=1, track="rejection_impossible", primary="1",
+                      uncovered=["E"])
+
+    notes = pipeline_invariants([_report(chain)], {1: _matrix(partial)})
+    narrative = _narrative("E", "가시 영역을 추출함", partial, partial, False, [], {},
+                           related="문헌 1, 문단 1")
+
+    assert not [note for note in notes if "[불변식 P1]" in note]
+    assert "일부 하위 한정에는 원문 근거가 있으나" in narrative
+    assert "구성 전체를 충족" in narrative
+
+
 def test_p3_catches_a_grade_higher_than_its_own_limitation_checks():
     """등급은 한정별 개시에서 유도된 값을 넘을 수 없다.
 

@@ -701,6 +701,32 @@ def evidenced_limitations(match: ElementMatch | None) -> set[str]:
             | unchecked_limitations(match))
 
 
+def all_requirements_evidenced(match: ElementMatch | None) -> bool:
+    """Whether one document produced verified source text for every mandatory requirement.
+
+    This deliberately asks only whether source text survived the quote check, not whether semantic
+    review ultimately accepted it.  It is used by the report invariant that catches a whole element
+    being called a blank even though the document supplied source text for all of its requirements.
+    Partial evidence is not the same contradiction: it should be shown as a nearby disclosure while
+    the element can still correctly remain uncovered.
+    """
+    if match is None or match.error:
+        return False
+    evidence = evidenced_limitations(match)
+    requirements = counted_checks(match.limitation_checks)
+    if not requirements:
+        return False
+    for representative in requirements:
+        if representative.alternative_group:
+            if not any(check.limitation in evidence
+                       for check in match.limitation_checks
+                       if check.alternative_group == representative.alternative_group):
+                return False
+        elif representative.limitation not in evidence:
+            return False
+    return True
+
+
 def unchecked_limitations(match: ElementMatch | None) -> set[str]:
     """의미검증을 받지 못했으나 **원문 대조는 통과한** 한정의 문언.
 

@@ -175,3 +175,35 @@ def test_a_listing_without_tabs_is_used_as_is(monkeypatch):
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "gemini-3.6-flash-medium\n"})())
 
     assert agy._agy_models("agy.exe") == ["gemini-3.6-flash-medium"]
+
+
+def test_every_cli_call_in_a_job_uses_the_frozen_settings(monkeypatch):
+    """설정 화면을 실행 중에 바꿔도 한 보고서 안에서 모델이 섞이지 않는다."""
+    frozen = {"provider": "agy", "model": "model-at-start", "prompt": ""}
+    current = {"provider": "gpt", "model": "model-changed-later", "prompt": ""}
+    captured = []
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return json.dumps({"claims": []}), ""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(agy, "load_runtime_settings", lambda: current)
+    monkeypatch.setattr(agy, "_build_command",
+                        lambda prompt, settings, workspace=None:
+                        captured.append(dict(settings)) or ["fake-cli"])
+    monkeypatch.setattr(agy.subprocess, "Popen", lambda *a, **k: Process())
+
+    agy.register_job("frozen-job", frozen)
+    agy.bind_job("frozen-job")
+    try:
+        agy.run_cli("prompt", expect="claims")
+    finally:
+        agy.finish_job("frozen-job")
+
+    assert captured == [frozen]
+    assert agy.runtime_settings() == current

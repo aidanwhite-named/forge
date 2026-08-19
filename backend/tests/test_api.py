@@ -86,6 +86,34 @@ def test_lifespan_recovers_interrupted_jobs(monkeypatch):
     assert logs == [("job-1", "job marked interrupted after server restart")]
 
 
+def test_health_reports_the_runtime_model_not_the_environment_default(monkeypatch):
+    monkeypatch.setattr(main, "load_runtime_settings",
+                        lambda: {"provider": "claude", "model": "claude-selected", "prompt": ""})
+
+    payload = client.get("/api/health").json()
+
+    assert payload["provider"] == "claude"
+    assert payload["model"] == "claude-selected"
+
+
+def test_history_records_the_frozen_model_used_by_the_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "HISTORY_DIR", tmp_path)
+    frozen = {"provider": "agy", "model": "model-at-start", "prompt": ""}
+    monkeypatch.setattr(main, "load_runtime_settings",
+                        lambda: {"provider": "gpt", "model": "changed-later", "prompt": ""})
+    result = AnalysisResult(job_id="provenance-job", claim_mapping=[], reports=[], validation=[])
+
+    agy.register_job("provenance-job", frozen)
+    agy.bind_job("provenance-job")
+    try:
+        main._persist_analysis("provenance-job", result, "청구항", [], "")
+    finally:
+        agy.finish_job("provenance-job")
+
+    meta = json.loads((tmp_path / "provenance-job" / "meta.json").read_text(encoding="utf-8"))
+    assert (meta["provider"], meta["model"]) == ("agy", "model-at-start")
+
+
 def test_completed_job_is_marked_completed(monkeypatch):
     monkeypatch.setattr(main, "analyze", fake_result)
     job_id, response = start_job()
