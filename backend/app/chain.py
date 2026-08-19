@@ -12,8 +12,10 @@ from .coverage import (
     difference_labels, disclosed_limitations, evidenced_limitations, filled_limitations,
     has_correspondence, ineligible_reason, is_better_match, is_complete,
     is_eligible_supplement, judgment_at_rank, limitation_gain, no_correspondence_labels,
-    pending_labels, residual_difference, rows_for, score_document,
-    supplement_gain, supplement_needed_labels, supplement_reason, well_known_labels,
+    limitation_state_map, pending_labels, reserved_labels, residual_difference, rows_for,
+    score_document,
+    supplement_gain, supplement_needed_labels, supplement_reason, unverified_count,
+    well_known_labels,
 )
 from .models import (Claim, ChainInfo, DocumentScore, ElementCoverage, ElementMatch,
                      NoveltyScreen, SupplementCandidate)
@@ -25,15 +27,9 @@ GAP_PRIORITY = 3.0
 # 보완 문헌을 하나 더 끌어오기 위해 요구하는 최소 이득. 상한에 닿기 전에도 새로 기여하는
 # 것이 없으면 여기서 멈춥니다.
 MIN_SUPPLEMENT_GAIN = 0.05
-# 독립항 거절 이유 하나에 세울 인용발명 수의 상한. 주 인용발명 1 + 보조 인용발명 1입니다.
-# 여기에 주지관용기술을 더할 수 있으므로, 실무에서 성립하는 네 형태
-# (인용발명 1 / 1 + 주지관용 / 2 / 2 + 주지관용)를 그대로 표현합니다.
-#
-# 상한을 두면 세 번째 문헌이 어느 구성의 유일한 검증 근거를 가지고 있을 때 그것이 버려집니다.
-# 그 사실을 감추면 "어느 인용발명에도 대응이 없다"는 거짓 보고가 되므로, 버리는 대신
-# beyond_limit에 그 구성과 문헌을 남깁니다. 상한은 **거절 이유를 몇 건으로 세울지**의 문제이지
-# 문헌에 기재가 있느냐의 문제가 아니므로, 둘을 같은 칸에 적지 않습니다.
-MAX_COMBINED_DOCUMENTS = 2
+# 독립항은 업로드된 문헌 중 실제 증분 기여가 있는 문헌을 모두 채택할 수 있습니다. 고정된 2건
+# 상한은 청구항의 서로 다른 공백을 문헌 2와 3이 각각 메우는 사건에서 한쪽 근거를 버렸습니다.
+# 결합 동기·용이성은 보고서가 별도로 유보하므로, 여기서는 구성 커버리지를 인위적으로 자르지 않습니다.
 # 종속항이 부모항 조합에 **새로 더할 수 있는** 문헌 수. 종속항의 추가 한정은 대개 한 줄이라,
 # 그것 하나를 위해 문헌을 여러 건 더 끌어오면 거절 이유가 실무에서 설득력을 잃습니다.
 MAX_DEPENDENT_ADDITIONS = 1
@@ -152,6 +148,10 @@ def _directly_disclosed(match: ElementMatch | None) -> bool:
     확인됐다는 뜻입니다. 지금은 verify.py가 partial을 반드시 inferred로 강등하므로 아래
     directness 조건에도 걸리지만, 신규성 부정은 청구항을 죽이는 가장 강한 결론이라
     다른 모듈의 불변식에 기대지 않고 이 게이트에서 직접 막습니다.
+
+    의미검증 미완료도 같은 이유로 여기서 직접 막습니다. derive_judgment의 상한이 이미
+    동일급을 못 주게 하지만, 그 상한은 판정을 재산출하는 경로를 탄 셀에만 걸립니다. 이
+    게이트는 그 경로가 돌았는지와 무관하게 성립해야 합니다.
     """
     return bool(
         match
@@ -161,6 +161,7 @@ def _directly_disclosed(match: ElementMatch | None) -> bool:
         and match.judgment in NOVELTY_DIRECT
         and match.directness == "direct"
         and not match.missing_limitations
+        and not unverified_count(match)
     )
 
 
@@ -174,15 +175,18 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
     # 자격 게이트를 통과한 후보 중 단독 적합도 1위를 주 인용발명으로 확정합니다.
     chain.primary = eligible[0]
     chain.track = "inventive_step_combination"
-    chain.combination_limit = MAX_COMBINED_DOCUMENTS
+    chain.combination_limit = 0                # 0 = 독립항에는 인위적인 문헌 수 상한 없음
     merged = dict(matrix[chain.primary])
     # 보완 검토 대상은 미커버 구성보다 넓습니다. '일부 차이'로 커버된 구성도 여기 들어옵니다.
     chain.supplement_needed = supplement_needed_labels(claim, merged)
 
     # 상한 안에서, 새로 기여하는 문헌이 있는 한 결합합니다. 이득이 문턱 아래로 떨어지면
     # 상한에 닿기 전에도 멈춥니다.
-    while len(chain.secondaries) + 1 < min(len(matrix), MAX_COMBINED_DOCUMENTS):
-        targets = supplement_needed_labels(claim, merged)
+    while len(chain.secondaries) + 1 < len(matrix):
+        # 전제부는 보고서에 대비하되 법적 한정 여부를 코드가 정하지 않으므로, 그것만 보강하려고
+        # 보조 인용발명을 늘리지 않습니다. 실측에서는 핵심 구성에 기여하지 않는 논문이 P0 한 줄
+        # 때문에 세 번째 채택 문헌이 되어 보고서만 길어졌습니다.
+        targets = blocking_labels(claim, supplement_needed_labels(claim, merged))
         if not targets:
             break
         candidate = _best_secondary(claim, matrix, merged, targets,
@@ -194,19 +198,12 @@ def _independent_chain(claim: Claim, matrix: Matrix, chain: ChainInfo) -> ChainI
         chain.secondaries.append(candidate)
         merged = _merge(claim, merged, matrix[candidate])
 
-    # 상한에 닿은 것만으로는 부족합니다. 한 자리만 더 있었다면 실제로 채택됐을 유효 후보가
-    # 남아 있을 때만 상한이 조합을 막은 것입니다. 후보가 전부 이미 채택됐거나 이득 문턱을
-    # 넘지 못했다면 상한을 올려도 결과가 같으므로 limit_binding은 거짓이어야 합니다.
-    chain.limit_binding = bool(
-        len(chain.secondaries) + 1 >= MAX_COMBINED_DOCUMENTS
-        and _best_secondary(
-            claim, matrix, merged, supplement_needed_labels(claim, merged),
-            no_correspondence_labels(claim, merged),
-            exclude={chain.primary, *chain.secondaries}, scores=_fitness(chain)))
+    chain.limit_binding = False
 
     chain.uncovered = no_correspondence_labels(claim, merged)
     # 대응은 있으나 하위 한정이나 구현 방식에 차이가 남는 구성입니다.
     chain.residual = difference_labels(claim, merged)
+    chain.reserved = reserved_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
     _apply_gap_policy(claim, chain, matrix, merged)
     return _finalize(claim, chain, merged, matrix)
@@ -237,6 +234,7 @@ def _no_primary_chain(claim: Claim, matrix: Matrix, chain: ChainInfo, cause: str
                  for element in claim.elements}
     chain.uncovered = no_correspondence_labels(claim, reference)
     chain.residual = difference_labels(claim, reference)
+    chain.reserved = reserved_labels(claim, reference)
     chain.combined_similarity = combined_similarity(claim, reference)
     corresponded = [element.label for element in claim.elements
                     if element.label not in chain.uncovered]
@@ -537,8 +535,27 @@ def _supplement_step(candidate: ElementMatch | None, current: ElementMatch | Non
     구성 전체의 우열이 개선되면서 빠진 한정도 메우는 후보가 있을 수 있습니다. 둘을 if/else로
     가르면 우열이 조금 개선됐다는 이유로 더 큰 한정 보완 이득이 가려집니다. 같은 누락 감소를
     두 번 더하지 않도록 두 경로 중 큰 값을 사용합니다.
+
+    **미검증만으로 생긴 우열은 구조적 이득으로 세지 않습니다.** 등급과 누락 수는 둘 다
+    미검증 한정을 개시 쪽에 세고 계산합니다(derive_judgment의 상한, missing_limitations).
+    그래서 한정을 하나도 확인하지 못한 셀이 실제로 한 건을 확인한 셀보다 **더 큰** 보완
+    기여를 받습니다 — 실측 형태로 재현하면 0.60 대 0.30이었습니다. 결합 문헌은
+    고정 결합 상한이 있던 버전에서는 그 셀이 유일한 보조 슬롯을 소비해 실제로 한정을
+    확인한 문헌을 밀어내고 결론까지 바꾸기도 했습니다.
+
+    **"확정 개시가 하나라도 있으면 통과"로는 부족합니다.** 그 문턱은 미검증 넷이 확정 개시
+    하나에 묻어 들어오는 길을 그대로 둡니다 — 1건 확인+4건 미검증인 후보가 0.60을 받고,
+    2건을 실제로 확인한 후보가 0.28에 그칩니다. 그래서 미검증이 하나라도 있으면 구조적
+    이득 자체를 쓰지 않고, 확정한 한정의 기여(limitation_gain)만 인정합니다. 그쪽은
+    disclosed_limitations에서 나오므로 정의상 확인된 것만 셉니다.
+
+    이렇게 해도 실제 기여가 지워지지는 않습니다. 미검증이 섞였다는 이유로 확정 개시까지
+    버리면 결합이 서야 할 사건에서 서지 않는데(entailment._mark_unchecked가 directness를
+    absent로 내려 같은 사고를 낸 적이 있습니다), limitation_gain이 그 몫을 그대로 냅니다.
     """
     structural = supplement_gain(candidate, current) if is_better_match(candidate, current) else 0.0
+    if unverified_count(candidate):
+        structural = 0.0
     return max(0.0, structural, limitation_gain(candidate, current))
 
 
@@ -666,6 +683,10 @@ def _restore_combination_antecedents(
         # 조건 2. 참조하는 대상보다 더 완전하게 복원하지 않습니다.
         limit = min(JUDGMENT_RANK.get(restored[source].judgment, 0) for source in source_labels)
         target = min(JUDGMENT_RANK.get(match.antecedent_capped_from, 0), limit)
+        # 다른 문헌이 지시 대상만 세워 주더라도 이 셀 자신의 근거가 추론이라는 사실은 바뀌지
+        # 않습니다. 추론 셀을 동일급으로 복원하면 유사도 배지와 차이점 줄이 서로 모순합니다.
+        if match.directness != "direct":
+            target = min(target, JUDGMENT_RANK["일부 차이"])
         if target <= JUDGMENT_RANK.get(match.judgment, 0):
             continue
         copy = match.model_copy(deep=True)
@@ -772,6 +793,7 @@ def _dependent_chain(claim: Claim, matrix: Matrix, parent: ChainInfo, chain: Cha
 
     chain.uncovered = no_correspondence_labels(claim, merged)
     chain.residual = difference_labels(claim, merged)
+    chain.reserved = reserved_labels(claim, merged)
     chain.combined_similarity = combined_similarity(claim, merged)
     parents = ancestry(all_claims, claim.number)
     inherited_text = f"청구항 {', '.join(str(number) for number in parents)}의 인용발명 조합을 상속" if parents else "부모항 조합을 상속"
@@ -876,6 +898,8 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         verify=match.verify if match else "empty",
         has_quote=bool(match and match.quote),
         missing_count=len(match.missing_limitations) if match else 0,
+        unverified_count=unverified_count(match),
+        limitation_states=limitation_state_map(match),
         gain=_supplement_step(match, primary),
         merged_gain=merged_gain,
         better_than_primary=is_better_match(match, primary),
@@ -885,6 +909,8 @@ def _candidate_row(document_id: str, match: ElementMatch | None, primary: Elemen
         adopted=taken,
         sample_count=match.sample_count if match else 0,
         sample_agreement=match.sample_agreement if match else 0.0,
+        sample_unanimous=match.sample_unanimous if match else 0,
+        sample_requirements=match.sample_requirements if match else 0,
         sample_early_exit=bool(match and match.sample_early_exit),
     )
 
@@ -950,17 +976,35 @@ def _combination_rationale(chain: ChainInfo) -> str:
     if not chain.secondaries:
         if chain.supplement_needed or chain.residual:
             labels = chain.residual or chain.supplement_needed
-            return ("주 인용발명 단독으로 모든 구성에 대응 기재는 확인되지만, "
-                    f"구성 {', '.join(labels)}은 완전 개시되지 않아 차이점 판단이 필요합니다. "
-                    "다른 문헌에서도 이 차이를 완전히 해소하는 더 강한 직접 근거는 확인하지 못했습니다."
-                    + _well_known_clause(chain))
+            reserved = set(chain.reserved)
+            differing = [label for label in labels if label not in reserved]
+            sentences = []
+            if differing:
+                sentences.append(
+                    "주 인용발명 단독으로 모든 구성에 대응 기재는 확인되지만, "
+                    f"구성 {', '.join(differing)}은 완전 개시되지 않아 차이점 판단이 필요합니다. "
+                    "다른 문헌에서도 이 차이를 완전히 해소하는 더 강한 직접 근거는 확인하지 못했습니다.")
+            # 유보 구성에는 "차이점 판단이 필요하다"고 적지 않습니다. 판단할 차이가 있는지
+            # 자체가 아직 확인되지 않았고, 필요한 것은 차이 판단이 아니라 원문 확인입니다.
+            if reserved:
+                sentences.append(
+                    f"구성 {', '.join(chain.reserved)}은 의미검증을 수행하지 못해 개시 여부를 "
+                    "확정하지 못했습니다.")
+            return " ".join(sentences) + _well_known_clause(chain)
         return ("주 인용발명 단독으로 모든 필수 구성이 직접·완전하게 개시됩니다."
                 + _well_known_clause(chain))
     base = ("주 인용발명이 완전히 개시하지 않은 구성을 보완 인용발명이 직접 개시하여 결합했습니다. "
             "이 결합은 구성 커버리지만으로 조립한 것이고, 결합의 동기·용이성·결합 방해 요소·"
             "작용효과는 평가하지 않았으므로 진보성 결론이 아닙니다.")
-    if chain.residual:
-        base += f" 결합 후에도 구성 {', '.join(chain.residual)}에는 차이가 남습니다."
+    # 유보 구성은 "차이가 남는다"에 넣지 않습니다. 차이는 대비해 본 결과이고, 유보는 대비
+    # 자체를 못 한 것입니다. 한 문장에 뭉치면 결론 줄이 바로 아래 지표('판정 유보')와
+    # 어긋납니다.
+    differing = [label for label in chain.residual if label not in set(chain.reserved)]
+    if differing:
+        base += f" 결합 후에도 구성 {', '.join(differing)}에는 차이가 남습니다."
+    if chain.reserved:
+        base += (f" 구성 {', '.join(chain.reserved)}은 의미검증을 수행하지 못해 "
+                 "개시 여부를 확정하지 못했습니다.")
     return base + _pending_clause(chain) + _well_known_clause(chain)
 
 

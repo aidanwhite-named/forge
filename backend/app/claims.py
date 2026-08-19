@@ -12,7 +12,8 @@ from . import cache
 from .cache import fingerprint
 from .agy import run_cli
 from .config import DECOMPOSITION_FILE, FORCE_REDECOMPOSE
-from .models import Claim, ClaimElement, Limitation
+from .consistency import pending_aliases
+from .models import Claim, ClaimElement, Limitation, ReferenceAlias
 
 _CLAIM_HEADER = re.compile(
     r"(?:^|\n)\s*(?:(?:\d+)\s*[.)]\s*)?"
@@ -294,12 +295,18 @@ def _pinned_decomposition() -> dict | None:
 
 def assign_importance(claims: list[Claim], decomposition: dict | None = None,
                       claims_text: str = "", *,
-                      pinned_decomposition: dict | None = None) -> list[str]:
+                      pinned_decomposition: dict | None = None,
+                      user_confirmed: bool = False) -> list[str]:
     """구성요소 중요도·하위 한정·검색어를 받습니다. 실패해도 기본값 3으로 진행합니다.
 
     decomposition은 이 분해 결과를 읽고 쓰는 저장소입니다. 이미 분해된 청구항은 그대로
     되살리고 남은 것만 LLM에 물어봅니다. pinned_decomposition은 회귀 실행처럼 환경변수와
     무관하게 사건별 분해를 고정해야 할 때만 사용합니다.
+
+    user_confirmed는 그 고정 분해가 **사용자가 확인·확정한 것**임을 뜻합니다. 두 경로는
+    pinned_decomposition이라는 같은 문을 쓰지만 출처가 정반대라, 구분하지 않으면 정상 실행의
+    보고서가 "회귀 사건의 고정 분해에서 읽었습니다"라고 적습니다 — 사용자가 화면에서 확정한
+    분해를 실험용 고정 파일에서 가져온 것으로 잘못 알리는 셈입니다.
 
     저장하는 이유는 호출 한 번을 아끼는 데 있지 않습니다. 이 분해 결과(limitations,
     search_terms)가 비교 캐시 키에 그대로 들어가는데(cache.cache_key), 같은 청구항을 다시
@@ -320,15 +327,21 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None,
     restored = {claim.number for claim in claims
                 if _restore_elements(claim, pinned, strict_version=False)}
     if restored:
-        notes.append(f"청구항 {', '.join(str(number) for number in sorted(restored))}의 구성 분해를 "
-                     f"{source}에서 읽었습니다. 이 보고서의 분해는 자동 생성된 것이 아닙니다.")
+        numbers = ", ".join(str(number) for number in sorted(restored))
+        # 사용자 확정 분해는 "자동 생성된 것이 아니다"가 아닙니다 — 모델이 제안한 분해를
+        # 사람이 확인해 확정한 것이므로, 실험용 고정과 같은 문장으로 알리면 둘 다 틀립니다.
+        notes.append(f"청구항 {numbers}의 구성 분해는 사용자가 확인·확정한 것입니다. "
+                     "제안 분해와의 차이는 decomposition_review.json에 남습니다."
+                     if user_confirmed else
+                     f"청구항 {numbers}의 구성 분해를 {source}에서 읽었습니다. "
+                     "이 보고서의 분해는 자동 생성된 것이 아닙니다.")
     restored |= {claim.number for claim in claims
                  if claim.number not in restored and _restore_elements(claim, decomposition)}
 
     shared_key = ""
     if claims_text and not FORCE_REDECOMPOSE:
         shared_key = cache.decomposition_key(claims_text, decomposition_generation())
-        shared = cache.load_decomposition(shared_key)
+        shared = _without_aliases(cache.load_decomposition(shared_key) or {})
         restored |= {claim.number for claim in claims
                      if claim.number not in restored and _restore_elements(claim, shared)}
 
@@ -337,7 +350,12 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None,
     # 분해를 받지 못한 청구항이 있으면 그 실행의 분해는 온전하지 않으므로 공유 캐시에 넣지
     # 않습니다. 빈 분해가 고착되면 이후 모든 실행이 그것을 재사용합니다.
     if shared_key and not warnings and claims_text:
-        cache.store_decomposition(shared_key, dump_decomposition(claims))
+        # **별칭 확정은 공유 캐시에 넣지 않습니다.** 캐시의 다른 값은 모델이 만든 *도출*이라
+        # 재사용이 비용 절약이지만, 별칭 확정은 특정 사람이 특정 사건에서 내린 *판단*입니다.
+        # 그것을 청구항 문언이 같다는 이유로 물려주면, 다음 실행은 그 사용자가 본 적도 없는
+        # 판단 위에서 돌면서 보고서에는 아무 표시도 남지 않습니다. 도출의 재사용은 최적화지만
+        # 판단의 재사용은 하지 않은 결정을 그 사람에게 돌리는 일입니다.
+        cache.store_decomposition(shared_key, _without_aliases(dump_decomposition(claims)))
     warnings = notes + warnings
     if decomposition is not None:
         # 분해를 받지 못한 청구항(기본값으로 진행)은 저장하지 않습니다. 저장하면 그 빈
@@ -351,6 +369,7 @@ def assign_importance(claims: list[Claim], decomposition: dict | None = None,
 def dump_decomposition(claims: list[Claim], existing: dict | None = None) -> dict:
     """분해 결과를 저장 가능한 형태로 옮깁니다. 기존 기록은 유지하고 덮어씁니다."""
     stored = dict((existing or {}).get("claims") or {})
+    aliases = dict((existing or {}).get("aliases") or {})
     for claim in claims:
         stored[str(claim.number)] = [
             {"label": element.label, "text": element.text, "importance": element.importance,
@@ -358,7 +377,17 @@ def dump_decomposition(claims: list[Claim], existing: dict | None = None) -> dic
              "limitations": [limitation.model_dump() for limitation in element.limitations]}
             for element in claim.elements
         ]
-    return {"version": decomposition_generation(), "claims": stored}
+        # 확정을 기다리는 별칭 후보를 분해와 **같은 기록**에 담습니다. 확정 관문이 하나여야
+        # "무엇을 확정했는지"가 한 군데 남습니다(models.ReferenceAlias).
+        pending = [alias.model_dump() for alias in pending_aliases(claim)]
+        if pending:
+            aliases[str(claim.number)] = pending
+        else:
+            aliases.pop(str(claim.number), None)
+    record = {"version": decomposition_generation(), "claims": stored}
+    if aliases:
+        record["aliases"] = aliases
+    return record
 
 
 def _restore_elements(claim: Claim, decomposition: dict | None,
@@ -392,6 +421,7 @@ def _restore_elements(claim: Claim, decomposition: dict | None,
                     for item in payloads]
     except (TypeError, ValueError):
         return False
+    claim.aliases = _restore_aliases(claim, decomposition)
     for element, item, limitations in zip(claim.elements, payloads, restored):
         try:
             element.importance = max(1, min(5, int(item.get("importance", 3))))
@@ -401,6 +431,81 @@ def _restore_elements(claim: Claim, decomposition: dict | None,
         element.search_terms = _unique_strings(item.get("search_terms"))[:16]
         element.limitations = limitations[:12]
     return True
+
+
+def _without_aliases(decomposition: dict) -> dict:
+    """공유 캐시를 오갈 때 별칭 확정을 떼어 냅니다. 읽을 때도 뗍니다 — 이 규칙이 생기기 전에
+    저장된 항목이 남아 있어도 남의 확정이 되살아나지 않게 합니다."""
+    return {key: value for key, value in (decomposition or {}).items() if key != "aliases"}
+
+
+def validate_aliases(proposed: dict, confirmed: dict) -> list[str]:
+    """확정본의 별칭이 **제안된 후보 안에서만** 움직였는지 확인합니다.
+
+    별칭은 개시 인정(의미검증의 reference_terms)과 등급 강등(enforce_antecedents)을 **둘 다**
+    바꿉니다. 화면이 체크박스와 후보 선택만 내주더라도 확정 요청은 그냥 JSON이므로, 없던 연결을
+    지어내 보내면 사람이 본 적 없는 지시 관계가 판정에 들어갑니다. 사용자가 바꿀 수 있는 것은
+    **확정 여부와 제시된 후보 중 하나를 고르는 것**뿐입니다.
+    """
+    # **청구항 번호가 키에 들어갑니다.** 빼면 청구항 1에서 제안된 별칭을 청구항 2 아래로
+    # 옮겨 보내도 target·term만 같으면 통과합니다. 그 별칭이 가리키는 앞 구성은 청구항마다
+    # 다른 것이므로, 옮겨진 확정은 사람이 본 적 없는 연결입니다.
+    offered = {(str(number), str(item.get("target", "")), str(item.get("term", ""))): item
+               for number, items in (proposed.get("aliases") or {}).items()
+               for item in items if isinstance(item, dict)}
+    problems: list[str] = []
+    for number, items in (confirmed.get("aliases") or {}).items():
+        if not isinstance(items, list):
+            problems.append(f"청구항 {number}의 지시 관계 목록 형식이 올바르지 않습니다.")
+            continue
+        seen: set[tuple[str, str, str]] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                problems.append(f"청구항 {number}에 읽을 수 없는 지시 관계 항목이 있습니다.")
+                continue
+            key = (str(number), str(item.get("target", "")), str(item.get("term", "")))
+            # 같은 별칭이 두 번 오면 나중 것이 앞선 것을 덮습니다. 순서가 판정을 정하게 두면,
+            # 확정한 것과 반영된 것이 조용히 갈릴 수 있습니다.
+            if key in seen:
+                problems.append(f"청구항 {number} ({key[1]})의 \"{key[2]}\"이 두 번 있습니다. "
+                                "같은 지시 관계는 한 번만 확정할 수 있습니다.")
+                continue
+            seen.add(key)
+            source = offered.get(key)
+            if source is None:
+                problems.append(f"청구항 {number} ({key[1]})의 \"{key[2]}\"은 제안되지 않은 "
+                                "지시 관계입니다. 제시된 항목만 확정할 수 있습니다.")
+                continue
+            allowed = [str(value) for value in source.get("candidates") or []]
+            if list(item.get("candidates") or []) != allowed:
+                problems.append(f"청구항 {number} ({key[1]})의 \"{key[2]}\" 후보 목록이 "
+                                "제안과 다릅니다. 후보는 고칠 수 없습니다.")
+            picked = str(item.get("selected_source", ""))
+            if item.get("confirmed") and picked not in allowed:
+                problems.append(f"청구항 {number} ({key[1]})의 \"{key[2]}\"을 확정하려면 "
+                                f"후보({', '.join(allowed) or '없음'}) 중 하나를 골라야 합니다.")
+            elif picked and picked not in allowed:
+                problems.append(f"청구항 {number} ({key[1]})의 \"{key[2]}\"에 후보가 아닌 "
+                                f"구성 {picked}을 골랐습니다.")
+    return problems
+
+
+def _restore_aliases(claim: Claim, decomposition: dict) -> list[ReferenceAlias]:
+    """저장된 별칭 확정을 되씌웁니다. 읽지 못하는 항목은 **확정되지 않은 것으로** 둡니다.
+
+    잘못 저장된 값이 확정으로 읽히면 사람이 승인하지 않은 연결이 판정을 바꿉니다. 이 값의
+    기본값은 언제나 "확정되지 않음"이어야 합니다.
+    """
+    stored = (decomposition.get("aliases") or {}).get(str(claim.number))
+    if not isinstance(stored, list):
+        return []
+    restored: list[ReferenceAlias] = []
+    for item in stored:
+        try:
+            restored.append(ReferenceAlias.model_validate(item))
+        except (TypeError, ValueError):
+            continue
+    return restored
 
 
 MAX_LIMITATIONS = 12
@@ -447,6 +552,8 @@ def validate_confirmed_decomposition(proposed: dict, confirmed: dict) -> list[st
             continue
         for original, edited in zip(expected, actual):
             problems += _element_problems(number, original, edited)
+    # 별칭은 개시 인정과 등급 강등을 **둘 다** 바꿉니다. 뼈대 검사와 같은 자리에서 겁니다.
+    problems += validate_aliases(proposed or {}, confirmed or {})
     return problems
 
 

@@ -1,4 +1,6 @@
 """이번 GNSS/SfM 사례에서 드러난 의미 과대판정과 단계적 근거 묶음의 회귀 테스트."""
+import json
+
 from app import cache, entailment
 from app.entailment import validate_entailment
 from app.models import (Chunk, Claim, ClaimElement, Document, ElementMatch, EvidenceSpan,
@@ -154,6 +156,65 @@ def test_source_context_is_limited_around_the_verified_quote():
     assert quote in context
 
 
+def test_entailment_receives_claim_flow_and_the_evidence_section(monkeypatch):
+    """실험용 GT 취득을 발명 본체의 입력 취득으로 옮겨 읽지 않도록 단계 문맥을 함께 보낸다."""
+    quote = "Using a LiDAR camera, we generated ground truth after reconstructing our output."
+    document = Document(id="7", filename="head.pdf", type="paper", chunks=[Chunk(
+        document_id="7", chunk_id="D7-B-p007-01", page=7, section="Experiments", text=quote)])
+    claim = Claim(number=1, elements=[
+        ClaimElement(label="A", text="3차원 센서 데이터를 획득하는 단계"),
+        ClaimElement(label="B", text="센서 점군과 영상 점군을 융합하는 단계"),
+    ])
+    match = ElementMatch(
+        claim_number=1, label="A", document_id="7", judgment="실질적 동일", directness="direct",
+        quote=quote, chunk_id="D7-B-p007-01", limitation_checks=[LimitationCheck(
+            index=0, kind="core", limitation="3차원 센서 데이터를 획득함", disclosed=True,
+            quote=quote, chunk_id="D7-B-p007-01")])
+    verify_matches([match], {"7": document})
+    seen = {}
+
+    def fake(payload, cache_keys=None, prompt=entailment.ENTAILMENT_PROMPT):
+        seen.update(payload["items"][0])
+        return {"entailments": [{"item_id": "1:A:0", "supported": False,
+                                  "relation": "unsupported", "directness": "inferred",
+                                  "reason": "Experiments의 GT 생성은 제안 방법 출력 뒤의 평가 단계다."}]}
+
+    monkeypatch.setattr(entailment, "_cached_run", fake)
+    validate_entailment([match], {"7": document}, claims=[claim])
+
+    assert seen["claim_flow"] == [{"label": "A", "text": claim.elements[0].text},
+                                  {"label": "B", "text": claim.elements[1].text}]
+    assert seen["evidence"][0]["section"] == "Experiments"
+    assert match.limitation_checks[0].semantic_status == "rejected"
+
+
+def test_entailment_splits_a_document_into_small_failure_isolated_batches(monkeypatch):
+    """한 문헌의 긴 요청 하나가 실패해 모든 강한 근거가 미검증으로 사라지는 회귀를 막는다."""
+    quotes = [f"verified operation {label}" for label in "ABCD"]
+    document = _document("8", "fusion.pdf", quotes)
+    matches = [ElementMatch(
+        claim_number=1, label=label, document_id="8", judgment="실질적 동일", directness="direct",
+        quote=quote, chunk_id=f"D8-B-p{index + 1:03d}-01", limitation_checks=[LimitationCheck(
+            index=0, kind="core", limitation=f"operation {label}", disclosed=True,
+            quote=quote, chunk_id=f"D8-B-p{index + 1:03d}-01")])
+        for index, (label, quote) in enumerate(zip("ABCD", quotes))]
+    verify_matches(matches, {"8": document})
+    batch_sizes = []
+
+    def fake(payload, cache_keys=None, prompt=entailment.ENTAILMENT_PROMPT):
+        batch_sizes.append(len(payload["items"]))
+        return {"entailments": [{"item_id": item["item_id"], "supported": True,
+                                  "relation": "explicit", "directness": "direct",
+                                  "reason": "원문이 한정을 명시한다."}
+                                 for item in payload["items"]]}
+
+    monkeypatch.setattr(entailment, "_cached_run", fake)
+    validate_entailment(matches, {"8": document})
+
+    assert batch_sizes == [entailment.MAX_ENTAILMENT_ITEMS_PER_CALL] * 2
+    assert all(match.limitation_checks[0].semantic_status == "accepted" for match in matches)
+
+
 _WHOLE = ("We use a normalized-cut algorithm to divide the camera graph into multiple subgraphs "
           "so that each subgraph can be reconstructed independently.")
 
@@ -205,9 +266,16 @@ def test_an_incomplete_response_is_not_cached_and_leaves_the_claim_analyzable(mo
 
     # 보조 검증의 결손은 chain.py의 analysis_incomplete로 번지지 않아야 한다.
     assert first.error == ""
-    assert first.judgment == "실질적 동일" and first.directness == "direct"
+    # 다만 동일급으로 남지도 않는다. 검증을 받지 못한 한정 위에 '실질적 동일'을 세우면
+    # 보고서에서 그 근거가 **가장 튼튼한 근거로** 읽힌다(coverage.derive_judgment의 상한).
+    # 개시 자체를 뒤집지는 않으므로 directness와 disclosed는 그대로다.
+    assert first.judgment == "일부 차이" and first.directness == "direct"
+    assert first.limitation_checks[0].disclosed is True
     assert first.limitation_checks[0].semantic_status == "error"
-    assert len(notes) == 1
+    # 같은 실행 안에서 결손 항목만 다시 묻는다. 스텁이 계속 비어 있으므로 회복되지 않고,
+    # 노트는 한정별 결손 1건 + 재질의 요약 1건이 된다.
+    assert len(calls) == 2
+    assert len(notes) == 2 and any("다시 물었고" in note for note in notes)
     digest = next(iter(cache_keys)).removeprefix(cache.ENTAILMENT_KEY_PREFIX)
     assert not (cache.ENTAILMENT_CACHE_DIR / f"{digest}.json").exists()
 
@@ -219,7 +287,7 @@ def test_an_incomplete_response_is_not_cached_and_leaves_the_claim_analyzable(mo
     verify_matches([second], {"1": document})
     validate_entailment([second], {"1": document})
 
-    assert len(calls) == 1
+    assert len(calls) == 2                    # 결손 스텁은 더 불리지 않았다
     assert second.judgment == "차이"
     assert second.limitation_checks[0].semantic_status == "rejected"
 
@@ -313,6 +381,108 @@ def test_reference_terms_are_omitted_for_elements_that_introduce_their_own_subje
     assert match.judgment == "차이" and match.directness == "inferred"
 
 
+_THREE_QUOTE = ("After optimizing the above camera pose, a robust and accurate global camera "
+                "pose was obtained for subsequent triangulation.")
+
+
+def _three_limitation_match() -> ElementMatch:
+    """실측 구성 E의 모양. 한정 3건이 모두 원문 대조를 통과해 의미검증 대상에 오른다."""
+    quote = _THREE_QUOTE
+    return ElementMatch(
+        claim_number=1, label="E", document_id="1", judgment="실질적 동일", directness="direct",
+        quote=quote, chunk_id="D1-B-p001-01", verify="verified",
+        limitation_checks=[
+            LimitationCheck(index=index, kind="core" if index < 2 else "qualifier",
+                            limitation=text, disclosed=True, quote=quote,
+                            chunk_id="D1-B-p001-01", verify="verified")
+            for index, text in enumerate(["전역 좌표 정합을 최적화함",
+                                          "절대좌표계에 대응하는 최종 3D 모델을 생성함",
+                                          "위치 및 기하학적 제약조건 적용으로 한정함"])])
+
+
+def _supported(item_id: str) -> dict:
+    return {"item_id": item_id, "supported": True, "relation": "functional_equivalent",
+            "directness": "direct", "reason": "근거 묶음이 한정을 뒷받침한다."}
+
+
+def test_missing_verdicts_are_re_asked_as_a_bundle_before_falling_back(monkeypatch):
+    """결손은 미완료로 굳히기 전에 먼저 회복을 시도한다.
+
+    미완료 상태는 과대판정을 막는 안전망이지 목표가 아니다. 막을 수 있는 결손을 막지 않으면
+    보고서의 절반이 "확인하지 못했습니다"로 덮인다.
+    """
+    document = _document("1", "sensors-21-03939.pdf", [_THREE_QUOTE])
+    match = _three_limitation_match()
+    verify_matches([match], {"1": document})
+    asked: list[list[str]] = []
+
+    def flaky(prompt, expect="entailments"):
+        payload = json.loads(prompt.split("CONTEXT:\n", 1)[1])
+        wanted = [item["item_id"] for item in payload["items"]]
+        asked.append(wanted)
+        if wanted == ["1:E:0", "1:E:1"] and asked.count(wanted) == 1:
+            return {"entailments": []}        # 첫 작은 배치가 비면 그 배치만 다시 묻는다
+        return {"entailments": [_supported(item_id) for item_id in wanted]}
+
+    monkeypatch.setattr(entailment, "run_cli", flaky)
+    notes = validate_entailment([match], {"1": document})
+
+    # 배치는 동시에 돌므로 **배치 사이의** 호출 순서는 정해지지 않습니다. 이 테스트가 지키는
+    # 것은 한 배치 안에서 결손을 묶음으로 다시 묻는다는 규율이므로 그 배치만 추려 봅니다.
+    assert [wanted for wanted in asked if wanted != ["1:E:2"]] == [["1:E:0", "1:E:1"]] * 2
+    assert asked.count(["1:E:2"]) == 1
+    assert [check.semantic_status for check in match.limitation_checks] == ["accepted"] * 3
+    assert match.judgment == "실질적 동일"      # 전부 회복됐으므로 상한이 걸리지 않는다
+    assert any("2건이 빠져 다시 물었고 2건을 회복했습니다" in note for note in notes)
+
+
+def test_a_verdict_still_missing_after_the_bundle_is_re_asked_one_at_a_time(monkeypatch):
+    document = _document("1", "sensors-21-03939.pdf", [_THREE_QUOTE])
+    match = _three_limitation_match()
+    verify_matches([match], {"1": document})
+    asked: list[list[str]] = []
+
+    def stubborn(prompt, expect="entailments"):
+        payload = json.loads(prompt.split("CONTEXT:\n", 1)[1])
+        wanted = [item["item_id"] for item in payload["items"]]
+        asked.append(wanted)
+        if wanted == ["1:E:0", "1:E:1"]:
+            # 첫 호출은 둘 다, 묶음 재질의는 마지막 하나를 빠뜨린다.
+            return {"entailments": [] if asked.count(wanted) == 1 else [_supported("1:E:0")]}
+        return {"entailments": [_supported(item_id) for item_id in wanted]}
+
+    monkeypatch.setattr(entailment, "run_cli", stubborn)
+    validate_entailment([match], {"1": document})
+
+    assert [wanted for wanted in asked if wanted != ["1:E:2"]] == [
+        ["1:E:0", "1:E:1"], ["1:E:0", "1:E:1"], ["1:E:1"]]
+    assert asked.count(["1:E:2"]) == 1
+    assert [check.semantic_status for check in match.limitation_checks] == ["accepted"] * 3
+
+
+def test_a_verdict_that_never_arrives_stays_unverified_and_caps_the_grade(monkeypatch):
+    """호출을 더 해도 답이 없으면 미완료로 남긴다. 지어내지도, 미개시로 적지도 않는다."""
+    document = _document("1", "sensors-21-03939.pdf", [_THREE_QUOTE])
+    match = _three_limitation_match()
+    verify_matches([match], {"1": document})
+
+    def silent_on_one(prompt, expect="entailments"):
+        payload = json.loads(prompt.split("CONTEXT:\n", 1)[1])
+        wanted = [item["item_id"] for item in payload["items"]]
+        return {"entailments": [_supported(item_id) for item_id in wanted
+                                if item_id != "1:E:1"]}
+
+    monkeypatch.setattr(entailment, "run_cli", silent_on_one)
+    notes = validate_entailment([match], {"1": document})
+
+    statuses = [check.semantic_status for check in match.limitation_checks]
+    assert statuses == ["accepted", "error", "accepted"]
+    assert match.limitation_checks[1].disclosed is True      # 개시를 뒤집지 않는다
+    assert match.missing_limitations == []                   # 누락으로도 적지 않는다
+    assert match.judgment == "일부 차이"                       # 동일급 상한만 걸린다
+    assert any("1건은 끝내 판단을 받지 못했습니다" in note for note in notes)
+
+
 def test_an_unchecked_limitation_restores_the_recovery_downgrade(monkeypatch):
     """verify.py가 이 단계에 넘긴 alignment=recovered 강등은 검증이 못 돌면 되살려야 한다."""
     document = _document("1", "sensors-21-03939.pdf", [_WHOLE])
@@ -327,7 +497,8 @@ def test_an_unchecked_limitation_restores_the_recovery_downgrade(monkeypatch):
 
     assert match.limitation_checks[0].semantic_status == "error"
     assert match.directness == "inferred"     # 복구된 근거는 검증 없이 직접 개시로 두지 않는다
-    assert match.judgment == "실질적 동일"      # 다만 비교 판정 자체를 없애지는 않는다
+    assert match.judgment == "일부 차이"        # 동일급 상한은 걸리되
+    assert match.limitation_checks[0].disclosed is True   # 비교 판정 자체를 없애지는 않는다
 
 
 def test_a_document_keeps_supplement_eligibility_for_limitations_it_verifiably_discloses(monkeypatch):
@@ -429,6 +600,8 @@ def test_a_missing_axis_supplied_by_another_reference_is_accepted_in_combination
     assert check.semantic_status == "accepted_in_combination"
     assert check.combination_documents == ["4"]
     assert any("결합 근거로 인정" in note for note in notes)
+    assert "진보성 결합의 근거 심사자" in seen["prompt"]
+    assert '"claim_flow"' in seen["prompt"]
     # 문맥에는 **다른 구성**의 근거까지 실려야 한다. 빠진 축은 대개 다른 구성이 세운 대상이다.
     assert WAVEGUIDE_QUOTE in seen["prompt"]
     # 문헌 단독 판정은 그대로다. 그 문헌 혼자서는 여전히 개시하지 않는다.

@@ -8,12 +8,12 @@ import json
 import re
 from collections import Counter
 
-from .agy import AnalysisCancelled, run_cli
+from .agy import AnalysisCancelled, run_cli, run_parallel
 from .claims import ancestry
 from .config import COMPARE_SAMPLES
 from .coverage import TERMINOLOGY_VALUES, derive_judgment
 from .models import (Claim, ClaimElement, Document, ElementMatch, EvidenceSpan, Limitation,
-                     LimitationCheck, missing_limitations)
+                     LimitationCheck, SampleTally, missing_limitations)
 from .prompts import DEFAULT_ANALYSIS_PROMPT
 
 # 문헌 한 건을 프롬프트에 넣을 때의 문자 예산. 넘으면 구성요소별 검색어가 적중한
@@ -57,10 +57,11 @@ requirements의 각 항목에는 kind가 붙어 있습니다.
 산출 규칙은 다음과 같습니다. 어떤 답이 어떤 등급이 되는지 알고 답하십시오.
 - core가 하나도 개시되지 않음 → 관련 원문을 제시했으면 "차이", 원문도 없으면 "대응 없음"
 - core가 일부만 개시됨 → "일부 유사"
+- core 전부 개시 + different_purpose가 true → "일부 유사"
+  (여기서 멈춥니다. qualifier가 남아 있든 아니든 이 위로 올라가지 않습니다)
 - core 전부 개시 + qualifier 중 누락 있음 → "일부 차이"
   (예: 저장 계층 간 이전은 개시되어 있으나 이전 여부를 경과 시간으로 정하고 청구항은 수요 지표로 정함)
-- 전부 개시 → different_purpose가 true면 "일부 유사",
-  아니면 terminology가 "identical"이면 "동일", "equivalent"이면 "실질적 동일"
+- 전부 개시 → terminology가 "identical"이면 "동일", "equivalent"이면 "실질적 동일"
 
 따라서 **등급을 올리거나 내리려고 개시 여부를 조정하지 마십시오.** 개시 여부는 사실대로 적고
 등급은 그 결과로 두십시오. 반대로 하면 근거와 등급이 어긋나 보고서가 스스로를 반박합니다.
@@ -117,44 +118,21 @@ requirements의 각 항목에는 kind가 붙어 있습니다.
 대응에 **동일·실질적 동일을 줄 수 있는지**를 정합니다. 대상이 다르면 등급을 내리는 것이지
 대응을 없는 것으로 만드는 것이 아닙니다.
 
-[동일 주체·모델의 연속성과 데이터 흐름 방향]
-- 청구항이 하나의 모델·네트워크·프로세서·부재에 여러 역할을 함께 부여하면, 문헌에서도
-  **같은 실체**가 그 역할을 수행하거나 두 실체가 하나로 동작한다고 명시되어야 합니다.
-  한 모델이 광학계를 모사하고 별개의 뉴럴 네트워크가 영상을 생성한다는 두 문장을 주워
-  "광학계를 모델링하는 뉴럴 네트워크" 하나로 합치지 마십시오. 명칭 차이가 아니라 **주체
-  정체성 축의 결손**이며, 해당 관계형 한정은 disclosed=false입니다.
-- "X로 학습되는 Y"와 "X 자체", "Y가 사용하는 모델"과 "Y 자체가 모델링하는 대상"을
-  구분하십시오. 도구·교사 모델·손실 계산에 쓰인 프록시의 속성을 학습 대상 네트워크에
-  전이하지 마십시오. 원문이 두 실체의 동일성 또는 역할 승계를 명시할 때만 연결할 수 있습니다.
-- 입력→처리→출력의 **방향**을 보존하십시오. 타겟 영상을 입력받아 위상 패턴을 출력하는 모델은,
-  보정 영상을 입력받아 타겟 영상을 출력하는 모델과 반대 방향입니다. 입력과 출력 양쪽에
-  '이미지'가 나온다는 이유로 등가로 두지 마십시오.
-- 네트워크 밖에서 보정행렬을 입력 영상에 적용한 뒤 디스플레이에 보내는 절차는, 그 보정 영상이
-  **학습된 네트워크에 입력되어 네트워크로부터 목표 영상이 출력되는 관계**를 개시하지 않습니다.
-  외부 전처리와 네트워크 내부 입출력은 원문이 하나의 데이터 흐름으로 연결할 때만 합칠 수 있습니다.
-- 미개시 사유에는 동작·대상·집합성·인과관계와 별도로 **주체 정체성** 또는 **방향성** 중
-  무엇이 비었는지를 적으십시오. 같은 명사를 썼다는 이유만으로 이 두 축을 생략하지 마십시오.
-- 이 엄격한 주체 검사는 **해당 requirement 문언 안에서 함께 요구하는 역할**에만 겁니다.
-  requirement가 단순히 "뉴럴 네트워크를 학습함"만 요구하면, 문헌에서 실제로 학습되는 별도
-  뉴럴 네트워크를 찾아 그 원문으로 판정하십시오. 다른 requirement의 "그 뉴럴 네트워크가
-  광학계를 모델링함"이 미개시라는 이유를 이 독립 원자 한정까지 끌어와 false로 만들지 마십시오.
-  반대로 이 단순 한정의 근거로 "신경망 학습과 유사하다"는 비유만 들지 말고, 네트워크가 실제로
-  학습된다고 명시한 문장을 끝까지 찾아 인용하십시오.
-- "입력 및 출력 이미지 세트를 획득함"이라는 독립 한정에서는 같은 캘리브레이션 흐름에서
-  디스플레이에 **제시·공급된 stimulus/target 이미지**와 그에 대응해 **촬영·관찰된 결과 이미지**가
-  반복되어 쌍을 이루면 입력측·출력측 이미지 세트로 볼 수 있습니다. 정확히 'input optical image'
-  라는 명칭을 요구하지 마십시오. 다만 "특정 도파관 시스템에 그 입력이 들어가 그 도파관을 통해
-  출력이 발생함"이라는 qualifier는 이 일반 영상쌍만으로 충족되지 않으며, 해당 시스템과 인과
-  경로를 별도 원문으로 확인해야 합니다.
-- 위 영상쌍 한정을 disclosed=true로 둘 때는 **제시·공급된 입력측 이미지 문장과 촬영된 출력측
-  이미지 문장을 그 limitation_checks 항목 자신의 quote/evidence에 모두 넣으십시오.** 한쪽을
-  형제 한정의 element_context에만 두면 독립 의미검증에서 기각됩니다.
-- 특정 광학계·전송계·처리계를 통한 입력→출력 인과 한정에서는 "장치가 그 시스템일 수 있다"는
-  **장치 유형 총론보다 실제 결과가 그 시스템을 통과해 촬영·출력되었다는 실시 문장**을 먼저
-  찾으십시오. 예를 들어 같은 실시 흐름에 "입력 영상을 표시하는 동안 촬영한다"와 "이미지는
-  도파관 접안렌즈를 통해 촬영되었다"가 있으면, 둘을 그 requirement 자신의 quote/evidence에
-  함께 넣어 제시→도파관→촬영 경로를 완성합니다. 일반 장치 유형 문장 하나만 인용하고 인과
-  한정을 disclosed=true로 두지 마십시오.
+[동일 주체와 데이터 흐름]
+- 청구항이 같은 주체에 여러 역할을 부여하면 문헌도 같은 실체 또는 하나로 연결된 실시 흐름에
+  그 역할을 귀속시켜야 합니다. 별개 주체의 속성·동작을 한 주체로 합치지 마십시오.
+- 입력→처리→출력의 방향과 시간 순서를 보존하십시오. 같은 명사가 앞뒤에 등장해도 데이터가
+  반대 방향으로 흐르거나 청구된 처리 뒤의 별도 단계에서만 쓰이면 같은 구성의 근거가 아닙니다.
+- 이 검사는 현재 requirement가 함께 요구하는 관계에만 적용하고, 형제 한정의 실패를 끌어와
+  독립적인 한정까지 기각하지 마십시오.
+
+[발명 흐름에서의 역할]
+- 청구항 전체의 단계 순서와 문헌의 발명 본체 흐름을 함께 보십시오. 같은 센서·데이터·모델이
+  문헌 어디엔가 등장한다는 사실만으로 그 단계가 개시되는 것은 아닙니다.
+- 비교실험, 성능평가, 정답(ground truth) 생성, 검증, 사후 측정에만 쓰인 구성은 문헌이 제안
+  방법의 입력·처리 단계라고 명시하지 않는 한 그 자리로 옮겨 읽지 마십시오. 특히 발명 출력물을
+  만든 뒤 평가용으로 취득한 데이터는 청구된 생성 방법의 입력 데이터가 아닙니다.
+- 서로 다른 실시예·실험의 문장을 임의로 이어 하나의 인과 사슬로 만들지 마십시오.
 
 [입력·대상·출력 3축 요건 — disclosed=true와 terminology 양쪽에 겁니다]
 "용어만 다르다"는 판단은 **같은 것을 대상으로 같은 일을 할 때만** 성립합니다. 어떤 한정에
@@ -403,6 +381,35 @@ def parent_context(claim: Claim, all_claims: list[Claim] | None) -> list[dict]:
             for number in ancestry(all_claims or [], claim.number) if number in by_number]
 
 
+def _sample(prompt: str, samples: int | None) -> tuple[list[list], str]:
+    """같은 프롬프트를 표본 수만큼 **동시에** 묻고 성공한 응답만 돌려줍니다.
+
+    표본끼리는 서로를 참조하지 않으므로 직렬로 돌 이유가 없습니다. 셀 자체도 병렬로 도는데
+    (pipeline._compare_cells) 그 안에서 표본이 직렬이면 셀 하나의 소요 시간이 늘 표본 수의
+    배수로 남습니다. 실제 동시 프로세스 수는 agy가 마지막에 한 번 더 조입니다.
+
+    **순서를 지킵니다.** consensus는 표본 번호로 "앞선 두 표본이 일치했는가"를 세므로
+    (_merge_votes의 early_exit) 완료 순서로 담으면 같은 입력에서 그 값이 실행마다 달라집니다.
+
+    실패한 표본은 버리고 나머지로 다수결을 냅니다. 전부 실패했을 때만 호출부가 미판정으로
+    처리하도록 마지막 오류를 함께 돌려줍니다.
+    """
+    rounds = max(1, samples if samples is not None else COMPARE_SAMPLES)
+    outcomes = run_parallel([lambda: run_cli(prompt, expect="matches")] * rounds, rounds)
+    responses: list[list] = []
+    last_error = ""
+    for value, error in outcomes:
+        if isinstance(error, AnalysisCancelled):
+            # 취소는 실패가 아닙니다. 삼키면 사용자가 멈춘 셀이 "판정을 받지 못했습니다"
+            # 경고로 남고 호출부는 취소된 줄 모른 채 다음 셀로 넘어갑니다.
+            raise error
+        if error is not None:
+            last_error = str(error)
+            continue
+        responses.append(value.get("matches") or [])
+    return responses, last_error
+
+
 def compare_document(claim: Claim, document: Document, guideline: str = "",
                      budget: int | None = None,
                      all_claims: list[Claim] | None = None,
@@ -441,21 +448,7 @@ def compare_document(claim: Claim, document: Document, guideline: str = "",
         },
     }
     prompt = _assemble_prompt(COMPARE_PROMPT, guideline, context)
-    rounds = max(1, samples if samples is not None else COMPARE_SAMPLES)
-    responses: list[list] = []
-    last_error = ""
-    for _ in range(rounds):
-        try:
-            responses.append(run_cli(prompt, expect="matches").get("matches") or [])
-        except AnalysisCancelled:
-            # 취소는 실패가 아닙니다. AnalysisCancelled가 RuntimeError를 상속하므로 아래 절이
-            # 그대로 삼켜 버리면, 사용자가 멈춘 셀이 "판정을 받지 못했습니다" 경고로 남고
-            # 호출부는 취소된 줄 모른 채 다음 셀로 넘어갑니다.
-            raise
-        except RuntimeError as exc:
-            # 표본 하나가 실패해도 나머지로 다수결을 낼 수 있습니다. 전부 실패했을 때만
-            # 미판정으로 처리합니다.
-            last_error = str(exc)
+    responses, last_error = _sample(prompt, samples)
     if not responses:
         return _placeholders(claim, document, f"{document.filename} 비교 호출 실패: {last_error}"), [
             f"청구항 {claim.number} × {document.filename} 비교에 실패해 판정을 받지 못했습니다: {last_error}"
@@ -512,16 +505,7 @@ def compare_document_claims(claims: list[Claim], document: Document, guideline: 
         } for claim in claims],
     }
     prompt = _assemble_prompt(DOCUMENT_COMPARE_PROMPT, guideline, context)
-    rounds = max(1, samples if samples is not None else COMPARE_SAMPLES)
-    responses: list[list] = []
-    last_error = ""
-    for _ in range(rounds):
-        try:
-            responses.append(run_cli(prompt, expect="matches").get("matches") or [])
-        except AnalysisCancelled:
-            raise
-        except RuntimeError as exc:
-            last_error = str(exc)
+    responses, last_error = _sample(prompt, samples)
     if not responses:
         return {}, [f"인용발명 {document.filename} 일괄 구성대비에 실패해 셀 단위로 다시 대비합니다:"
                     f" {last_error}"]
@@ -660,7 +644,6 @@ def _merge_votes(votes: list[tuple[int, dict]], requirement_count: int, total: i
     3으로 둘 근거도, 내릴 근거도 실행 기록에서 확인할 수 없습니다.
     """
     items = [item for _, item in votes]
-    winner = max(items, key=_response_strength)          # 서술·발췌의 기본값이 될 표본
     checks: list[dict] = []
     unanimous = 0
     # 앞선 두 표본이 모든 한정에서 일치해야 조기 종료 후보입니다. 한 한정이라도 갈리면 거짓.
@@ -668,14 +651,28 @@ def _merge_votes(votes: list[tuple[int, dict]], requirement_count: int, total: i
     for index in range(requirement_count):
         opinions: dict[int, bool] = {}
         supporting: list[dict] = []
+        # 표본별 원시 답. **다수결에는 쓰지 않습니다** — 아래 판정 로직은 그대로 두고 관측만
+        # 더합니다. 합쳐진 결과만 남기면 "2대 1로 갈린 미개시"와 "3대 0으로 일치한 미개시"가
+        # 같은 값이 되는데, 그 둘은 다음에 해야 할 일이 다릅니다.
+        cast: dict[int, str] = {}
         for sample, item in votes:
             check = _check_at(item, index)
             if check is None:
+                cast[sample] = "absent"        # 이 표본이 이 한정에 답하지 않았습니다
                 continue
-            disclosed = check.get("disclosed") is True
+            raw = check.get("disclosed")
+            disclosed = raw is True
+            # 읽을 수 없는 값을 "미개시"로 세면 응답 결손이 문헌에 대한 사실 주장이 됩니다.
+            # 판정에서는 종전과 같이 비개시로 다루되(is True), 기록에는 사실대로 남깁니다.
+            cast[sample] = "disclosed" if disclosed else ("missing" if raw is False else "invalid")
             opinions[sample] = disclosed
             if disclosed:
                 supporting.append(check)
+        # 이 구성 자체에 답하지 않은 표본도 채웁니다. votes에는 응답한 표본만 들어 있어서,
+        # 채우지 않으면 표본 수와 투표 수가 어긋납니다(report._sample_tallies_add_up).
+        tally = {"total": total,
+                 "votes": [{"sample": sample, "verdict": cast.get(sample, "absent")}
+                           for sample in range(total)]}
         # 전 표본이 이 한정에 답했고 답이 하나로 모였을 때만 만장일치로 셉니다. 답하지 않은
         # 표본이 있으면 일치한 것이 아니라 표가 모자란 것입니다.
         if len(opinions) == total and len(set(opinions.values())) == 1:
@@ -685,23 +682,50 @@ def _merge_votes(votes: list[tuple[int, dict]], requirement_count: int, total: i
         # 과반이 개시라고 해야 개시입니다. 동률은 미개시입니다.
         if len(supporting) * 2 > total:
             best = max(supporting, key=_check_strength)
-            checks.append({**best, "index": index, "disclosed": True})
+            checks.append({**best, "index": index, "disclosed": True, "sample_tally": tally})
         else:
             rejected = next((check for _, item in votes
                              if (check := _check_at(item, index)) is not None), {})
             # 미개시로 확정되더라도 그 표본이 제시한 가장 가까운 원문은 남깁니다. 보고서의
             # "가장 가까운 기재" 줄이 이것을 씁니다.
-            checks.append({**rejected, "index": index, "disclosed": False})
+            checks.append({**rejected, "index": index, "disclosed": False, "sample_tally": tally})
+    # 서술·발췌의 기본값이 될 표본은 **합쳐진 사실과 가장 덜 어긋나는 것**에서 고릅니다.
+    # limitation_checks는 한정별 다수결로 정해지는데 reason은 자유 서술이라, 근거가 가장 많이
+    # 실린 표본에서 그냥 가져오면 둘이 다른 표본에서 옵니다. 실측: 표본 3개가 전부 갈린 셀에서
+    # judgment "차이"·미개시 core 2개와 함께 "…구성이 개시되어 있으므로"라는 이유가 저장됐습니다.
+    merged = [check.get("disclosed") is True for check in checks]
+    winner = max(items, key=lambda item: (_vote_agreement(item, merged), _response_strength(item)))
     return {
         **winner,
+        # 어느 표본도 합쳐진 사실과 맞지 않으면 그 이유는 다른 사실을 설명하는 문장입니다.
+        # 비우면 보고서가 발췌 자체를 가리키는 중립 문구로 대체합니다(report._reason_clause).
+        **({"reason": ""} if _vote_agreement(winner, merged) < len(merged) else {}),
         "limitation_checks": checks,
         "terminology": _majority(items, "terminology", "equivalent"),
         "different_purpose": _majority(items, "different_purpose", False),
         # 다수결로 확정된 사실과 어긋나지 않도록, 등급 관련 자유 필드는 넘기지 않습니다.
         "sample_count": total,
         "sample_agreement": round(unanimous / requirement_count, 4) if requirement_count else 0.0,
+        # 비율의 분자·분모를 함께 싣습니다. 비율만 남기면 0.33이 "표본이 전부 갈렸다"로도
+        # "한정 3개 중 1개만 만장일치"로도 읽히고, 실제로 그 오독이 결론까지 갔습니다.
+        "sample_unanimous": unanimous,
+        "sample_requirements": requirement_count,
         "sample_early_exit": early_exit and total >= 3,
     }
+
+
+def _vote_agreement(item: dict, merged: list[bool]) -> int:
+    """표본의 한정별 개시 여부가 합쳐진 사실과 몇 개나 같은지.
+
+    답하지 않은 한정은 같다고 세지 않습니다 — 침묵은 동의가 아니고, 그 표본의 서술은 그
+    한정을 설명하지 못합니다.
+    """
+    agreed = 0
+    for index, disclosed in enumerate(merged):
+        check = _check_at(item, index)
+        if check is not None and (check.get("disclosed") is True) == disclosed:
+            agreed += 1
+    return agreed
 
 
 def _check_at(vote: dict, index: int) -> dict | None:
@@ -998,6 +1022,8 @@ def _build_matches(raw_matches, claim: Claim, document: Document
             evidence=evidence,
             sample_count=_as_int(item.get("sample_count")),
             sample_agreement=_as_float(item.get("sample_agreement")),
+            sample_unanimous=_as_int(item.get("sample_unanimous")),
+            sample_requirements=_as_int(item.get("sample_requirements")),
             sample_early_exit=item.get("sample_early_exit") is True,
             error=error,
         ))
@@ -1101,6 +1127,7 @@ def _build_limitation_checks(raw_checks, requirements: list[Limitation], whole_e
             quote=quote,
             quote_translation=re.sub(r"\s+", " ", str(item.get("quote_translation") or "")).strip(),
             evidence=evidence,
+            sample_tally=SampleTally.model_validate(item.get("sample_tally") or {}),
         ))
     return checks, missing_limitations(checks), omitted
 

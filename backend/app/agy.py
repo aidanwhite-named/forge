@@ -5,8 +5,10 @@ import signal
 import subprocess
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
-from .config import AGY_TIMEOUT_SECONDS, AGY_MAX_RETRIES, load_runtime_settings
+from .config import (AGY_TIMEOUT_SECONDS, AGY_MAX_RETRIES, MAX_CONCURRENT_CLI,
+                     load_runtime_settings)
 
 # Windows CreateProcess는 명령줄 전체를 32767자로 제한하고, 초과하면
 # WinError 206(FileNotFoundError)으로 실패합니다. 긴 프롬프트는 인자 대신
@@ -32,6 +34,11 @@ _cancel_events: dict[str, threading.Event] = {}
 # 붙들고 있으면 나중에 뜬 것이 앞의 것을 덮어써서, 취소했을 때 살아남은 프로세스가
 # 계속 돌고 사용자는 멈춘 줄 압니다. 작업당 전부 들고 있다가 함께 정리합니다.
 _active_processes: dict[str, set[subprocess.Popen]] = {}
+# 동시에 살아 있을 수 있는 CLI 프로세스 수. 단계마다 제 나름의 병렬도를 갖는데(구성대비 셀 ×
+# 표본, 의미검증 배치) 그 값들이 곱해진 만큼 프로세스가 뜨면 provider 한도에 걸립니다. 한도에
+# 걸린 호출은 실패해 재시도가 붙으므로 병렬화의 이득이 그대로 사라집니다. 마지막 관문을 여기
+# 한 곳에 두면 호출부는 자기 단계의 병렬도만 정하면 됩니다.
+_cli_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLI)
 
 
 def register_job(job_id: str) -> None:
@@ -86,6 +93,46 @@ def cancel_job(job_id: str) -> bool:
     return True
 
 
+def run_parallel(tasks: list, max_workers: int) -> list[tuple]:
+    """작업을 병렬로 돌리고 ``(결과, 예외)`` 쌍을 **제출 순서 그대로** 돌려줍니다.
+
+    이 함수가 따로 있는 이유는 병렬 실행 자체가 아니라 병렬 실행이 조용히 깨뜨리는 두 가지
+    때문입니다. 호출부마다 다시 구현하면 한 곳에서만 빠뜨려도 증상이 드물게 나타나 찾기
+    어렵습니다.
+
+    **작업 바인딩.** 풀의 워커 스레드는 부모의 job을 물려받지 않습니다. 매어 두지 않으면
+    취소 신호가 그 스레드에서 띄운 CLI 프로세스에 닿지 않아, 사용자가 멈춘 뒤에도 프로세스가
+    끝까지 돕니다(_compare_cells가 같은 이유로 bind_job을 부릅니다).
+
+    **순서.** 완료 순서로 모으면 같은 입력에서 실행마다 다른 산출물이 나옵니다. 구성대비
+    표본은 순서가 곧 표본 번호이고(compare.consensus가 "앞선 두 표본이 일치했는가"를 셉니다),
+    검증 노트는 순서가 곧 보고서의 줄 순서입니다.
+
+    예외는 올리지 않고 쌍에 담아 돌려줍니다. 실패를 다루는 방식이 호출부마다 다르기
+    때문입니다 — 표본 하나는 버리고 나머지로 다수결을 내지만, 배치 하나는 그 사실을 노트로
+    남겨야 합니다. 취소(AnalysisCancelled)도 담아 보내므로 호출부가 먼저 가려내야 합니다.
+    """
+    if not tasks:
+        return []
+    job_id = current_job()
+
+    def run(task):
+        if job_id:
+            bind_job(job_id)
+        try:
+            return task(), None
+        except Exception as exc:  # noqa: BLE001 - 종류는 호출부가 보고 정합니다.
+            # BaseException까지 잡으면 Ctrl-C가 결과 튜플에 담겨 조용히 삼켜집니다.
+            # 취소는 AnalysisCancelled(RuntimeError)이므로 Exception으로 충분합니다.
+            return None, exc
+
+    if len(tasks) == 1 or max_workers <= 1:
+        return [run(task) for task in tasks]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
+        # map은 완료 순서가 아니라 제출 순서로 돌려줍니다. as_completed를 쓰면 안 됩니다.
+        return list(pool.map(run, tasks))
+
+
 def _kill_process_tree(process: subprocess.Popen) -> None:
     """Kill the provider CLI and descendants without touching unrelated processes."""
     if process.poll() is not None:
@@ -129,21 +176,27 @@ def run_cli(prompt: str, expect: str = "claims") -> dict:
             raise_if_cancelled()
             process = None
             try:
-                process = subprocess.Popen(
-                    command, text=True, encoding="utf-8", errors="replace",
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    shell=False,
-                    stdin=subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
-                    cwd=sandbox,
-                    start_new_session=os.name != "nt",
-                )
-                job_id = current_job()
-                if job_id:
-                    with _job_lock:
-                        _active_processes.setdefault(job_id, set()).add(process)
-                raise_if_cancelled(job_id)
-                stdout, stderr = process.communicate(input=stdin_prompt, timeout=AGY_TIMEOUT_SECONDS)
-                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                # 자리를 **띄우기 전에** 받습니다. 프로세스를 먼저 만들고 나서 기다리면
+                # 상한은 아무것도 막지 못합니다. 응답 대기가 소요 시간의 거의 전부라
+                # 자리를 communicate가 끝날 때까지 쥐고 있어야 의미가 있습니다.
+                with _cli_slots:
+                    process = subprocess.Popen(
+                        command, text=True, encoding="utf-8", errors="replace",
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        shell=False,
+                        stdin=subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
+                        cwd=sandbox,
+                        start_new_session=os.name != "nt",
+                    )
+                    job_id = current_job()
+                    if job_id:
+                        with _job_lock:
+                            _active_processes.setdefault(job_id, set()).add(process)
+                    raise_if_cancelled(job_id)
+                    stdout, stderr = process.communicate(input=stdin_prompt,
+                                                         timeout=AGY_TIMEOUT_SECONDS)
+                    result = subprocess.CompletedProcess(command, process.returncode,
+                                                         stdout, stderr)
                 raise_if_cancelled(job_id)
             except subprocess.TimeoutExpired as exc:
                 if process is not None:
@@ -297,14 +350,26 @@ def available_models(settings: dict | None = None, refresh: bool = False) -> lis
 
 
 def _agy_models(executable: str) -> list[str]:
-    """agy가 지원하는 모델 목록. 조회에 실패하면 빈 목록으로 취급합니다."""
+    """agy가 지원하는 모델 목록. 조회에 실패하면 빈 목록으로 취급합니다.
+
+    출력은 "id<TAB>표시 이름" 한 줄씩이고 앞에 진행 메시지("Fetching available models...")가
+    붙습니다. 줄을 통째로 모델 이름으로 쓰면 화면 목록에서 하나를 고르는 순간 --model에
+    "id<TAB>표시 이름"이 그대로 실려 CLI가 통째로 거부합니다(invalid model selection).
+    그러면 분해·구성대비·의미검증이 전부 실패해 중요도는 기본값 3으로, 셀은 미판정으로
+    떨어지는데, 보고서 자체는 그대로 나오므로 사용자는 원인을 알기 어렵습니다.
+    """
     if executable not in _model_cache:
         try:
             # 서버가 콘솔 없이 실행되면 CLI가 stdin을 기다리다 멈추므로 반드시 닫아 준다.
             listing = subprocess.run([executable, "models"], text=True, encoding="utf-8", errors="replace",
                                      capture_output=True, timeout=30, check=False, shell=False,
                                      stdin=subprocess.DEVNULL)
-            _model_cache[executable] = [line.strip() for line in listing.stdout.splitlines() if line.strip()] if listing.returncode == 0 else []
+            lines = [line.strip() for line in listing.stdout.splitlines()
+                     if line.strip()] if listing.returncode == 0 else []
+            # 탭이 있는 줄만 모델 행입니다 — 진행 메시지는 이 조건에서 자연히 빠집니다.
+            # 탭이 하나도 없으면 목록 형식이 다른 것이므로 종전대로 줄 전체를 씁니다.
+            models = [line.split("\t", 1)[0].strip() for line in lines if "\t" in line]
+            _model_cache[executable] = models or lines
         except (subprocess.TimeoutExpired, OSError):
             _model_cache[executable] = []
     return _model_cache[executable]

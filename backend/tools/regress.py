@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 DEFAULT_CASES_DIR = ROOT / "cases"
 # 등급 서열은 앱과 같은 표를 씁니다. 하니스가 자기 사다리를 들면 같은 등급을 두 곳이
 # 다르게 읽습니다.
-from app.coverage import JUDGMENT_RANK           # noqa: E402
+from app.coverage import DIRECTNESS_RANK, JUDGMENT_RANK, VERIFY_RANK   # noqa: E402
 from app.report import to_markdown                # noqa: E402
 
 
@@ -71,9 +71,17 @@ def observe(result, kind: str = "forge", note: str = "", pinned: bool = False,
     유일한 신호이고, 뒤의 것은 판정이 흔들렸을 때 그 원인이 분해인지 비교인지를 가릅니다 —
     분해는 앱에서 매 실행 새로 만들어지므로 같은 사건에서도 달라질 수 있고, 그 차이 하나가
     인용발명 조합까지 뒤집습니다.
+
+    **구성 하나에 대해 결합 후 행과 문헌별 단독 셀을 함께 담습니다.** 보고서 행은 이미
+    결합이 끝난 결과라, 거기에만 기대값을 걸면 "주 인용발명 단독으로는 개시가 아닌데 보조
+    인용발명이 메워 준 것"과 "주 인용발명 단독으로 개시"가 같은 값으로 관측됩니다. 실측에서
+    정확히 그 형태의 과대판정이 나왔습니다 — 구성 E가 문헌 2 단독으로 실질적 동일을 받았고,
+    절대좌표계 한정을 실제로 댄 것은 문헌 1이었는데 보고서 행만 보면 구별되지 않습니다.
+    문헌별 셀을 함께 남기면 그 두 가지에 서로 다른 기대값을 걸 수 있습니다.
     """
     claims: dict[str, dict] = {}
     for report in result.reports:
+        coverage = {entry.label: entry for entry in report.chain.element_coverage}
         elements = {}
         for item in report.claims:
             elements[item.label] = {
@@ -82,14 +90,21 @@ def observe(result, kind: str = "forge", note: str = "", pinned: bool = False,
                 "disclosed": item.disclosed_limitations,
                 "total": item.total_limitations,
                 "document": item.adopted_document or "",
+                "cells": _cells(coverage.get(item.label)),
             }
         claims[str(report.claim_number)] = {
             "track": report.track,
             "primary": report.chain.primary or "",
             "secondaries": list(report.chain.secondaries),
             "residual": list(report.chain.residual),
+            "reserved": list(report.chain.reserved),
             "uncovered": list(report.chain.uncovered),
             "pending": list(report.chain.combination_pending),
+            # 신규성 게이트가 문헌별로 무엇을 빠뜨렸다고 보았는지. 셀 등급과 별개입니다 —
+            # 게이트는 등급 외에 직접성·검증·누락까지 함께 요구하므로, 등급이 같아도 이쪽이
+            # 갈릴 수 있고 그 차이가 곧 "이 문헌 하나로 신규성이 부정되는가"입니다.
+            "novelty_missing": {document_id: list(labels) for document_id, labels
+                                in (report.chain.novelty.missing_by_document or {}).items()},
             "elements": elements,
         }
     return {"kind": _kind(kind, pinned), "at": datetime.now(timezone.utc).isoformat(),
@@ -97,6 +112,39 @@ def observe(result, kind: str = "forge", note: str = "", pinned: bool = False,
             "invariants": [item for item in result.verify_notes if item.startswith("[불변식")],
             "decomposition": _decomposition_fingerprint(result, decomposition),
             "claims": claims}
+
+
+def _cells(coverage) -> dict[str, dict]:
+    """구성 1개에 대한 **문헌별 단독 셀** 판정. 결합 전의 값입니다.
+
+    ElementCoverage.candidates는 (구성 × 문헌) 전수를 담는 유일한 자리입니다. 채택되지
+    않은 문헌도 사유와 함께 남아 있어, 결합 결과 한 줄로는 볼 수 없는 두 가지를 여기서만
+    구별할 수 있습니다 — 어느 문헌이 그 구성을 실제로 개시했는가, 그리고 채택된 문헌이
+    빠뜨린 한정을 어느 문헌이 댔는가.
+
+    발췌나 사유 문언은 담지 않습니다. 표현이 조금 달라질 때마다 관측이 통째로 '변경'으로
+    찍히고, 문헌 원문이 관측 파일로 새어 나갑니다(observe와 같은 규율).
+    """
+    if coverage is None:
+        return {}
+    return {candidate.document_id: {
+        "judgment": candidate.judgment,
+        "directness": candidate.directness,
+        "verify": candidate.verify,
+        "missing": candidate.missing_count,
+        # 누락과 따로 남깁니다. 이 셀이 어떤 등급을 받았을 때 그것이 **검증된 개시** 위에
+        # 선 것인지 확인하지 못한 한정 위에 선 것인지가 여기서만 구별됩니다.
+        "unverified": candidate.unverified_count,
+        "adopted": candidate.adopted,
+        # 한정 문언 → 상태. 등급만 고정하면 검증기가 **문제의 그 한정은 계속 인정한 채**
+        # 다른 한정을 잘못 기각해도 등급이 내려가 회귀가 통과합니다. 오판을 자리째 고정하려면
+        # 한정 단위로 걸 수 있어야 합니다.
+        #
+        # 청구항 원문이 관측 파일에 들어가지만, cases/는 저장소 밖이고(.gitignore) 여기 실리는
+        # 것은 인용문헌 발췌가 아니라 **사용자 자신의 청구항 분해**입니다. 문헌 원문이 새어
+        # 나가지 않는다는 observe의 규율은 그대로입니다.
+        "limitations": dict(candidate.limitation_states),
+    } for candidate in coverage.candidates}
 
 
 def _decomposition_fingerprint(result, decomposition: dict | None = None) -> dict:
@@ -211,7 +259,7 @@ def score(observation: dict, expected: dict) -> list[dict]:
         #
         # 키가 있으면 값이 비어 있어도 채점합니다. `if wanted`로 걸러 내면 "_secondaries": []
         # 즉 "결합이 서면 안 된다"는 기대를 아예 적을 수 없습니다.
-        for key in ("track", "primary", "secondaries", "residual", "uncovered"):
+        for key in ("track", "primary", "secondaries", "residual", "reserved", "uncovered"):
             marker = f"_{key}"
             if marker not in elements:
                 continue
@@ -223,6 +271,34 @@ def score(observation: dict, expected: dict) -> list[dict]:
             else:
                 findings.append({"where": f"청구항 {number}", "ok": True,
                                  "reason": f"{key}={actual_value!r}"})
+        findings += _check_novelty(number, elements.get("_novelty_missing"),
+                                   observed_claim.get("novelty_missing"))
+    return findings
+
+
+def _check_novelty(number: str, wanted: dict | None, actual: dict | None) -> list[dict]:
+    """신규성 게이트의 문헌별 누락. **포함**을 봅니다.
+
+    등가로 걸면 무관한 구성 하나가 움직일 때마다 기대값을 고쳐야 하고, 그러면 정작 지키려던
+    한 줄("이 문헌 단독으로는 그 구성이 개시되지 않는다")이 잦은 수정에 묻힙니다.
+    """
+    if not wanted:
+        return []
+    where = f"청구항 {number} 신규성"
+    if actual is None:
+        return [{"where": where, "ok": False,
+                 "reason": "관측에 신규성 누락 기록이 없습니다 (관측을 다시 받으십시오)"}]
+    findings: list[dict] = []
+    for document_id, labels in sorted(wanted.items()):
+        observed = actual.get(document_id)
+        if observed is None:
+            findings.append({"where": f"{where} 문헌 {document_id}", "ok": False,
+                             "reason": "이 문헌의 기록이 없습니다"})
+            continue
+        absent = [label for label in labels if label not in observed]
+        findings.append({"where": f"{where} 문헌 {document_id}", "ok": not absent,
+                         "reason": (f"누락 목록에 {', '.join(absent)}이 없습니다 (관측 {observed})"
+                                    if absent else f"{', '.join(labels)} 포함")})
     return findings
 
 
@@ -246,9 +322,105 @@ def _check_element(where: str, spec: dict, actual: dict) -> list[dict]:
         if key in spec and actual[key] != spec[key]:
             findings.append({"where": where, "ok": False,
                              "reason": f"{key}={actual[key]!r}, 기대 {spec[key]!r}"})
+    findings += _check_cells(where, spec.get("cells") or {}, actual.get("cells"))
     if not findings:
         findings.append({"where": where, "ok": True, "reason": _brief(actual)})
     return findings
+
+
+def _check_cells(where: str, wanted: dict, actual: dict | None) -> list[dict]:
+    """문헌별 단독 셀 기대값. 결합 후 행과 **따로** 채점합니다.
+
+    구성 하나에 두 종류의 기대를 걸 수 있어야 합니다. "이 문헌 단독으로는 여기까지"와
+    "결합까지 마친 보고서 행은 여기까지"는 서로 다른 주장이고, 과대판정은 대개 앞의 것이
+    틀렸는데 뒤의 것이 맞아서 가려집니다.
+
+    관측에 cells가 없으면(옛 관측) 조용히 통과시키지 않고 불합격으로 적습니다. 기대값을
+    적어 두었는데 채점되지 않는 상태가 가장 위험합니다 — 하니스가 켜져 있다고 믿게 됩니다.
+    """
+    findings: list[dict] = []
+    for document_id, spec in sorted(wanted.items()):
+        label = f"{where} 문헌 {document_id} 단독"
+        if actual is None:
+            findings.append({"where": label, "ok": False,
+                             "reason": "관측에 문헌별 셀이 없습니다 (관측을 다시 받으십시오)"})
+            continue
+        cell = actual.get(document_id)
+        if cell is None:
+            findings.append({"where": label, "ok": False, "reason": "이 문헌의 셀이 관측에 없습니다"})
+            continue
+        rank = JUDGMENT_RANK.get(cell.get("judgment"), 0)
+        failed = False
+        if "min_grade" in spec and rank < JUDGMENT_RANK.get(spec["min_grade"], 0):
+            findings.append({"where": label, "ok": False,
+                             "reason": f"{cell.get('judgment')} < 최소 {spec['min_grade']}"})
+            failed = True
+        if "max_grade" in spec and rank > JUDGMENT_RANK.get(spec["max_grade"], 5):
+            findings.append({"where": label, "ok": False,
+                             "reason": f"{cell.get('judgment')} > 최대 {spec['max_grade']}"})
+            failed = True
+        for key in ("missing", "unverified", "adopted", "directness", "verify"):
+            if key in spec and cell.get(key) != spec[key]:
+                findings.append({"where": label, "ok": False,
+                                 "reason": f"{key}={cell.get(key)!r}, 기대 {spec[key]!r}"})
+                failed = True
+        for entry in _check_limitations(label, spec, cell):
+            failed = failed or not entry["ok"]
+            findings.append(entry)
+        if not failed:
+            findings.append({"where": label, "ok": True, "reason": _brief_cell(cell)})
+    return findings
+
+
+# 한정 단위 기대값. 값은 상태 이름이 아니라 **문언의 일부**입니다.
+#
+# 인덱스로 걸면 분해가 한 번 흔들릴 때 전부 어긋나고, 문언 전체로 걸면 표현이 한 글자만
+# 달라져도 어긋납니다. 판정을 가르는 것은 대개 한정 안의 특정 어구 하나(여기서는
+# '절대좌표계')이므로, 그 어구가 살아 있는 한 안정적으로 걸립니다.
+_LIMITATION_RULES = {
+    # 이 어구를 담은 한정은 그 문헌에서 **기각**되어야 합니다(개시도 미완료도 아님).
+    "must_reject_contains": ("missing",),
+    # 이 어구를 담은 한정은 **확정 개시**여야 합니다. 미완료는 통과가 아닙니다.
+    "must_disclose_contains": ("disclosed",),
+}
+
+
+def _check_limitations(where: str, spec: dict, cell: dict) -> list[dict]:
+    """한정 단위 기대값 채점.
+
+    어구가 **어느 한정에도 없으면 불합격**입니다. 분해가 그 어구를 잃었다면 이 기대값은
+    더 이상 아무것도 지키지 못하는데, 조용히 통과시키면 하니스가 켜져 있다고 믿게 됩니다.
+    """
+    findings: list[dict] = []
+    states = cell.get("limitations")
+    for key, allowed in _LIMITATION_RULES.items():
+        phrases = spec.get(key) or []
+        if not phrases:
+            continue
+        if states is None:
+            findings.append({"where": where, "ok": False,
+                             "reason": f"{key}: 관측에 한정별 상태가 없습니다 (관측을 다시 받으십시오)"})
+            continue
+        for phrase in phrases:
+            matched = {text: state for text, state in states.items() if phrase in text}
+            if not matched:
+                findings.append({"where": where, "ok": False,
+                                 "reason": f"{key}: '{phrase}'를 담은 한정이 분해에 없습니다"})
+                continue
+            offending = {text: state for text, state in matched.items() if state not in allowed}
+            if offending:
+                detail = "; ".join(f"{_clip_text(text)}={state}"
+                                   for text, state in sorted(offending.items()))
+                findings.append({"where": where, "ok": False,
+                                 "reason": f"{key} '{phrase}': {detail} (기대 {'/'.join(allowed)})"})
+            else:
+                findings.append({"where": where, "ok": True,
+                                 "reason": f"{key} '{phrase}': {len(matched)}건 모두 {'/'.join(allowed)}"})
+    return findings
+
+
+def _clip_text(text: str, limit: int = 40) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def normalize(element: dict | None) -> dict | None:
@@ -266,11 +438,15 @@ def normalize(element: dict | None) -> dict | None:
     disclosed = element.get("disclosed")
     if disclosed is None:
         disclosed = element.get("disclosed_median")
+    # cells는 문헌별 단독 셀입니다. 옛 관측에는 아예 없으므로 None으로 두어 "기록이 없다"와
+    # "셀이 하나도 없다"를 구별합니다 — 빈 dict로 채우면 옛 관측이 전부 "문헌별 판정이
+    # 사라졌다"로 대조되고, 기대값 채점도 조용히 통과합니다.
     return {"judgment": element.get("judgment"),
             "corresponded": element.get("corresponded"),
             "disclosed": disclosed,
             "total": element.get("total"),
-            "document": element.get("document")}
+            "document": element.get("document"),
+            "cells": element.get("cells")}
 
 
 _COMPARED_FIELDS = ("judgment", "corresponded", "disclosed", "total", "document")
@@ -292,7 +468,7 @@ def diff(before: dict, after: dict) -> list[str]:
     for number in numbers:
         old_claim = before.get("claims", {}).get(number, {})
         new_claim = after.get("claims", {}).get(number, {})
-        for key in ("track", "primary", "secondaries", "residual", "uncovered"):
+        for key in ("track", "primary", "secondaries", "residual", "reserved", "uncovered"):
             old_value, new_value = old_claim.get(key), new_claim.get(key)
             # 옛 관측에는 residual·uncovered가 없습니다. 없는 것을 변화로 세지 않습니다.
             if old_value is not None and new_value is not None and old_value != new_value:
@@ -303,6 +479,28 @@ def diff(before: dict, after: dict) -> list[str]:
             new = normalize(new_claim.get("elements", {}).get(label))
             if _element_changed(old, new):
                 lines.append(f"  청구항 {number} ({label}): {_brief(old)} → {_brief(new)}")
+            lines += _cell_diff(f"청구항 {number} ({label})", old, new)
+    return lines
+
+
+def _cell_diff(where: str, old: dict | None, new: dict | None) -> list[str]:
+    """문헌별 단독 셀의 변화. 결합 후 행이 그대로여도 그 아래가 뒤집힐 수 있습니다.
+
+    보조 인용발명이 메워 주던 한정을 주 인용발명이 직접 개시하게 되면(또는 그 반대로 바뀌면)
+    보고서 행은 한 글자도 달라지지 않습니다. 결합의 근거가 통째로 바뀐 것이므로 회귀로
+    읽어야 하는데, 행만 대조하면 보이지 않습니다.
+    """
+    old_cells = (old or {}).get("cells")
+    new_cells = (new or {}).get("cells")
+    # 옛 관측에는 cells가 없습니다. 없는 것을 변화로 세지 않습니다(normalize 참조).
+    if old_cells is None or new_cells is None:
+        return []
+    lines: list[str] = []
+    for document_id in sorted(set(old_cells) | set(new_cells)):
+        before, after = old_cells.get(document_id), new_cells.get(document_id)
+        if before != after:
+            lines.append(f"  {where} 문헌 {document_id} 단독: "
+                         f"{_brief_cell(before)} → {_brief_cell(after)}")
     return lines
 
 
@@ -313,6 +511,19 @@ def _brief(element: dict | None) -> str:
               if element["disclosed"] is not None and element["total"] is not None else "")
     document = f" doc{element['document']}" if element["document"] else ""
     return f"{element['judgment'] or '?'}{counts}{document}"
+
+
+def _brief_cell(cell: dict | None) -> str:
+    if not cell:
+        return "(없음)"
+    parts = [str(cell.get("judgment") or "?")]
+    if cell.get("missing"):
+        parts.append(f"누락{cell['missing']}")
+    if cell.get("directness") and cell["directness"] != "direct":
+        parts.append(str(cell["directness"]))
+    if cell.get("adopted"):
+        parts.append("채택")
+    return " ".join(parts)
 
 
 # --- 실행 ---------------------------------------------------------------------
@@ -484,11 +695,12 @@ def aggregate(observations: list[dict]) -> dict:
                 "corresponded": corresponded, "spread": dict(spread),
                 "disclosed_median": median(item["disclosed"] for item in seen),
                 "total": totals.most_common(1)[0][0], "total_spread": dict(totals),
+                "cells": _aggregate_cells(seen, runs),
             }
         tracks = Counter(claim["track"] for claim in present)
         primaries = Counter(claim["primary"] for claim in present)
         list_votes = {key: Counter(tuple(claim.get(key) or []) for claim in present)
-                      for key in ("secondaries", "residual", "uncovered")}
+                      for key in ("secondaries", "residual", "reserved", "uncovered")}
         claims[number] = {
             "runs": runs, "observed_runs": len(present),
             "track": tracks.most_common(1)[0][0], "track_spread": dict(tracks),
@@ -509,6 +721,87 @@ def aggregate(observations: list[dict]) -> dict:
     if violations is not None:
         merged["invariants"] = violations
     return merged
+
+
+def _aggregate_cells(seen: list[dict], runs: int) -> dict | None:
+    """회차별 문헌별 셀을 하나로 합칩니다. 대표값 규칙은 구성 등급과 같습니다.
+
+    최빈 판정을 대표로 삼되 **동률이면 낮은 등급**을 씁니다(aggregate 참조). 문헌별 셀에서
+    특히 중요한 이유가 있습니다 — 결합은 셀 하나가 한 등급 흔들리면 채택 문헌 자체가
+    바뀌므로, 여기서 높은 쪽을 대표로 잡으면 실제로는 회차마다 갈리는 조합이 안정된
+    것처럼 보입니다.
+
+    한 회차라도 기록이 없으면 None입니다. 없는 것을 빈 목록으로 적으면 옛 관측과 새 관측이
+    구별되지 않습니다(_merged_invariants와 같은 규율).
+    """
+    from collections import Counter
+    from statistics import median
+
+    if any(item.get("cells") is None for item in seen):
+        return None
+    merged: dict[str, dict] = {}
+    for document_id in sorted({key for item in seen for key in item["cells"]}):
+        cells = [item["cells"][document_id] for item in seen if document_id in item["cells"]]
+        spread = Counter(cell.get("judgment") for cell in cells)
+        top = max(spread.values())
+        judgment = min((name for name, count in spread.items() if count == top),
+                       key=lambda name: JUDGMENT_RANK.get(name, 0))
+        merged[document_id] = {
+            "judgment": judgment,
+            "hits": spread[judgment], "runs": runs,
+            "stability": f"{spread[judgment]}/{runs}",
+            "spread": dict(spread),
+            "missing": median(cell.get("missing") or 0 for cell in cells),
+            # 미완료 수는 반드시 이월합니다. 버리면 --runs 2 이상에서 unverified 기대값이
+            # 채점되지 않는데, 채점되지 않는 기대값은 하니스가 켜져 있다는 착각만 만듭니다.
+            "unverified": median(cell.get("unverified") or 0 for cell in cells),
+            # 직접성·검증 상태도 최빈값으로 남깁니다. 등급이 같아도 이 둘이 흔들리면 보조
+            # 인용발명 자격(coverage.ineligible_reason)이 회차마다 갈립니다.
+            "directness": _majority((cell.get("directness") for cell in cells),
+                                    DIRECTNESS_RANK),
+            "verify": _majority((cell.get("verify") for cell in cells), VERIFY_RANK),
+            # 채택은 과반일 때만 참으로 봅니다. 한 회차만 채택된 문헌을 채택으로 적으면
+            # 결합이 흔들렸다는 사실이 대표값에서 사라집니다.
+            "adopted": sum(1 for cell in cells if cell.get("adopted")) * 2 > len(cells),
+            "limitations": _aggregate_limitations(cells),
+        }
+    return merged
+
+
+# 회차마다 상태가 갈린 한정. must_reject_contains와 must_disclose_contains **어느 쪽도**
+# 만족하지 않는 값이라, 불안정이 어느 방향으로도 통과로 읽히지 않습니다.
+#
+# 다수결이나 보수적 대표값을 쓸 수 없습니다. 낮은 상태를 대표로 잡으면 must_reject가 거짓
+# 통과하고, 높은 상태를 잡으면 must_disclose가 거짓 통과합니다 — 규칙마다 안전한 방향이
+# 반대라 하나의 대표값으로는 둘 다 지킬 수 없습니다.
+UNSTABLE_STATE = "unstable"
+
+
+def _aggregate_limitations(cells: list[dict]) -> dict | None:
+    if any(cell.get("limitations") is None for cell in cells):
+        return None
+    merged: dict[str, str] = {}
+    for text in {key for cell in cells for key in cell["limitations"]}:
+        seen = {cell["limitations"].get(text) for cell in cells}
+        merged[text] = seen.pop() if len(seen) == 1 else UNSTABLE_STATE
+    return merged
+
+
+def _majority(values, rank: dict[str, int]) -> str | None:
+    """최빈값. **동률이면 보수적인 쪽**을 씁니다.
+
+    사전순으로 정하면 direct/inferred가 1:1일 때 낙관적인 direct가 뽑힙니다. 등급 집계가
+    동률에서 낮은 등급을 쓰는 것과 같은 이유로(aggregate), 회차마다 갈리는 값을 좋은 쪽으로
+    대표하면 불안정이 안정으로 보입니다. 순위표를 받아 낮은 값을 씁니다.
+    """
+    from collections import Counter
+
+    counted = Counter(value for value in values if value is not None)
+    if not counted:
+        return None
+    top = max(counted.values())
+    return min((name for name, count in counted.items() if count == top),
+               key=lambda name: (rank.get(name, 0), name))
 
 
 def _merged_invariants(observations: list[dict]) -> list[str] | None:
@@ -663,10 +956,21 @@ def _report(case: dict, observation: dict, previous: dict | None) -> bool:
               for key in ("track", "primary", "secondaries", "residual", "uncovered")
               if len(claim.get(f"{key}_spread") or {}) > 1]
     drift = (observation.get("decomposition_spread") or {}).get("unstable") or {}
-    if unstable or swings or drift:
+    # 결합 후 행이 안정적이어도 그 아래 문헌별 셀은 갈릴 수 있습니다. 채택 문헌이 회차마다
+    # 바뀌는데 등급만 같은 경우가 그렇고, 결합 근거가 통째로 달라진 것이므로 함께 냅니다.
+    unstable_cells = [(number, label, document_id, cell)
+                      for number, claim in observation.get("claims", {}).items()
+                      for label, element in claim.get("elements", {}).items()
+                      for document_id, cell in (element.get("cells") or {}).items()
+                      if isinstance(cell, dict) and cell.get("runs", 1) > 1
+                      and cell.get("hits") != cell.get("runs")]
+    if unstable or swings or drift or unstable_cells:
         print("  [안정성] 회차마다 갈린 항목 — 이 값들의 변화를 회귀로 읽으면 안 됩니다")
         for number, label, element in unstable:
             print(f"    청구항 {number} ({label}): {element['stability']} {element['spread']}")
+        for number, label, document_id, cell in unstable_cells:
+            print(f"    청구항 {number} ({label}) 문헌 {document_id} 단독: "
+                  f"{cell['stability']} {cell['spread']}")
         for number, key, spread in swings:
             print(f"    청구항 {number} {key}: {spread}")
         if drift:

@@ -150,3 +150,28 @@ def test_cli_runs_in_a_throwaway_directory_not_the_repository(monkeypatch):
     cwd = captured["cwd"]
     assert cwd and "forge-cli-" in cwd
     assert "Forge" not in cwd.replace("forge-cli-", "")
+
+
+def test_the_model_listing_keeps_only_the_identifier(monkeypatch):
+    """`agy models`는 "id<TAB>표시 이름"을 출력한다. 줄째로 쓰면 --model이 통째로 거부된다.
+
+    화면 목록에서 모델을 고른 순간 모든 CLI 호출이 실패해 중요도는 기본값 3으로, 셀은
+    미판정으로 떨어지는데 보고서는 그대로 나오므로 원인을 알기 어렵다.
+    """
+    listing = ("Fetching available models...\n"
+               "gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)\n"
+               "claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n")
+    monkeypatch.setattr(agy, "_model_cache", {})
+    monkeypatch.setattr(agy.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": listing})())
+
+    assert agy._agy_models("agy.exe") == ["gemini-3.7-flash-medium", "claude-opus-4-6-thinking"]
+
+
+def test_a_listing_without_tabs_is_used_as_is(monkeypatch):
+    """탭이 없는 출력 형식에서는 줄 전체가 모델 이름이다. 그 경우까지 잘라내면 목록이 빈다."""
+    monkeypatch.setattr(agy, "_model_cache", {})
+    monkeypatch.setattr(agy.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "gemini-3.6-flash-medium\n"})())
+
+    assert agy._agy_models("agy.exe") == ["gemini-3.6-flash-medium"]

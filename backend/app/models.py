@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # 판정 어휘. 이 6개 라벨 외에는 파이프라인 어디에서도 쓰지 않습니다.
 Judgment = Literal["동일", "실질적 동일", "일부 차이", "일부 유사", "차이", "대응 없음"]
@@ -89,10 +89,43 @@ class ClaimElement(BaseModel):
         return [{"text": item, "kind": "core"} if isinstance(item, str) else item for item in value]
 
 
+ReferenceQuality = Literal["direct", "confirmed_alias", "fuzzy", "ambiguous"]
+
+
+class ReferenceAlias(BaseModel):
+    """청구항이 같은 대상을 다르게 적은 자리를, **사람이** 같은 것으로 확정한 기록.
+
+    문언이 어긋난 참조를 도구가 자동으로 이어서는 안 됩니다. 실측의 "가시 두상 영역" ↔ "가시
+    두상 영상"은 동의어가 아니라 오기일 가능성이 높고, 모델에게 "같은 대상이냐"고 물으면 문맥상
+    거의 언제나 "그렇다"고 답합니다. 그 답을 받아 이으면 도구가 청구항의 기재 문제를 대신
+    덮어 주는 것이지 해소가 아닙니다 — 출원 중이면 고쳐야 할 기재불비이고, 등록된 권리라면
+    해석의 다툼거리입니다. 어느 쪽이든 사람이 판단할 자리입니다.
+
+    그래서 확정은 **분해 확정과 같은 관문**에서 받습니다. 별도 화면을 두면 "무엇을 확정했는지"가
+    두 군데로 갈리고, 그렇게 갈린 상태가 이 파이프라인이 되풀이해 겪은 실패 형태입니다.
+    """
+    target: str                               # "상기 …"를 적은 구성. 이 연결을 쓰는 쪽입니다
+    term: str                                 # 뒤 구성이 적은 지시 어구
+    # 해소기가 찾은 도입 후보 **전부**. 하나면 문언이 어긋난 참조이고, 둘 이상이면 어느 것을
+    # 가리키는지 문언만으로 정할 수 없는 자리입니다. 후보를 버리면 사용자가 고를 것이 사라져
+    # 애매한 참조가 "확정하거나 버리거나" 둘 중 하나로 눌립니다.
+    candidates: list[str] = []
+    # 사용자가 고른 도입 구성. 반드시 candidates 안에 있어야 합니다(claims.validate_aliases).
+    selected_source: str = ""
+    confirmed: bool = False                   # 사람이 확정했는지. 거짓이면 판정에 쓰지 않습니다
+
+    @property
+    def settled(self) -> bool:
+        """판정에 반영해도 되는 상태인지. 확정 표시와 고른 후보가 **둘 다** 있어야 합니다."""
+        return self.confirmed and self.selected_source in self.candidates
+
+
 class Claim(BaseModel):
     number: int
     preamble: str = ""                        # "…에 있어서" 앞 전제부
     elements: list[ClaimElement] = []
+    # 문언이 어긋난 참조를 사람이 확정한 목록. 분해 확정과 같은 관문에서 받습니다.
+    aliases: list[ReferenceAlias] = []
     depends_on: int | None = None             # 종속항이 참조하는 부모 청구항 번호
     raw: str = ""
 
@@ -104,6 +137,128 @@ class EvidenceSpan(BaseModel):
     verify: VerifyStatus = "empty"
     # PDF 텍스트와의 정렬 품질입니다. 의미상 직접성(directness)과 분리해 기록합니다.
     alignment: EvidenceAlignment = "unverified"
+
+
+class Reference(BaseModel):
+    """청구항의 "상기 …" 하나가 가리키는 앞 구성과, **그 연결이 얼마나 확실한지**.
+
+    지시 관계는 문언에서 읽어 내는데 청구항의 문언은 흔들립니다. 실측에서 (E)가 세운 "가시
+    두상 영역"을 (G)가 "가시 두상 영상"으로 받아 적었고, 어구 전체를 맞춰야 하는 방식에서는
+    그 참조가 없는 것이 됐습니다. 공통 부분으로 이으면 그 참조는 살아나지만, 이번에는 아래처럼
+    **엉뚱한 구성에 붙는** 연결이 생깁니다.
+
+        (A) 가시 두상 영역을 추출함
+        (B) 가시 두상 색상을 산출함
+        (C) 상기 가시 두상 영상을 처리함     ← "가시 두상"만으로는 A인지 B인지 모릅니다
+
+    둘 다 지우지 않고 **갈라 둡니다.** 확인된 연결(direct)만 등급 상한의 근거가 되고, 추측
+    (fuzzy·ambiguous)은 보고서에 남되 판정을 건드리지 않습니다. 참조를 놓치면 상한이 안 걸릴
+    뿐이지만, 잘못 이으면 맞게 개시된 구성이 근거 없이 강등됩니다 — 방향이 더 나쁩니다.
+    """
+    term: str                                 # 지시 어구. 청구항 문언 그대로
+    source: str                               # 그 어구를 도입한 구성 라벨
+    quality: ReferenceQuality = "direct"
+    # 그 어구를 도입한 구성이 여럿이면 전부. quality가 ambiguous인 연결의 후보들입니다.
+    candidates: list[str] = []
+
+    @property
+    def confirmed(self) -> bool:
+        """판정을 건드려도 되는 연결인지. 추측은 보고만 하고 등급은 건드리지 않습니다.
+
+        문언이 그대로 이어진 연결(direct)과 **사람이 확정한** 별칭(confirmed_alias)만입니다.
+        모델이 "같은 대상 같다"고 한 것은 여기 들어오지 않습니다(models.ReferenceAlias).
+        """
+        return self.quality in ("direct", "confirmed_alias")
+
+
+class SemanticEvent(BaseModel):
+    """검증 단계가 이 한정의 판정을 건드린 기록 한 건. **덮어쓰지 않고 쌓습니다.**
+
+    semantic_status는 단일 필드라 마지막 단계만 남습니다. 실측에서 한정 하나가 의미검증에서
+    기각된 뒤 결합검증에서 다시 기각됐는데, 기록에는 뒤엣것만 남아 앞선 기각이 사라졌습니다.
+    그러면 "결합 위에서 한 번 봤다"와 "문헌 단독으로 보고 결합 위에서 또 봤다"가 구별되지
+    않습니다 — 뒤엣것이 훨씬 강한 판정인데 보고서에서는 같은 무게로 읽힙니다.
+
+    상태(현재 값)와 경위(어떻게 왔는가)는 다른 질문이므로 자리를 따로 둡니다. semantic_status는
+    그대로 종단 상태로 남고, 이 목록이 그 상태에 이른 경로입니다.
+    """
+    stage: Literal["의미검증", "결합검증"]
+    outcome: Literal["인정", "기각"]
+    note: str = ""
+    # 결합검증이 인정한 경우 빠진 축을 실제로 댄 인용발명.
+    supplied_by: list[str] = []
+
+
+# 표본 하나가 이 한정에 대해 낸 답. disclosed/missing 밖의 두 상태를 따로 둡니다 —
+# **답하지 않은 것**(absent)과 **답했으나 읽을 수 없는 것**(invalid)은 서로 다르고, 둘 다
+# "미개시"가 아닙니다. 셋을 한 칸에 넣으면 응답 결손이 문헌에 대한 사실 주장으로 바뀝니다.
+SampleVerdict = Literal["disclosed", "missing", "absent", "invalid"]
+
+
+class SampleVote(BaseModel):
+    sample: int
+    verdict: SampleVerdict
+
+
+class SampleTally(BaseModel):
+    """이 한정에 대한 **표본별 원시 답**. 집계는 저장하지 않고 여기서 유도합니다.
+
+    _merge_votes가 다수결로 합치면서 개별 표본의 답을 버렸습니다. 남는 것은 "한정 3개 중
+    1개만 만장일치"라는 구성 단위 비율 하나뿐이라, 정작 필요한 "이 한정이 2대 1로 갈렸는가,
+    3대 0으로 일치했는가"를 말할 수 없었습니다. 그 차이가 **표본마다 갈린 불안정한 미대응**과
+    **전 표본이 일관된 확정적 공백**을 가릅니다.
+
+    집계를 필드로 두지 않는 이유는 원시 투표와 갈릴 수 있기 때문입니다. 유도해 쓰면 갈릴
+    자리가 없습니다. total은 물어본 표본 수이고 votes는 그 전부이므로 둘은 항상 같습니다
+    (report._sample_tallies_add_up).
+
+    **레거시 기록은 지어내지 않습니다.** 원시 투표를 남기기 전에 저장된 셀은 votes가 비고
+    available이 거짓입니다 — 비율에서 되짚어 만들면 있지도 않았던 표본 답이 기록에 생깁니다.
+    """
+    total: int = 0
+    votes: list[SampleVote] = []
+
+    @property
+    def available(self) -> bool:
+        """표본 기록이 남아 있는지. 거짓이면 이 셀은 원시 투표를 남기기 전에 판정된 것입니다."""
+        return self.total > 0 and bool(self.votes)
+
+    def count(self, verdict: SampleVerdict) -> int:
+        return sum(1 for vote in self.votes if vote.verdict == verdict)
+
+    @property
+    def disclosed(self) -> int:
+        return self.count("disclosed")
+
+    @property
+    def missing(self) -> int:
+        return self.count("missing")
+
+    @property
+    def split(self) -> bool:
+        """표본이 갈렸는지. 실제로 답한 것들끼리 의견이 나뉘면 참입니다."""
+        return self.disclosed > 0 and self.missing > 0
+
+    @property
+    def incomplete(self) -> bool:
+        """쓸 만한 답을 내지 못한 표본이 있는지(무응답·판독불가).
+
+        표본이 **갈린 것**과 표본이 **답하지 못한 것**은 다릅니다. 앞은 같은 근거를 두고 판단이
+        나뉜 것이라 사람이 원문을 봐야 하고, 뒤는 도구가 답을 받지 못한 것이라 다시 물으면
+        됩니다. 한 낱말로 뭉뚱그리면 후속 조치가 갈리지 않습니다.
+        """
+        return self.count("absent") > 0 or self.count("invalid") > 0
+
+    @property
+    def unanimous(self) -> bool:
+        """전 표본이 같은 답을 냈고 그 답이 쓸 만한지.
+
+        보고서가 이 값으로 적을 것과 적지 않을 것을 가릅니다. **개시·미개시의 대립만 보면
+        안 됩니다** — 세 표본 중 하나만 답하고 둘은 무응답·판독불가인 한정은 서로 갈린 것은
+        아니지만 만장일치도 아니고, 오히려 그쪽이 더 확인이 필요한 자리입니다.
+        """
+        verdicts = {vote.verdict for vote in self.votes}
+        return self.available and len(verdicts) == 1 and verdicts <= {"disclosed", "missing"}
 
 
 class LimitationCheck(BaseModel):
@@ -128,9 +283,28 @@ class LimitationCheck(BaseModel):
     semantic_status: SemanticStatus = "not_run"
     semantic_relation: SemanticRelation = "unsupported"
     semantic_note: str = ""
+    # 이 한정을 건드린 검증 단계의 **전체** 기록. semantic_status가 종단 상태만 남기는 것과
+    # 달리 덮어쓰지 않고 쌓으므로, 한 한정이 두 단계에 걸쳐 판정된 경우가 그대로 남습니다.
+    semantic_events: list[SemanticEvent] = []
+    # 이 한정에 대한 표본별 원시 답. 관측 전용이며 판정에 쓰지 않습니다.
+    sample_tally: SampleTally = SampleTally()
     # 결합 심사에서 이 한정의 빠진 축을 실제로 댄 인용발명. accepted_in_combination일 때만
     # 채워지며, 보고서가 "어느 문헌이 무엇을 댔는지"를 지어내지 않고 적을 수 있게 합니다.
     combination_documents: list[str] = []
+
+    def record(self, event: SemanticEvent) -> None:
+        """검증 이벤트를 쌓습니다. 같은 판정이 두 번 적용되어도 한 번만 남습니다.
+
+        지금 파이프라인은 한 실행에서 각 단계를 한 번씩만 돌리지만, 그것은 호출부의 성질이지
+        이 자료구조의 성질이 아닙니다. 쌓기만 하는 목록은 재적용에 취약하고, 중복이 들어가면
+        보고서가 "두 번 기각됐다"고 적습니다 — 없는 심사를 지어내는 방향의 오류입니다.
+
+        멱등을 여기서 보장해 두면 호출부가 늘어나도 그 성질이 유지됩니다. 단계나 사유가 다른
+        이벤트는 다른 판정이므로 그대로 쌓입니다.
+        """
+        if self.semantic_events and self.semantic_events[-1] == event:
+            return
+        self.semantic_events.append(event)
 
 
 def missing_limitations(checks: list[LimitationCheck]) -> list[str]:
@@ -212,6 +386,11 @@ class ElementMatch(BaseModel):
     # 데이터로 답할 수 있게 합니다.
     sample_count: int = 0                     # 이 셀을 합친 표본 수(0=합의 경로를 타지 않음)
     sample_agreement: float = 0.0             # 전 표본이 같은 disclosed를 낸 한정의 비율(0~1)
+    # 그 비율의 분자·분모. 비율만으로는 보고서에 사실대로 적을 수 없습니다 — 0.33이 "세 표본이
+    # 전부 갈렸다"인지 "한정 3개 중 1개만 만장일치였다"인지가 값에서 읽히지 않아, 실제로 두
+    # 사람이 같은 숫자를 정반대로 읽었습니다. 분자·분모를 그대로 실으면 그 오독이 불가능합니다.
+    sample_unanimous: int = 0                 # 전 표본이 일치한 한정 수
+    sample_requirements: int = 0              # 표본 일치를 물은 한정 수(비율의 분모)
     # 앞선 두 표본이 **모든** 한정에서 일치한 셀. 그때는 세 번째 표본이 다수결을 바꿀 수 없어
     # (2표가 이미 과반) 조기 종료 후보가 됩니다. 다만 세 번째 표본은 대표 발췌·근거 묶음을
     # 바꿀 수 있으므로 이 값이 참이라고 결과가 동일하다는 뜻은 아닙니다 — 절감 상한일 뿐입니다.
@@ -219,6 +398,28 @@ class ElementMatch(BaseModel):
     # 판정을 **받지 못한** 셀. "대응 없음"(받아본 결과 대응이 없었다)과 반드시 구분합니다.
     # 이 값이 차 있으면 그 청구항은 법적 결론을 만들지 않습니다.
     error: str = ""
+
+    @model_validator(mode="after")
+    def _backfill_sample_counts(self) -> "ElementMatch":
+        """분자·분모가 없는 옛 기록을 비율에서 되짚습니다.
+
+        캐시 세대는 **프롬프트 문면**에서 나오므로(cache.compare_generation) 모델에 필드를
+        더해도 키가 갈리지 않습니다. 옛 캐시 항목은 그대로 로드되고 새 필드만 0으로 남습니다.
+        그러면 캐시 히트한 셀에서만 "표본이 갈렸다"는 표시가 조용히 사라져, 보고서가 셀마다
+        다른 말을 하게 됩니다 — 같은 불안정성이 새로 판정한 셀에서는 보이고 캐시에서 온 셀에서는
+        안 보이는 상태가 가장 나쁩니다.
+
+        세대를 올려 캐시를 통째로 버리는 선택지도 있지만, 관측용 필드 하나 때문에 (구성 ×
+        문헌) 판정을 전량 다시 사는 것은 값이 맞지 않습니다. 비율과 한정 수가 남아 있으므로
+        분자·분모는 손실 없이 복원됩니다.
+
+        새 기록은 _merge_votes가 두 값을 함께 쓰므로 이 경로를 타지 않습니다. 한정이 하나도
+        없는 셀은 비율 자체가 정의되지 않으므로 건드리지 않습니다.
+        """
+        if self.sample_count > 0 and not self.sample_requirements and self.limitation_checks:
+            self.sample_requirements = len(self.limitation_checks)
+            self.sample_unanimous = round(self.sample_agreement * self.sample_requirements)
+        return self
 
 
 class DocumentScore(BaseModel):
@@ -242,6 +443,15 @@ class SupplementCandidate(BaseModel):
     verify: str = "empty"
     has_quote: bool = False
     missing_count: int = 0
+    # 의미검증을 받지 못한 한정 수. 누락 수와 따로 둡니다 — 이 행은 (구성 × 문헌) 전수라,
+    # 회귀 하니스가 "문헌 단독 셀이 무엇에 근거해 그 등급을 받았는가"를 읽는 유일한 자리입니다.
+    unverified_count: int = 0
+    # 한정 문언 → 상태(disclosed / unverified / missing).
+    #
+    # 개수만으로는 **어느** 한정이 걸렸는지 알 수 없어, 등급만 고정하는 회귀는 오판을 놓칩니다.
+    # 검증기가 문제의 한정은 계속 인정하면서 엉뚱한 한정을 기각해도 등급은 똑같이 내려가고,
+    # 그러면 기대값이 통과합니다. 한정 단위로 기대를 걸 수 있어야 그 자리를 고정합니다.
+    limitation_states: dict[str, str] = {}
     gain: float = 0.0                         # 주 인용발명 대비 보완 이득
     merged_gain: float = 0.0                  # **채택 조합** 대비 증분 이득. 0이면 중복 후보
     better_than_primary: bool = False
@@ -255,6 +465,8 @@ class SupplementCandidate(BaseModel):
     # 셀 단위 일치율을 감사 데이터에서 집계할 수 있는 유일한 자리입니다.
     sample_count: int = 0
     sample_agreement: float = 0.0
+    sample_unanimous: int = 0
+    sample_requirements: int = 0
     sample_early_exit: bool = False
 
 
@@ -283,6 +495,10 @@ class ChainInfo(BaseModel):
     track: Literal["novelty_single", "inventive_step_combination", "rejection_impossible",
                    "analysis_incomplete"] = "rejection_impossible"
     incomplete_reasons: list[str] = []        # 판정을 받지 못한 (구성, 문헌) 셀의 사유
+    # 확인된 개시가 하나도 없이 미검증만 남아 판정을 유보한 구성. residual과 **따로** 둡니다 —
+    # 차이는 대비해 본 결과이고 유보는 대비 자체를 못 한 것이라, 후속 조치가 다릅니다
+    # (앞은 보완 문헌 검색, 뒤는 원문 확인과 재실행).
+    reserved: list[str] = []
     preamble_undisclosed: list[str] = []      # 대응이 확인되지 않은 전제부 라벨(한정 여부는 미판단)
     primary: str | None = None                # document_id
     secondaries: list[str] = []
@@ -392,6 +608,14 @@ class Evidence(BaseModel):
     # 판단을 감추지 않고 함께 내보내야 심사관이 그 다리를 다툴 수 있습니다.
     semantic_relation: str = ""
     semantic_note: str = ""
+    # 이 발췌를 낸 한정의 의미검증이 **수행되지 못한** 경우(응답 결손). 개시 판정은 그대로
+    # 두고 사실만 표시합니다.
+    #
+    # 표시가 없으면 보고서의 신호가 뒤집힙니다. 의미검증을 통과한 근거에는 "발췌 문언
+    # 그대로는 아니며…" 단서가 붙으므로, 검증을 **받지 못한** 근거는 아무 표시가 없어
+    # 원문 그대로의 가장 튼튼한 근거로 읽힙니다. 실측에서 🟢을 받은 구성의 근거가 전부
+    # 그 상태였습니다.
+    verification_incomplete: bool = False
 
 
 class DocumentMapping(BaseModel):
@@ -405,6 +629,46 @@ class DocumentMapping(BaseModel):
     source_file: str = ""                       # 히스토리에 보존된 원문 PDF 상대 경로
     role: str = ""                            # 주 인용발명 / 부 인용발명 / 미채택
     main_score: float = 0.0
+
+
+class TrailStep(BaseModel):
+    """한정 하나의 개시 판정이 **초기 비교 이후에 움직인** 기록 한 줄."""
+    index: int
+    limitation: str = ""
+    stage: Literal["의미검증", "결합검증"] = "의미검증"
+    outcome: Literal["기각", "인정"] = "기각"
+    note: str = ""
+    # 결합검증이 인정한 경우 빠진 축을 실제로 댄 인용발명. 지어내지 않고 그대로 적습니다.
+    combination_documents: list[str] = []
+
+
+class VerificationTrail(BaseModel):
+    """구성 하나가 **어떤 단계를 거쳐** 지금 판정이 되었는지. 문헌별로 한 건.
+
+    이 값이 없으면 보고서는 결과만 남기고 경위를 버립니다. 실제로 그랬습니다 — 어떤 구성의
+    한정 하나가 초기 비교에서 개시로 나왔다가 의미검증에서 근거 불일치로 기각되고 결합검증에서
+    다시 기각된 사건이, 보고서에는 "대응되는 인용발명이 확인되지 않음" 한 줄로만 남았습니다.
+    그 한 줄만 읽은 사람은 도구가 그 구성을 **검토하지 않았다**고 읽습니다. 실제로는 세 번
+    검토했고 두 번은 근거를 들어 기각한 것인데, 판단의 강도가 보고서에서 사라진 것입니다.
+
+    경위는 이미 LimitationCheck.semantic_status/semantic_note에 구조화되어 있었습니다.
+    보고서가 accepted만 렌더링하고 rejected·*_in_combination을 읽지 않았을 뿐입니다.
+    """
+    document_id: str = ""
+    reference_number: int | None = None
+    # 표본 합의 계측치. 갈린 셀에서만 보고서에 나갑니다(만장일치 셀은 적을 것이 없습니다).
+    sample_count: int = 0
+    sample_unanimous: int = 0
+    sample_requirements: int = 0
+    steps: list[TrailStep] = []
+    # 표가 갈린 한정의 (번호, 문언, 표본별 답). 구성 단위 비율만으로는 어느 한정이 몇 대 몇으로
+    # 갈렸는지 말할 수 없어, 갈린 자리를 짚어 재실행하거나 사람이 확인할 수가 없습니다.
+    tallies: list[tuple[int, str, SampleTally]] = []
+
+    @property
+    def split(self) -> bool:
+        """표본이 갈린 셀인지. 물어본 한정이 있고 그중 만장일치가 아닌 것이 있을 때."""
+        return self.sample_requirements > 0 and self.sample_unanimous < self.sample_requirements
 
 
 class ClaimResult(BaseModel):
@@ -430,11 +694,23 @@ class ClaimResult(BaseModel):
     # 어긋나면 보고서가 스스로를 반박합니다(report.report_invariants가 이 값으로 확인합니다).
     # "1/5 개시"라고 적어 놓고 차이점 줄에는 빠진 한정이 한 줄도 없는 상태가 그것입니다.
     missing_limitations: list[str] = []
+    # 의미검증을 수행하지 못한 한정. missing_limitations와 **반드시 따로** 둡니다 — 앞의
+    # 것은 "이 문헌에 없다"는 문헌에 대한 사실 주장이고, 이것은 "확인하지 못했다"는 도구의
+    # 상태입니다. 한 목록에 섞으면 검증기 결손이 문헌의 결손으로 보고서에 적힙니다.
+    unverified_limitations: list[str] = []
+    # 미완료 한정 **수**. 목록과 따로 두는 이유는 하위 한정으로 분해되지 않은 점검
+    # (whole_element)이 목록에서 빠지기 때문입니다. 지표 줄의 산술("개시 확인 = 개시 - 미완료")이
+    # 목록 길이에 기대면 그 경우에 숫자가 어긋납니다.
+    unverified_limitation_count: int = 0
     combination: bool = False                 # 두 건 이상의 인용발명을 결합해 대응시켰는지
     evidence: list[Evidence] = []
     status: str = ""
     adopted_document: str = ""                # 이 구성의 근거로 최종 채택된 문헌
     adopted_reference: int | None = None      # 그 문헌의 인용발명 번호
+    # 이 구성의 판정 경위. **미대응 구성에도 채웁니다** — 오히려 그쪽이 더 필요합니다.
+    # 채택된 문헌이 없으면 evidence도 근거 목록도 비므로, 경위가 없으면 그 구성에 대해
+    # 보고서가 말하는 것은 "확인되지 않았다" 한 줄뿐이 됩니다.
+    trail: list[VerificationTrail] = []
 
 
 class ClaimReport(BaseModel):

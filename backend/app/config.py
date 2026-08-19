@@ -63,6 +63,22 @@ COMPARE_MAX_WORKERS = max(1, int(os.getenv("FORGE_COMPARE_WORKERS", "4")))
 # 보고서를 그날의 운이 정하고, 코드를 고쳐도 효과를 1회 실행으로 확인할 수 없습니다.
 # 비용이 그대로 배수로 늘어나므로 값을 열어 둡니다. 1이면 샘플링을 끕니다.
 COMPARE_SAMPLES = max(1, int(os.getenv("FORGE_COMPARE_SAMPLES", "3")))
+# **전체** 동시 CLI 프로세스 상한. 단계별 노브를 곱한 값이 그대로 동시 실행 수가 되지 않도록
+# 마지막에 한 번 더 조입니다(구성대비 셀 4 × 표본 3 = 12).
+#
+# CLI 하나가 프로세스 하나이고 호출마다 8천 토큰짜리 에이전트 프리앰블이 얹히므로, 무한정
+# 올리면 메모리와 provider 동시 요청 한도에 걸립니다. 한도에 걸린 호출은 실패해 재시도가
+# 붙으므로 **더 느려집니다** — 이 상한은 성능 제한이 아니라 성능 보호입니다.
+MAX_CONCURRENT_CLI = max(1, int(os.getenv("FORGE_MAX_CONCURRENT_CLI", "8")))
+# 의미검증 배치를 동시에 몇 개까지 돌릴지. 배치는 서로를 참조하지 않고 소요 시간의 거의
+# 전부가 CLI 응답 대기라, 구성대비 셀과 같은 이유로 병렬화됩니다. 실측(1청구항 × 문헌 3건)에서
+# 이 단계가 CLI를 18회 부르는 동안 구성대비는 3회였는데, 직렬로 돌아 전체 시간의 절반 이상을
+# 혼자 썼습니다 — 호출 수가 가장 많은 단계가 유일하게 직렬이었습니다.
+#
+# 기본값이 전역 상한과 **같습니다.** 이 단계는 구성대비가 끝난 뒤 혼자 돌기 때문에 예산을
+# 나눠 쓸 상대가 없습니다. 더 작게 잡으면 가장 긴 단계에서 남은 자리를 놀리게 됩니다.
+ENTAILMENT_MAX_WORKERS = max(1, int(os.getenv("FORGE_ENTAILMENT_WORKERS",
+                                              str(MAX_CONCURRENT_CLI))))
 # 인용발명 1건을 대비할 때 한 호출에 몇 개 청구항까지 함께 실을지.
 #
 # 1이면 종전과 같은 (청구항 × 문헌) 축이라 문헌 본문이 청구항 수 × 표본 수만큼 다시 실립니다.
@@ -99,16 +115,27 @@ LOG_MAX_BYTES = int(os.getenv("FORGE_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 PRIOR_ART_VERIFY_TIMEOUT = float(os.getenv("FORGE_PRIOR_ART_VERIFY_TIMEOUT", "15"))
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
+def model_id(value: str) -> str:
+    """모델 이름에서 표시용 꼬리를 떼어 냅니다.
+
+    `agy models`는 "id<TAB>표시 이름"을 출력하는데 목록을 줄째로 실어 나르던 동안 저장된
+    설정 파일에는 탭이 붙은 값이 그대로 남아 있습니다(agy._agy_models). 그 값을 --model에
+    실으면 CLI가 통째로 거부해 모든 호출이 실패하므로, 읽고 쓸 때 첫 탭 앞까지만 씁니다.
+    목록 파싱을 고쳐도 **이미 저장된 설정은 낫지 않기 때문에** 읽는 쪽에도 둡니다.
+    """
+    return str(value or "").split("\t", 1)[0].strip()
+
 def load_runtime_settings() -> dict:
     defaults = {"provider": LLM_PROVIDER, "model": AGY_MODEL, "prompt": DEFAULT_ANALYSIS_PROMPT}
     if not SETTINGS_FILE.exists(): return defaults
     try:
         value = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return {**defaults, **{k: value[k] for k in defaults if k in value and value[k]}}
+        settings = {**defaults, **{k: value[k] for k in defaults if k in value and value[k]}}
+        return {**settings, "model": model_id(settings["model"]) or defaults["model"]}
     except (OSError, json.JSONDecodeError): return defaults
 
 def save_runtime_settings(value: dict) -> dict:
-    settings = {"provider": value["provider"], "model": value["model"],
+    settings = {"provider": value["provider"], "model": model_id(value["model"]),
                 "prompt": value.get("prompt") or DEFAULT_ANALYSIS_PROMPT}
     SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     return settings

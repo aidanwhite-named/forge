@@ -413,7 +413,8 @@ def _run_async_analysis(job_id: str, claims: str, documents: list[Document],
         # 확인한 그 분해가 실제로 쓰인 분해가 됩니다.
         result = analyze(job_id, claims, documents, analysis_prompt, progress, decomposition,
                          cache_keys, priority_date,
-                         pinned_decomposition=confirmed_decomposition)
+                         pinned_decomposition=confirmed_decomposition,
+                         decomposition_confirmed=confirmed_decomposition is not None)
         agy.raise_if_cancelled(job_id)
         _persist_initial_analysis(job_id, result, claims, documents, analysis_prompt, work,
                                   decomposition, cache_keys, priority_date)
@@ -485,6 +486,9 @@ def get_decomposition(job_id: str):
         "version": proposed.get("version", ""),
         "decomposition": proposed,
         "warnings": record.get("_decomposition_warnings", []),
+        # 확정을 기다리는 별칭 후보. 분해와 **같은 화면**에서 받습니다 — 확정 관문이 둘로
+        # 갈리면 "무엇을 확정했는지"도 두 군데로 흩어집니다(models.ReferenceAlias).
+        "aliases": proposed.get("aliases", {}),
         "confirmed": bool((review or {}).get("confirmed_at")),
     }
 

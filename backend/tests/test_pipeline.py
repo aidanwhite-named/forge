@@ -576,7 +576,11 @@ def test_a_disclosure_bridged_by_semantic_review_says_so_next_to_the_excerpt():
 def test_summary_states_the_common_ground_and_the_sharpest_difference(stub_cli):
     report = pipeline.analyze("job", CLAIMS, DOCUMENTS).reports[0]
     summary = report.summary_similarity
-    assert summary.startswith("청구항과 인용발명 1, 인용발명 2는 ")
+    # 문헌 번호는 **대표 구성이 대응된 문헌**만 적는다. 대응된 모든 구성의 채택 문헌을 합쳐
+    # 적으면, 그 구성을 개시하지 않은 문헌까지 공통점의 주어가 된다(구성 B는 인용발명 2가
+    # 대응했고 대표 구성 A는 인용발명 1이 대응했다).
+    assert summary.startswith("청구항과 인용발명 1은 ")
+    assert "인용발명 2" not in summary
     assert "\n" not in summary
     # 유사점은 한 줄 요약이다. 구성 원문을 이어 붙이면 "…단계 및에 관한"처럼 연결어미에서
     # 문장이 끊기고, 이미 위에 구성별로 적힌 내용을 다시 나열하는 것에 그친다.
@@ -1350,6 +1354,23 @@ def test_an_antecedent_cap_does_not_swallow_the_remaining_limitations():
     assert _difference(match, None, False, mappings, documents) == match.antecedent_note
 
 
+def test_an_antecedent_bridge_does_not_hide_inferred_directness():
+    """선행 구성 보완 뒤에도 해당 셀의 '추론 대응' 차이는 보고서에 남아야 한다."""
+    match = ElementMatch(
+        claim_number=1, label="D", document_id="2", judgment="실질적 동일",
+        directness="inferred", quote="두 깊이 맵을 융합한다.", verify="verified",
+        antecedent_resolved_by=["1"])
+    bridge = ElementMatch(
+        claim_number=1, label="A", document_id="1", judgment="실질적 동일",
+        directness="direct", quote="3D 센서 데이터를 획득한다.", verify="verified")
+    mappings = [DocumentMapping(reference_number=1, filename="a.pdf", document_id="1"),
+                DocumentMapping(reference_number=2, filename="b.pdf", document_id="2")]
+
+    difference = _difference(match, None, False, mappings, {}, bridge=bridge)
+
+    assert difference == "직접 개시가 아니라 추론에 의한 대응입니다"
+
+
 def test_batch_cells_judged_in_a_different_grouping_do_not_share_a_cache_key():
     """일괄 프롬프트에는 형제 청구항이 함께 실린다. 묶음이 다르면 같은 셀도 다른 프롬프트다."""
     claim = parse_claims(_BATCH_CLAIMS)[0]
@@ -1541,3 +1562,56 @@ def test_p2_still_checks_when_the_combination_limit_binds():
             _candidate("2", gain=0.44, merged_gain=0.44, excluded_reason="")])])
 
     assert any("[불변식 P2]" in note for note in pipeline_invariants([_report(chain)], {1: matrix}))
+
+
+def test_a_primary_without_correspondence_is_not_dressed_up_as_a_combination():
+    """'차이'는 core가 하나도 개시되지 않았다는 뜻이다. 그 문헌을 결합 상대로 세우면 안 된다.
+
+    실측: 점군 융합 구성을 인용발명 2가 단독으로 개시했는데, 주 인용발명의 **텍스처 이미지
+    스티칭** 문장이 결합 상대로 실려 "…는 구성이 기재되어 있으나 … 이를 결합하면"으로
+    나갔다. 그 문헌이 융합을 가르친 것처럼 읽히고, 인용하면 곧바로 반박당한다.
+    """
+    documents = {
+        "1": Document(id="1", filename="primary.pdf", chunks=[
+            Chunk(document_id="1", chunk_id="D1-P-0262", page=11, paragraph="0262",
+                  text="Instead of fusing all input images we use only three images for the texture map.")]),
+        "2": Document(id="2", filename="fusion.pdf", chunks=[
+            Chunk(document_id="2", chunk_id="D2-B-p003", page=3,
+                  text="The ToF and stereo depth measurements are fused using the confidence measures.")]),
+    }
+    mappings = [DocumentMapping(reference_number=1, filename="primary.pdf", document_id="1",
+                                document_number="US 2019/0035149 A1"),
+                DocumentMapping(reference_number=2, filename="fusion.pdf", document_id="2")]
+    primary = ElementMatch(
+        claim_number=1, label="D", document_id="1", judgment="차이", directness="absent",
+        quote="Instead of fusing all input images we use only three images for the texture map.",
+        chunk_id="D1-P-0262", verify="verified")
+    adopted = ElementMatch(
+        claim_number=1, label="D", document_id="2", judgment="실질적 동일", directness="direct",
+        quote="The ToF and stereo depth measurements are fused using the confidence measures.",
+        chunk_id="D2-B-p003", verify="verified", reason="두 센서의 신뢰도로 가중해 융합하고 있음")
+
+    narrative = _narrative("D", "두 점군을 신뢰도에 기초하여 융합함", adopted, primary, True,
+                           mappings, documents)
+
+    assert "이를 결합하면" not in narrative
+    assert "텍스처" not in narrative and "texture" not in narrative
+    assert narrative.endswith('구성과 대응됩니다.')
+
+
+def test_the_summary_names_only_the_documents_that_disclose_the_representative_element():
+    """주어와 술어가 다른 출처에서 오면 요약이 본문보다 넓게 말한다."""
+    results = [
+        ClaimResult(label="A", claim="두 점군을 신뢰도에 기초하여 융합함", corresponded=True,
+                    status="개시됨", adopted_reference=2),
+        ClaimResult(label="B", claim="영상을 획득함", corresponded=True, status="개시됨",
+                    adopted_reference=1),
+    ]
+    claim = Claim(number=1, elements=[
+        ClaimElement(label="A", text="두 점군을 신뢰도에 기초하여 융합함", importance=5),
+        ClaimElement(label="B", text="영상을 획득함", importance=2)])
+
+    summary = _summary_similarity(claim, results)
+
+    assert summary.startswith("청구항과 인용발명 2는 ")     # 대표 구성 A를 개시한 문헌만
+    assert "인용발명 1" not in summary

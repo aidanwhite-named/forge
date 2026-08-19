@@ -65,6 +65,26 @@ def test_secondary_is_chosen_by_increment_not_absolute_strength():
     assert chain.track == "inventive_step_combination"
 
 
+def test_a_document_is_not_adopted_only_to_improve_a_nonblocking_preamble():
+    """전제부만 보강하는 문헌은 대비 결과에는 남되 인용 조합을 불필요하게 늘리지 않는다."""
+    target = Claim(number=1, elements=[
+        ClaimElement(label="P0", text="카메라 보정 방법에 있어서", importance=2, is_preamble=True),
+        ClaimElement(label="A", text="센서 데이터를 획득함", importance=5),
+        ClaimElement(label="B", text="데이터를 융합함", importance=5),
+    ])
+    matches = ([cell("1", "P0", "일부 유사"), cell("1", "A", "동일"),
+                cell("1", "B", "대응 없음")]
+               + [cell("2", "P0", "대응 없음"), cell("2", "A", "대응 없음"),
+                  cell("2", "B", "동일")]
+               + [cell("3", "P0", "동일"), cell("3", "A", "대응 없음"),
+                  cell("3", "B", "대응 없음")])
+
+    chain = build(target, matches)
+
+    assert chain.primary == "1" and chain.secondaries == ["2"]
+    assert "3" not in chain.secondaries
+
+
 def test_core_gap_that_no_document_fills_makes_the_rejection_impossible():
     """'차이' 판정은 라벨 정의상 개시로 보지 않으므로 공백이 그대로 남는다."""
     matches = ([cell("1", "A", "동일"), cell("1", "B", "대응 없음"), cell("1", "C", "동일")]
@@ -223,7 +243,7 @@ def test_the_report_only_blames_the_combination_limit_when_it_actually_bound():
     사람은 상한만 올리면 그 문헌이 들어온다고 읽지만, 실제로 문헌을 떨어뜨린 것은 보완 후보
     평가였다.
     """
-    # 2번이 공백 C를 메운 뒤에도 3번이 B의 누락 한정을 메울 수 있지만 자리가 없다.
+    # 독립항에는 고정 상한이 없으므로 2번과 3번이 각자 메우는 근거를 모두 채택한다.
     matches = ([cell("1", "A", "동일"),
                 disclosing("1", "B", "일부 차이", ["기본 동작"], missing=[WAVEGUIDE]),
                 cell("1", "C", "대응 없음")]
@@ -232,7 +252,8 @@ def test_the_report_only_blames_the_combination_limit_when_it_actually_bound():
                + [cell("3", "A", "대응 없음"),
                   disclosing("3", "B", "차이", [WAVEGUIDE], direct=False),
                   cell("3", "C", "대응 없음")])
-    assert build(claim(), matches).limit_binding is True
+    chain = build(claim(), matches)
+    assert chain.secondaries == ["2", "3"] and chain.limit_binding is False
 
     # 후보가 정확히 두 건이고 둘 다 채택됐다면 상한에 닿았어도 배제된 후보는 없다.
     filled = ([cell("1", "A", "동일"), cell("1", "B", "동일"),
@@ -523,13 +544,8 @@ def test_an_unsupported_difference_does_not_displace_the_current_gap():
     assert best_match([current, unsupported]).document_id == "1"
 
 
-def test_independent_claim_combines_at_most_two_documents():
-    """사례 5. 독립항 거절 이유에 세우는 인용발명은 최대 2건(주 1 + 보조 1)이다.
-
-    3건을 결합한 거절 이유는 실무에서 성립하기 어렵다. 다만 상한 때문에 빠진 세 번째 문헌이
-    어떤 구성의 유일한 근거를 가지고 있다면 그 사실은 반드시 남는다 — 감추면 "어느 인용발명에도
-    대응이 없다"는 거짓 진술이 되고, 이미 손에 든 문헌을 다시 찾게 된다.
-    """
+def test_independent_claim_keeps_every_document_that_fills_a_distinct_gap():
+    """문헌 2와 3이 서로 다른 공백을 메우면 둘 다 조합에 남아야 한다."""
     target = claim(importances=(5, 5, 4, 4))
     matches = (
         [cell("1", "A", "동일"), cell("1", "B", "동일"), cell("1", "C", "대응 없음"), cell("1", "D", "대응 없음")]
@@ -537,17 +553,17 @@ def test_independent_claim_combines_at_most_two_documents():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and chain.secondaries == ["2"]
-    assert chain.combination_limit == 2
+    assert chain.primary == "1" and chain.secondaries == ["2", "3"]
+    assert chain.combination_limit == 0
     assert coverage_of(chain, "C").adopted_document == "2"
-    assert chain.beyond_limit == ["D"] and chain.beyond_limit_documents["D"] == ["3"]
-    assert "상한(2건)" in chain.rationale
+    assert coverage_of(chain, "D").adopted_document == "3"
+    assert chain.beyond_limit == [] and not chain.limit_binding
     # 모든 문헌의 구성별 대응은 채택 여부와 무관하게 전부 분석된다.
     assert {candidate.document_id for candidate in coverage_of(chain, "D").candidates} == {"1", "2", "3"}
 
 
-def test_the_secondary_that_fills_the_most_gaps_wins_the_single_slot():
-    """보조 인용발명 자리가 하나뿐이면 공백을 가장 많이 메우는 문헌이 차지한다."""
+def test_the_secondary_that_fills_the_most_gaps_is_selected_first():
+    """여러 보조 문헌이 필요해도 가장 큰 증분 기여를 한 문헌을 먼저 세운다."""
     target = claim(importances=(5, 3, 3, 4))                    # D가 핵심, 마지막에 남도록 구성
     matches = (
         [cell("1", "A", "동일")] + [cell("1", label, "대응 없음") for label in "BCD"]
@@ -556,8 +572,8 @@ def test_the_secondary_that_fills_the_most_gaps_wins_the_single_slot():
         + [cell("3", label, "대응 없음") for label in "ABC"] + [cell("3", "D", "동일")]
     )
     chain = build(target, matches, all_claims=[target])
-    assert chain.primary == "1" and chain.secondaries == ["2"]   # B·C를 한 번에 메우는 2
-    assert chain.beyond_limit == ["D"] and chain.beyond_limit_documents["D"] == ["3"]
+    assert chain.primary == "1" and chain.secondaries == ["2", "3"]  # B·C를 메운 2가 먼저
+    assert chain.beyond_limit == []
 
 
 def test_video_editing_buffer_document_outranks_a_shallow_timing_improvement():
@@ -575,7 +591,7 @@ def test_video_editing_buffer_document_outranks_a_shallow_timing_improvement():
     chain = build(target, matches, all_claims=[target])
 
     assert chain.primary == "1"
-    assert chain.secondaries == ["2"]
+    assert chain.secondaries == ["2", "3"]       # D 공백을 메우는 2가 B 보강용 3보다 먼저
     assert coverage_of(chain, "D").adopted_document == "2"
     assert chain.uncovered == []
 
@@ -915,6 +931,19 @@ def test_the_restored_grade_never_exceeds_the_antecedent_it_references():
     assert coverage_of(chain, "B").adopted_judgment == "실질적 동일"
 
 
+def test_an_inferred_cell_is_not_restored_to_an_identical_grade():
+    """다른 문헌이 지시 대상만 보완해도 이 셀 자체의 추론 직접성은 남는다."""
+    capped = _capped("1")
+    capped.directness = "inferred"
+    matches = [cell("1", "A", "대응 없음"), capped,
+               cell("2", "A", "실질적 동일"), cell("2", "B", "대응 없음")]
+
+    chain = build(_anaphora_claim(), matches)
+
+    assert coverage_of(chain, "B").adopted_judgment == "일부 차이"
+    assert "직접 개시가 아니라 추론에 의한 대응입니다" in coverage_of(chain, "B").residual_difference
+
+
 # --- 주 인용발명 자격 게이트 ------------------------------------------------------
 # 이 게이트는 오래 "있는 척"만 했습니다. 임계가 절대 차(0.20)라 core_direct 최고점이 0.5
 # 안팎인 실측 분포에서는 최고점의 60%짜리 문헌까지 통과했고, 그마저도 "핵심 구성을 하나라도
@@ -1204,16 +1233,14 @@ def test_every_unadopted_candidate_carries_a_reason():
                 assert row.excluded_reason, f"{coverage.label}/문헌 {row.document_id}에 사유가 없다"
 
 
-def test_the_combination_limit_is_recorded_as_the_reason_when_it_binds():
-    """상한이 실제로 걸려 빠진 문헌은 그 사실이 후보 행에 적혀야 한다."""
+def test_independent_candidates_are_not_dropped_by_an_artificial_limit():
+    """서로 다른 공백을 메우는 후보는 인위적인 2문헌 상한 때문에 탈락하지 않는다."""
     matches = (
         [cell("1", "A", "동일"), cell("1", "B", "대응 없음"), cell("1", "C", "대응 없음")]
         + [cell("2", "A", "대응 없음"), cell("2", "B", "실질적 동일"), cell("2", "C", "대응 없음")]
         + [cell("3", "A", "대응 없음"), cell("3", "B", "대응 없음"), cell("3", "C", "실질적 동일")]
     )
     chain = build(claim(), matches)
-    assert chain.limit_binding                       # 자리가 하나 더 있었다면 채택됐을 후보가 남아 있다
-
-    dropped = [row for coverage in chain.element_coverage for row in coverage.candidates
-               if not row.adopted and row.merged_gain > 0]
-    assert dropped and all("상한" in row.excluded_reason for row in dropped)
+    assert chain.secondaries == ["2", "3"] and not chain.limit_binding
+    assert not [row for coverage in chain.element_coverage for row in coverage.candidates
+                if not row.adopted and row.merged_gain > 0]

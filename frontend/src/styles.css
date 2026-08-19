@@ -368,6 +368,175 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
   line-height: 1.7;
 }
 
+/* ── 청구항 분해 확정 관문 ─────────────────────────────────────────────
+   구성대비 전에 사용자가 분해를 확인하는 화면입니다. 청구항 원문을 왼쪽에 고정해 두는 것이
+   이 레이아웃의 목적입니다 — 한정이 청구항에 실제로 적힌 것인지 확인하려면 원문이 눈에
+   함께 있어야 합니다. */
+.gate-pending { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.gate-pending button { flex: 0 0 auto; }
+
+.gate-brief {
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid #cbdcc0;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  font-size: 13px;
+  line-height: 1.75;
+}
+.gate-brief strong { display: block; margin-bottom: 4px; font-size: 14px; }
+.gate-brief b { font-weight: 800; }
+
+.gate-warning {
+  margin-bottom: 10px;
+  padding: 12px 15px;
+  border: 1px solid #e6d3a6;
+  border-radius: 11px;
+  color: #6b5210;
+  background: #fdf6e3;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.gate-problems {
+  margin-bottom: 18px;
+  padding: 14px 17px;
+  border: 1px solid #e7c2be;
+  border-radius: 12px;
+  color: #7d2f26;
+  background: #fff5f3;
+  font-size: 13px;
+}
+.gate-problems strong { display: block; margin-bottom: 6px; }
+.gate-problems ul { margin: 0; padding-left: 18px; line-height: 1.8; }
+
+.decompose-grid { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 1080px) { .decompose-grid { grid-template-columns: minmax(0, 1fr); } }
+
+.claims-source { align-self: start; position: sticky; top: 84px; max-height: calc(100vh - 190px); display: flex; flex-direction: column; }
+@media (max-width: 1080px) { .claims-source { position: static; max-height: 320px; } }
+.claims-source pre {
+  overflow: auto;
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 12.5px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.decompose-claims { display: grid; gap: 18px; min-width: 0; }
+.claim-decompose { display: block; }
+
+.element-edit {
+  padding: 15px 0 18px;
+  border-top: 1px solid var(--line);
+}
+.element-edit:first-of-type { border-top: 0; }
+.element-edit.is-edited { border-left: 3px solid var(--green-bright); margin-left: -13px; padding-left: 10px; }
+.element-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 9px; }
+.element-head > b { color: var(--green-bright); font: 750 19px/1 var(--display); }
+.edited-chip {
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--green-bright);
+  font-size: 10px;
+  font-weight: 800;
+}
+.element-field { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-soft); font-size: 11.5px; }
+.element-field.checkbox { gap: 5px; }
+.element-field select {
+  padding: 4px 7px;
+  border: 1px solid var(--line-dark);
+  border-radius: 7px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.element-source {
+  margin: 0 0 12px;
+  padding: 10px 13px;
+  border-left: 3px solid var(--line-dark);
+  border-radius: 0 8px 8px 0;
+  background: var(--surface-soft);
+  color: #414a46;
+  font-size: 12.5px;
+  line-height: 1.75;
+}
+
+.limit-block { display: grid; gap: 9px; }
+.limit-heading { display: flex; align-items: center; justify-content: space-between; color: var(--ink-soft); font-size: 11.5px; font-weight: 700; }
+.tiny { padding: 5px 10px !important; font-size: 11px !important; border-radius: 8px !important; }
+.limit-row {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.limit-row textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  font-size: 12.5px;
+  line-height: 1.7;
+  resize: vertical;
+}
+.limit-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.limit-meta select,
+.limit-meta input {
+  padding: 6px 9px;
+  border: 1px solid var(--line-dark);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 11.5px;
+}
+.limit-meta input { flex: 1 1 120px; min-width: 0; }
+.limit-meta button { margin-left: auto; }
+.limit-empty { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.7; }
+
+.term-block { margin-top: 12px; }
+.term-heading { display: block; margin-bottom: 6px; color: var(--ink-soft); font-size: 11.5px; font-weight: 700; }
+.term-editor { display: grid; gap: 7px; }
+.term-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.term {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--line-dark);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 11.5px;
+}
+.term button {
+  padding: 0 3px;
+  border: 0;
+  border-radius: 50%;
+  color: var(--ink-soft);
+  background: transparent;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.term button:hover:not(:disabled) { color: var(--danger); }
+.term-empty { color: var(--ink-soft); font-size: 11.5px; }
+.term-editor > input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  font-size: 12px;
+}
+
+.gate-dock { position: sticky; bottom: 16px; margin-top: 22px; }
+
 .result-heading { margin-bottom: 26px; }
 .result-actions { display: flex; align-items: center; gap: 9px; }
 .download {
@@ -469,6 +638,9 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 }
 .quality { background: var(--surface-soft); }
 .reference-chip { color: #fff; background: var(--green); }
+/* 미완료 칩은 근거 칩과 같은 초록으로 두면 안 됩니다. 나머지 칩은 "확인된 것"을 세는데
+   이것만 "확인하지 못한 것"을 세므로, 색이 같으면 신호가 정확히 뒤집혀 읽힙니다. */
+.reference-chip.chip-warn { color: #2a1c06; background: #e0a63a; }
 /* 구성 라벨 배지. 한 글자는 정원, '전제부'처럼 긴 것은 알약 모양으로 늘어납니다. */
 .badge {
   min-width: 24px;
@@ -497,6 +669,25 @@ textarea:disabled { color: #737b77; background: #f0f2ef; }
 .narrative { color: #4c5651; font-size: 14px; line-height: 1.78; }
 .diff { margin-top: 13px; padding: 12px 14px; border-radius: 10px; color: #7f4038; background: #fff4f1; font-size: 12px; line-height: 1.7; }
 .diff b { margin-right: 8px; }
+
+/* 판정 경위. 차이점(.diff)과 달리 문헌에 대한 주장이 아니라 **도구가 무엇을 했는가**의
+   기록이므로, 경고색을 쓰지 않고 중립 톤으로 한 단 낮춰 둡니다. */
+.trail { margin-top: 13px; border-top: 1px dashed var(--line); padding-top: 11px; }
+.trail > b { display: block; margin-bottom: 7px; color: #6a736e; font-size: 11px; letter-spacing: .02em; }
+.trail ul { margin: 0 0 6px; padding: 0; list-style: none; }
+.trail li { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline;
+            padding: 5px 0; color: #4c5651; font-size: 12px; line-height: 1.65; }
+.trail li + li { border-top: 1px solid var(--line); }
+.trail li.split { color: #7a5a12; }
+.trail li.tally .kind { flex: none; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+                        font-weight: 700; color: #7a5a12; background: #fdf6e6; }
+.trail .stage-out, .trail .stage-in {
+  flex: none; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700;
+}
+.trail .stage-out { color: #7f4038; background: #fff4f1; }
+.trail .stage-in { color: #1f5638; background: #eaf6ee; }
+.trail .limitation { font-weight: 650; }
+.trail .why { flex-basis: 100%; color: #6a736e; }
 
 details > summary { list-style: none; cursor: pointer; }
 details > summary::-webkit-details-marker { display: none; }
@@ -715,3 +906,19 @@ footer {
   font-size: 12px;
   line-height: 1.65;
 }
+
+/* 지시 관계 확정. 분해 확정과 같은 관문에 두되, 놓치면 안 되는 결정이므로 경고보다
+   눈에 띄게 둡니다 — 확정하지 않으면 그 참조는 판정에 반영되지 않습니다. */
+.alias-gate { margin: 14px 0 0; padding: 14px 16px; border: 1px solid #d8c48a;
+              border-radius: 12px; background: #fdf8ea; }
+.alias-gate > strong { display: block; color: #6b5312; font-size: 13px; }
+.alias-gate > p { margin: 7px 0 11px; color: #6f6f66; font-size: 12px; line-height: 1.7; }
+.alias-gate .alias { padding: 7px 0; }
+.alias-gate .alias + .alias { border-top: 1px solid #eadfc0; }
+.alias-gate label { display: flex; gap: 9px; align-items: baseline;
+                    font-size: 12.5px; line-height: 1.65; cursor: pointer; }
+.alias-gate .alias.settled { color: #1f5638; }
+.alias-gate input { flex: none; margin: 0; }
+.alias-gate input:disabled { opacity: .4; cursor: default; }
+.alias-gate select { margin: 7px 0 0 26px; padding: 5px 9px; border: 1px solid #d8c48a;
+                     border-radius: 8px; background: #fff; font-size: 12px; }

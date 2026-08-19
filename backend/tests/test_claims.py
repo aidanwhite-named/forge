@@ -246,6 +246,26 @@ def test_an_explicit_pinned_decomposition_takes_priority_over_the_environment(tm
     assert any("회귀 사건의 고정 분해" in note for note in notes)
 
 
+def test_a_user_confirmed_decomposition_is_not_reported_as_a_regression_pin(tmp_path, monkeypatch):
+    """사용자 확정 분해와 회귀 고정 분해는 같은 문으로 들어오지만 출처가 정반대다.
+
+    구분하지 않으면 정상 실행의 보고서가 "회귀 사건의 고정 분해에서 읽었습니다. 이 보고서의
+    분해는 자동 생성된 것이 아닙니다"라고 적는다 — 모델이 제안하고 사용자가 확정한 분해를
+    실험용 고정 파일에서 가져온 것으로 잘못 알리는 셈이라, 두 문장 다 사실이 아니다.
+    """
+    path = _pinned_file(tmp_path, version="확정본", text="확정한 한정")
+    pinned = json.loads(path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(claims, "run_cli",
+                        lambda *a, **k: pytest.fail("확정 분해가 있는데 LLM을 불렀습니다."))
+
+    parsed = claims.parse_claims("쓰기 요청을 큐에 저장하는 저장부")
+    notes = claims.assign_importance(parsed, pinned_decomposition=pinned, user_confirmed=True)
+
+    assert [item.text for item in parsed[0].elements[0].limitations] == ["확정한 한정"]
+    assert any("사용자가 확인·확정한 것입니다" in note for note in notes)
+    assert not any("회귀 사건" in note or "자동 생성된 것이 아닙니다" in note for note in notes)
+
+
 # --- 확정 분해 검증 --------------------------------------------------------------
 # _restore_elements는 청구항 번호·라벨·구성 원문이 하나라도 어긋나면 조용히 False를 돌려주고,
 # 파이프라인은 확정본을 버린 채 LLM 재분해로 넘어간다. 사용자가 확인한 것과 다른 분해로 판정이

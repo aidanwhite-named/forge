@@ -11,10 +11,13 @@ import re
 
 from .chain import chain_documents, merge_selected
 from .consistency import antecedents
-from .coverage import (JUDGMENT_RANK, best_match, derive_judgment, evidence_locations,
-                       evidenced_limitations, limitation_counts, report_grade)
+from .coverage import (FULL_JUDGMENTS, JUDGMENT_RANK, best_match, derive_judgment,
+                       evidence_locations, evidenced_limitations, is_reserved, is_unverified_check,
+                       limitation_counts, report_grade, residual_difference, unverified_count,
+                       unverified_limitations)
 from .models import (AnalysisResult, ChainInfo, Claim, ClaimReport, ClaimResult, Document,
-                     DocumentMapping, ElementMatch, Evidence, LimitationCheck)
+                     DocumentMapping, ElementMatch, Evidence, LimitationCheck, SampleTally,
+                     SemanticEvent, TrailStep, VerificationTrail)
 
 # 발췌 길이 상한. 요구 형식이 "최대 3줄, 가능하면 1줄"이므로 한 줄 분량으로 자릅니다.
 EXCERPT_LIMIT = 150
@@ -134,6 +137,15 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         (match.document_id != chain.primary and _usable(primary)) or bridge is not None))
     combined = bool(replaced_cell or (match and match.combination_resolved))
     disclosed, total = limitation_counts(match)
+    pending = unverified_count(match)
+    status = _status_of(match, disclosed, pending)
+    # 확인된 개시가 하나도 없으면 표시 등급과 서술도 함께 유보로 바꿉니다. 숫자만 고치고
+    # 등급 배지에 "기술 사상 동일"을, 서술에 "구성과 부분적으로 대응됩니다"를 남기면 같은
+    # 구성이 한 화면에서 서로 다른 말을 합니다 — 읽는 사람은 등급과 문장을 먼저 봅니다.
+    # analysis_incomplete의 '판정 불가'와 같은 처리이고, 사유만 다릅니다.
+    reserved = status == "판정 유보"
+    if reserved:
+        grade, emoji = "판정 유보 — 의미검증 미완료", "⚠️"
     return ClaimResult(
         label=label,
         is_preamble=is_preamble,
@@ -143,9 +155,11 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
         total_limitations=total,
         evidence_locations=evidence_locations(match) if corresponded else 0,
         missing_limitations=list(match.missing_limitations) if match else [],
+        unverified_limitations=_unverified_entries(match),
+        unverified_limitation_count=pending,
         grade=grade,
         emoji=emoji,
-        narrative=_narrative(
+        narrative=_reserved_narrative(match, mappings) if reserved else _narrative(
             label, text, match, primary, replaced_cell, mappings, documents,
             _closest_related(label, matrix, mappings, documents),
             _gap_note(label, chain, mappings), bridge=bridge),
@@ -154,10 +168,11 @@ def _element_result(claim: Claim, label: str, match: ElementMatch | None, chain:
             chain.beyond_limit_residual.get(label), _unadopted_note(chain), bridge=bridge),
         combination=combined,
         evidence=evidence,
-        status=_STATUS.get(match.judgment, "미개시") if match else "미개시",
+        status=status,
         adopted_document=match.document_id if corresponded and match else "",
         adopted_reference=(_reference_number(match.document_id, mappings)
                            if corresponded and match else None),
+        trail=_verification_trail(label, matrix, mappings),
     )
 
 
@@ -221,7 +236,10 @@ def _narrative(label: str, text: str, match: ElementMatch | None, primary: Eleme
                 f"확인되지 않고, {_passage(bridge, mappings, documents)}는 그 선행 "
                 f"구성이 기재되어 있어 이를 결합하면 청구항의 \"{_clip(text)}\" 구성과 "
                 "부분적으로 대응됩니다.")
-    if combined and primary is not None:
+    # 결합 문장은 **결합 상대가 실제로 기여할 때만** 씁니다. combination_resolved는 조합
+    # 전체를 근거로 한정을 되살린 경우에도 참이라, primary가 그 구성을 개시하지 않았는데도
+    # 이 가지로 들어올 수 있습니다. 그때는 단독 개시 문장이 사실에 맞습니다.
+    if combined and _usable(primary):
         missing = "; ".join(primary.missing_limitations[:2]) or "청구항이 요구하는 세부 구성"
         return (f"{_passage(primary, mappings, documents)}는 구성이 기재되어 있으나 {missing}에 대한 "
                 f"기재는 없고, {passage}는 구성이 기재되어 있어 이를 결합하면 "
@@ -313,6 +331,38 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
                 overflow: dict[str, list[str]] | None = None,
                 unadopted_note: str = "",
                 bridge: ElementMatch | None = None) -> str | None:
+    """차이점 한 줄. 누락 사유를 고른 뒤 의미검증 미완료를 뒤에 덧붙입니다.
+
+    분기마다 따로 적지 않고 마지막에 한 번 붙이는 이유: 아래 함수는 지시 관계·결합 해소·
+    보완 등 사유가 여러 갈래이고 그중 하나는 **None**을 돌려줍니다(한정이 전부 개시된 동일급).
+    미완료를 각 갈래에 적으면 반드시 한 갈래를 빠뜨리게 되고, 빠진 갈래에서는 등급이 왜
+    눌렸는지가 본문에서 사라집니다 — 결론과 본문이 어긋나는 실측 사례가 정확히 그 형태였고,
+    그때도 원인은 "차이점 줄을 만드는 경로가 여러 개"라는 것이었습니다.
+    """
+    pending = _unverified_entries(match)
+    if not pending:
+        return _difference_before_verification(match, primary, combined, mappings, documents,
+                                               overflow, unadopted_note, bridge)
+    note = "; ".join(pending[:2])
+    if len(pending) > 2:
+        note += f" 외 {len(pending) - 2}건"
+    note += " 한정은 의미검증을 수행하지 못해 개시가 확인되지 않았습니다"
+    # 확인된 개시가 하나도 없으면 **차이를 적지 않습니다.** 미검증은 차이가 확인된 상태가
+    # 아닙니다. "세부 구현·조건에 차이가 있어 동일하다고 보기 어렵습니다"를 붙이면, 판단을
+    # 받지 못한 것을 판단해 본 결과로 옮겨 적게 되고 바로 위의 '판정 유보'와도 어긋납니다.
+    if is_reserved(match):
+        return note
+    base = _difference_before_verification(match, primary, combined, mappings, documents,
+                                           overflow, unadopted_note, bridge)
+    return f"{base.rstrip('.')}. 또한 {note}" if base else note
+
+
+def _difference_before_verification(
+        match: ElementMatch | None, primary: ElementMatch | None, combined: bool,
+        mappings: list[DocumentMapping], documents: dict[str, Document],
+        overflow: dict[str, list[str]] | None = None,
+        unadopted_note: str = "",
+        bridge: ElementMatch | None = None) -> str | None:
     if match is None or not _corresponded(match):
         return None
     # 지시 관계 상한은 다른 어떤 사유보다 먼저 적습니다. 다만 **누락 한정을 대신하지는
@@ -331,6 +381,10 @@ def _difference(match: ElementMatch | None, primary: ElementMatch | None, combin
     if bridge is not None:
         if match.missing_limitations:
             return _residual_gap(match.missing_limitations[:3], mappings, overflow, unadopted_note)
+        # 다른 문헌이 선행 구성만 이어 줬다고 이 셀 자체의 추론 직접성까지 사라지지는 않습니다.
+        # 결합 서술은 antecedent bridge를 보여 주고, 차이점 줄은 남은 추론 한계를 보여 줍니다.
+        if match.judgment not in FULL_JUDGMENTS or match.directness != "direct":
+            return "; ".join(residual_difference(match)) or None
         return None
     # 채택 셀 자체는 주 인용발명인데, 그 셀이 빠뜨린 한정을 조합 안의 다른 문헌이 댄 경우.
     # 아래 `combined` 분기는 채택 셀의 **문헌이 바뀐** 경우만 다루므로 여기서 먼저 답합니다.
@@ -473,9 +527,16 @@ def _chunk_location(document_id: str, chunk_id: str, documents: dict[str, Docume
 
 
 def _usable(match: ElementMatch | None) -> bool:
-    """결합 문장에 주 인용발명을 함께 세울 수 있는지. 검증된 발췌가 있어야 합니다."""
+    """결합 문장에 주 인용발명을 함께 세울 수 있는지. 검증된 발췌 + **대응 판정**이 있어야 합니다.
+
+    "대응 없음"만 걸러서는 부족합니다. "차이"는 core가 하나도 개시되지 않았다는 뜻이고, 그
+    문헌에 남은 것은 가장 가까운 인접 기재뿐입니다. 그것을 결합 상대로 세우면 "…에는 …는
+    구성이 기재되어 있으나"라는 문장이 붙어, 그 구성을 개시하지 않은 문헌이 기여한 것처럼
+    읽힙니다. 실측: 점군 융합 구성에서 **텍스처 이미지 스티칭** 문장이 결합 상대로 실려,
+    단독 개시인 구성이 두 문헌의 결합처럼 보고됐습니다.
+    """
     return bool(match and match.quote and match.verify in {"verified", "partial"}
-                and match.judgment != "대응 없음")
+                and _corresponded(match))
 
 
 # --- 근거 위치 ----------------------------------------------------------------
@@ -506,6 +567,7 @@ def _collect_evidence(label: str, chain: ChainInfo, matrix: dict[str, dict[str, 
                 quality=_QUALITY.get(verify, "UNVERIFIED"),
                 limitation=limitation, kind=kind,
                 semantic_relation=relation, semantic_note=note,
+                verification_incomplete=is_unverified_check(check),
             ))
 
         spans = []
@@ -540,6 +602,143 @@ _BRIDGE_LABELS = {
     "necessary_implicit": "필연적 함의로 인정",
     "functional_equivalent": "기능적 동등으로 인정",
 }
+
+
+# 옛 기록에는 append-only 이벤트 로그가 없고 종단 상태만 있습니다. 그때는 상태 하나에서
+# 이벤트 하나를 되짚어 만듭니다 — 경로는 잃었지만 마지막 판정은 남아 있으므로, 아무것도 적지
+# 않는 것보다 낫습니다. 새 기록은 semantic_events를 그대로 씁니다.
+_TERMINAL_STAGES: dict[str, tuple[str, str]] = {
+    "accepted": ("의미검증", "인정"),
+    "rejected": ("의미검증", "기각"),
+    "accepted_in_combination": ("결합검증", "인정"),
+    "rejected_in_combination": ("결합검증", "기각"),
+}
+
+
+def _events(check: LimitationCheck) -> list[SemanticEvent]:
+    """이 한정을 건드린 검증 이벤트. 로그가 없는 옛 기록은 종단 상태에서 되짚습니다."""
+    if check.semantic_events:
+        return list(check.semantic_events)
+    found = _TERMINAL_STAGES.get(check.semantic_status)
+    if found is None:
+        return []
+    stage, outcome = found
+    return [SemanticEvent(stage=stage, outcome=outcome, note=check.semantic_note,
+                          supplied_by=list(check.combination_documents))]
+
+
+def _reportable(events: list[SemanticEvent]) -> list[SemanticEvent]:
+    """경위로 적을 이벤트만 남깁니다.
+
+    의미검증 인정 하나로 끝난 한정은 근거 목록의 "↳ 발췌 문언 그대로는 아니며 …" 줄이 이미
+    같은 말을 합니다. 두 자리에 같은 문장을 적으면 경위가 보고서의 기본 소음이 되고, 그러면
+    정작 판정이 움직인 한정이 그 소음에 묻힙니다. **단계를 두 번 이상 거친 한정은 그대로
+    남깁니다** — 그때는 근거 줄이 마지막 판정만 말하므로 경로가 사라집니다.
+    """
+    if len(events) == 1 and events[0].stage == "의미검증" and events[0].outcome == "인정":
+        return []
+    return events
+
+
+def _verification_trail(label: str, matrix: dict[str, dict[str, ElementMatch]],
+                        mappings: list[DocumentMapping]) -> list[VerificationTrail]:
+    """이 구성이 어떤 단계를 거쳐 지금 판정이 되었는지를 문헌별로 모읍니다.
+
+    **채택 문헌이 아니라 행렬 전체를 훑습니다.** 미대응 구성에는 채택 문헌이 없어서, 채택된
+    셀만 보면 경위가 가장 필요한 구성에서 정확히 아무것도 남지 않습니다. 경위가 있다는 것은
+    그 문헌을 실제로 심사했다는 뜻이므로, 채택 여부와 무관하게 남길 값입니다.
+    """
+    trails: list[VerificationTrail] = []
+    for document_id in sorted(matrix):
+        match = matrix[document_id].get(label)
+        if match is None:
+            continue
+        steps = [TrailStep(index=check.index, limitation=check.limitation,
+                           stage=event.stage, outcome=event.outcome,
+                           note=_clip(event.note, 300),
+                           combination_documents=list(event.supplied_by))
+                 for check in match.limitation_checks
+                 for event in _reportable(_events(check))]
+        trail = VerificationTrail(
+            document_id=document_id,
+            reference_number=_reference_number(document_id, mappings),
+            sample_count=match.sample_count,
+            sample_unanimous=match.sample_unanimous,
+            sample_requirements=match.sample_requirements,
+            steps=steps,
+            # 만장일치가 **아닌** 한정만 싣습니다. 갈린 것뿐 아니라 무응답·판독불가가 섞인
+            # 한정도 포함됩니다 — 셋 중 하나만 답한 자리는 갈린 것은 아니어도 확인이 더
+            # 필요합니다. 전부 실으면 정작 볼 것이 그 목록에 묻힙니다.
+            tallies=[(check.index, check.limitation, check.sample_tally)
+                     for check in match.limitation_checks
+                     if check.sample_tally.available and not check.sample_tally.unanimous],
+        )
+        # 적을 것이 없는 문헌은 싣지 않습니다. 만장일치로 통과한 셀까지 한 줄씩 나가면
+        # 경위가 보고서의 기본 소음이 되고, 그러면 갈린 셀이 묻힙니다.
+        if steps or trail.split or trail.tallies:
+            trails.append(trail)
+    return trails
+
+
+def _trail_lines(item: ClaimResult, mappings: list[DocumentMapping]) -> list[str]:
+    """판정 경위를 단계별로 적습니다. 초기 비교·의미검증·결합검증을 한 줄에 섞지 않습니다."""
+    if not item.trail:
+        return []
+    lines = ["", "판정 경위:"]
+    for trail in item.trail:
+        where = _document_name(trail.document_id, trail.reference_number)
+        if trail.split:
+            # 비율이 아니라 분자·분모를 적습니다. "0.33"은 두 가지로 읽히지만 "3개 중 1개"는
+            # 한 가지로만 읽힙니다.
+            # **"갈렸다"고 단정하지 않습니다.** 만장일치가 아닌 이유는 판단이 나뉜 것일 수도,
+            # 표본이 답하지 못한 것일 수도 있습니다. 어느 쪽인지는 아래 한정별 줄이 말하고,
+            # 이 줄은 셀 단위로 확인할 수 있는 사실(만장일치 비율)만 적습니다.
+            lines.append(f"- ({where}) ⚠️ 초기 비교 결과가 불안정합니다 — "
+                         f"한정 {trail.sample_requirements}개 중 "
+                         f"{trail.sample_unanimous}개만 표본 {trail.sample_count}회 만장일치")
+        # 어느 한정이 몇 대 몇으로 갈렸는지. 구성 단위 비율만으로는 "2대 1로 갈린 미개시"와
+        # "3대 0으로 일치한 미개시"가 같은 값이 되는데, 그 둘은 다음 조치가 다릅니다.
+        lines += [f"  · 한정 #{index} 「{_clip(text, 46)}」 {_tally_kind(tally)}: "
+                  f"개시 {tally.disclosed}표 · 미개시 {tally.missing}표"
+                  + (f" · 무응답 {absent}표" if (absent := tally.count("absent")) else "")
+                  + (f" · 판독불가 {invalid}표" if (invalid := tally.count("invalid")) else "")
+                  + f" (표본 {tally.total}회)"
+                  for index, text, tally in trail.tallies]
+        # 단계 순서(의미검증 → 결합검증)로 묶습니다. 한정 번호 순으로 늘어놓으면 두 단계가
+        # 번갈아 나와, 어느 단계가 무엇을 걸렀는지가 줄을 세어야 보입니다.
+        #
+        # 한정 하나가 **두 단계 모두에** 나올 수 있습니다. 문헌 단독으로 기각된 뒤 결합 위에서
+        # 다시 심사받은 한정이 그렇고, 그 두 줄이 함께 있어야 "결합까지 보고도 안 됐다"가
+        # 읽힙니다(models.SemanticEvent).
+        for stage in ("의미검증", "결합검증"):
+            for step in [item for item in trail.steps if item.stage == stage]:
+                supplied = ""
+                if step.combination_documents:
+                    names = ", ".join(
+                        _document_name(document_id, _reference_number(document_id, mappings))
+                        for document_id in step.combination_documents)
+                    supplied = f" (빠진 축은 {names}가 개시)"
+                note = f" — {step.note}" if step.note else ""
+                # 번호는 감사 데이터(judgment.json·verify_notes)의 한정 인덱스와 같은 값이라
+                # 0부터입니다. "한정 0"으로 적으면 개수로 읽히므로 식별자임을 표시합니다.
+                lines.append(f"- ({where}) {step.stage} {step.outcome}: "
+                             f"한정 #{step.index} 「{_clip(step.limitation, 60)}」{supplied}{note}")
+    return lines
+
+
+def _tally_kind(tally: SampleTally) -> str:
+    """이 한정이 왜 만장일치가 아닌지. 후속 조치가 갈리므로 한 낱말로 뭉치지 않습니다.
+
+    판정 불일치는 같은 근거를 두고 판단이 나뉜 것이라 사람이 원문을 봐야 하고, 응답 결손은
+    도구가 답을 받지 못한 것이라 다시 물으면 됩니다.
+    """
+    kinds = [name for name, holds in (("판정 불일치", tally.split),
+                                      ("응답 결손", tally.incomplete)) if holds]
+    return " · ".join(kinds) or "표본 불일치"
+
+
+def _document_name(document_id: str, reference_number: int | None) -> str:
+    return f"인용발명 {reference_number}" if reference_number is not None else f"문헌 {document_id}"
 
 
 def _semantic_bridge(check: LimitationCheck | None) -> tuple[str, str]:
@@ -627,7 +826,16 @@ def _conclusion(claim: Claim, chain: ChainInfo, merged: dict[str, ElementMatch])
         # 남은 차이 중 미채택 문헌이 메우는 것은 따로 적습니다. 뭉쳐 두면 결론 줄만 읽는
         # 사람이 그 구성 전체를 추가 검토 대상으로 옮겨 적게 됩니다.
         limited = [label for label in chain.residual if label in chain.beyond_limit_residual]
-        detail.append(f"차이가 남는 구성: {', '.join(chain.residual)}.")
+        # 확인된 개시가 하나도 없는 구성은 "차이가 남는다"가 아닙니다. 차이는 대비해 본
+        # 결과이고, 이쪽은 대비 자체를 못 한 것입니다. 후속 조치도 다릅니다 — 앞의 것은
+        # 보완 문헌 검색, 뒤의 것은 원문 확인과 재실행입니다.
+        reserved = set(chain.reserved)
+        differing = [label for label in chain.residual if label not in reserved]
+        reserved = [label for label in chain.residual if label in reserved]
+        if differing:
+            detail.append(f"차이가 남는 구성: {', '.join(differing)}.")
+        if reserved:
+            detail.append(f"의미검증 미완료로 판정을 유보한 구성: {', '.join(reserved)}.")
         if limited:
             detail.append(f"그중 미채택 인용발명이 그 한정을 개시한 구성: {', '.join(limited)}.")
     return f"{title} — {' '.join(detail)}" if detail else title
@@ -669,13 +877,19 @@ def _summary_similarity(claim: Claim, results: list[ClaimResult]) -> str:
     if any(result.status == "판정 불가" for result in results):
         return "구성대비 판정을 받지 못해 유사 내용을 요약할 수 없습니다."
     substantive = [result for result in results if not result.is_preamble]
-    corresponded = [result for result in substantive if result.corresponded]
+    # 확인된 개시가 하나도 없는 구성은 공통점 요약에서 뺍니다. 그 구성을 "대응 기재가
+    # 확인됨"으로 세면, 본문에서 판정 유보로 적어 둔 것을 요약이 공통점으로 되살립니다.
+    corresponded = [result for result in substantive
+                    if result.corresponded and result.status != "판정 유보"]
     if not corresponded:
         return "청구항과 인용발명 사이에 대응되는 기술 내용이 확인되지 않았습니다."
-    numbers = sorted({result.adopted_reference for result in corresponded
-                      if result.adopted_reference is not None})
-    references = ", ".join(f"인용발명 {number}" for number in numbers) or "제시된 인용발명"
     representative = _representative(claim, corresponded)
+    # 문헌 번호는 **대표 구성이 실제로 대응된 문헌**만 적습니다. 대응된 모든 구성의 채택
+    # 문헌을 합쳐 적으면 주어와 술어가 서로 다른 출처에서 옵니다 — 실측: 융합 구성을
+    # 인용발명 2 하나가 개시했는데 요약은 "인용발명 1, 2, 3은 …융합… 구성에서 공통되며"로
+    # 나갔습니다. 나머지 문헌이 어디까지 대응했는지는 뒤의 범위 문구가 이미 말합니다.
+    references = (f"인용발명 {representative.adopted_reference}"
+                  if representative.adopted_reference is not None else "제시된 인용발명")
     common = _summary_phrase(representative.claim)
     # 부분 개시 구성을 "모두 …에서 공통된다"고 적으면, 정작 개시되지 않은 한정을 공통점으로
     # 단언하게 됩니다. 실제로 "제1·제2 반사부재 **사이에** 배치되는 광원"이 그 배치 관계는
@@ -801,6 +1015,87 @@ def pipeline_invariants(reports: list[ClaimReport],
         notes += _evidence_is_never_erased(report, matrix)
         notes += _every_rejection_has_a_reason(report, matrix)
         notes += _grades_never_exceed_their_own_evidence(report, matrix)
+        notes += _no_full_grade_rests_on_an_unchecked_limitation(report, matrix)
+        notes += _verified_judgments_keep_their_trail(report, matrix)
+        notes += _sample_tallies_add_up(report, matrix)
+    return notes
+
+
+def _sample_tallies_add_up(report: ClaimReport,
+                           matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """표본 집계가 원시 투표와 어긋나지 않는지.
+
+    집계는 투표에서 유도하므로 정의상 갈릴 수 없지만, 기록되는 투표 **수**가 물어본 표본
+    수와 다르면 유도값 자체가 사실이 아닙니다. "3표 중 2표"라고 적힌 줄이 실제로는 두 표만
+    받은 것이면, 읽는 사람은 없는 표본 하나를 셈에 넣습니다.
+    """
+    notes: list[str] = []
+    for document_id, matches in sorted(matrix.items()):
+        for label, match in sorted(matches.items()):
+            for check in match.limitation_checks:
+                tally = check.sample_tally
+                if not tally.available or len(tally.votes) == tally.total:
+                    continue
+                notes.append(f"[불변식 S1] 청구항 {report.claim_number} ({label}) / 문헌 "
+                             f"{document_id} 한정 #{check.index}: 표본 {tally.total}회인데 "
+                             f"기록된 투표는 {len(tally.votes)}건입니다.")
+    return notes
+
+
+def _verified_judgments_keep_their_trail(
+        report: ClaimReport, matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """검증 단계가 움직인 판정은 보고서에도 남아야 합니다.
+
+    행렬에는 "의미검증이 이 한정을 기각했다"가 사유와 함께 기록되는데, 보고서가 그것을 읽지
+    않으면 남는 것은 결과 한 줄뿐입니다. 그러면 읽는 사람은 도구가 그 구성을 **검토하지
+    않았다**고 읽습니다 — 실제로는 근거를 들어 두 번 기각한 것인데도 그렇습니다. 실측에서
+    바로 그 상태의 보고서를 두고 두 사람이 정반대 결론을 냈습니다.
+
+    _evidence_is_never_erased가 **인정된** 근거를 지키는 것과 같은 이유로, 이쪽은 **기각된**
+    판단의 사유를 지킵니다. 인정만 남기고 기각을 버리면 보고서는 한쪽으로만 검증 가능해집니다.
+    """
+    notes: list[str] = []
+    by_label = {item.label: item for item in report.claims}
+    for label, item in sorted(by_label.items()):
+        # 이벤트 단위로 셉니다. 한정 단위로 세면 두 단계를 거친 한정에서 뒤엣것만 남아도
+        # 통과합니다 — 앞선 기각이 사라지는 것이 애초에 이 기록을 만든 이유입니다.
+        moved = {(document_id, check.index, event.stage, event.outcome)
+                 for document_id, matches in matrix.items()
+                 for check in (matches.get(label).limitation_checks if matches.get(label) else [])
+                 for event in _reportable(_events(check))}
+        carried = {(trail.document_id, step.index, step.stage, step.outcome)
+                   for trail in item.trail for step in trail.steps}
+        if lost := moved - carried:
+            notes.append(f"[보고서 정합성] 청구항 {report.claim_number} ({label}): 검증 단계가 "
+                         f"판정을 바꾼 기록 {len(lost)}건이 보고서 경위에서 빠졌습니다.")
+    return notes
+
+
+def _no_full_grade_rests_on_an_unchecked_limitation(
+        report: ClaimReport, matrix: dict[str, dict[str, ElementMatch]]) -> list[str]:
+    """P4. 의미검증을 받지 못한 한정 위에 동일급 판정이 설 수 없습니다.
+
+    실측에서 정확히 이 형태로 새어 나갔습니다. 구성 D·E의 한정 다섯 건이 검증기 응답에서
+    빠졌고(entailment._mark_unchecked), 그 다섯 건이 그대로 개시로 남아 두 구성이 🟢
+    실질적 동일을 받았습니다. 그중 하나(절대좌표계에 대응하는 최종 3D 모델)는 원문을 읽으면
+    그 문헌에 없는 구성이었습니다.
+
+    derive_judgment가 이미 상한을 씌우지만, 상한은 판정을 재산출하는 경로를 탄 셀에만
+    걸립니다. 재산출을 부르지 않는 경로가 하나라도 남으면 같은 결과가 다시 나갑니다 —
+    P3가 "등급이 한정별 개시보다 높다"를 결과로 확인하는 것과 같은 이유로, 이쪽도 경로가
+    아니라 **결과**를 봅니다.
+    """
+    notes: list[str] = []
+    for document_id, matches in sorted(matrix.items()):
+        for label, match in sorted(matches.items()):
+            if match.error or match.judgment not in FULL_JUDGMENTS:
+                continue
+            pending = unverified_limitations(match)
+            if pending:
+                notes.append(
+                    f"[불변식 P4] 청구항 {report.claim_number} ({label}) / 문헌 "
+                    f"{document_id}: 등급 '{match.judgment}'인데 한정 {len(pending)}건이 "
+                    f"의미검증을 받지 못했습니다 ({'; '.join(pending)[:120]}).")
     return notes
 
 
@@ -975,9 +1270,16 @@ def _summary_difference(chain: ChainInfo, results: list[ClaimResult]) -> str:
     if well_known:
         lines.append(f"구성 {', '.join(well_known)}은 주지관용기술로 보아 결합에 더했으며, "
                      "그 인정 여부는 별도로 확인해야 합니다.")
+    # 유보 구성은 차이 목록에서 뺍니다. 본문과 결론이 '판정 유보'로 적은 것을 요약이
+    # "세부 구현·하위 한정에 차이가 남아 있다"로 되살리면, 요약만 읽는 독자는 대비해 본
+    # 결과가 있다고 읽습니다. 여기서만 새어 나가면 앞의 두 곳을 고친 의미가 없습니다.
+    if chain.reserved:
+        lines.append(f"구성 {', '.join(chain.reserved)}은 의미검증을 수행하지 못해 개시 여부를 "
+                     "확정하지 못했습니다. 차이 판단이 아니라 원문 확인이 필요한 항목입니다.")
     if lines:
         return " ".join(lines)
-    residual = [label for label in chain.residual if label not in chain.uncovered]
+    residual = [label for label in chain.residual
+                if label not in chain.uncovered and label not in set(chain.reserved)]
     if not residual:
         return ""
     line = f"구성 {', '.join(residual)}은 결합 후에도 세부 구현·하위 한정에 차이가 남아 있습니다."
@@ -1070,11 +1372,79 @@ def _claim_section(report: ClaimReport, mappings: list[DocumentMapping]) -> list
         if item.difference:
             lines.append(f"→ 차이점: {item.difference}")
         lines += _limitation_evidence_lines(item)
+        lines += _trail_lines(item, mappings)
     lines += ["", "### 종합 분석 요약", ""]
     if report.summary_similarity:
         lines.append(f"- 유사점: {report.summary_similarity}")
     if report.summary_difference:
         lines.append(f"- 차이점: {report.summary_difference}")
+    lines += _review_needed_lines(report)
+    return lines
+
+
+def _reserved_narrative(match: ElementMatch | None, mappings: list[DocumentMapping]) -> str:
+    """확인된 개시가 하나도 없는 구성의 서술. 대응을 주장하지 않습니다.
+
+    이 셀에서 확인된 사실은 **발췌가 원문에 실재한다**는 것 하나뿐입니다. 그 이상을 적으면
+    판단받지 않은 것을 판단한 결과로 옮겨 적게 됩니다.
+    """
+    where = _reference_name(match.document_id, mappings) if match else "제시된 인용발명"
+    return (f"{where}에 관련 기재가 있고 발췌가 원문에 실재하는 것까지는 확인했으나, "
+            "그 발췌가 이 구성의 한정을 뒷받침하는지는 의미검증에서 판단을 받지 못했습니다. "
+            "개시 여부를 원문으로 직접 확인하십시오.")
+
+
+def _status_of(match: ElementMatch | None, disclosed: int, pending: int) -> str:
+    """집계에 쓰는 구성 상태. 확인된 개시가 하나도 없으면 '판정 유보'입니다.
+
+    '부분 개시'는 "일부는 이 문헌에 있고 일부는 없다"는 뜻입니다. 한정이 전부 미완료인
+    구성을 거기 넣으면, 아무것도 확인하지 못한 상태가 절반쯤 확인된 상태로 집계됩니다.
+    '미개시'로 넣는 것도 같은 크기의 오류를 반대 방향으로 냅니다 — 그쪽은 문헌에 없다는
+    뜻이 됩니다. 세 칸 어디에도 맞지 않으므로 칸을 하나 더 둡니다.
+    """
+    if match is None:
+        return "미개시"
+    if is_reserved(match):
+        return "판정 유보"
+    return _STATUS.get(match.judgment, "미개시")
+
+
+def _unverified_entries(match: ElementMatch | None) -> list[str]:
+    """보고서에 적을 미완료 항목. 문언이 없어도 **표시는 사라지지 않게** 합니다.
+
+    구성이 하위 한정으로 분해되지 않은 경우(whole_element) 그 점검의 limitation은 구성 원문
+    한 줄 전체라 목록에서 빠집니다. 그런데 등급 상한은 그 점검에도 걸리므로, 문언이 없다는
+    이유로 아무것도 적지 않으면 "등급이 왜 눌렸는지 본문에 없는" 상태가 됩니다 — 결론과
+    본문이 어긋나는, 이 파이프라인이 되풀이한 바로 그 형태입니다.
+    """
+    texts = unverified_limitations(match)
+    if texts or not unverified_count(match):
+        return texts
+    return ["구성 전체 (하위 한정으로 분해되지 않은 점검)"]
+
+
+def _review_needed_lines(report: ClaimReport) -> list[str]:
+    """도구가 확인하지 못한 것을 한자리에 모읍니다. 판정이 아니라 **작업 지시**입니다.
+
+    구성별 근거 줄에도 같은 사실이 찍히지만, 그것은 그 구성을 읽는 사람에게만 보입니다.
+    결론만 읽고 넘기는 독자에게는 "이 보고서의 어느 판정이 검증 위에 서 있지 않은가"가
+    한 번도 보이지 않습니다. 실측 사건에서 🟢 두 개가 정확히 그렇게 나갔습니다.
+
+    판정을 여기서 되돌리지 않습니다. 어느 쪽이 옳은지는 원문을 읽어야 정해지고, 이 절의
+    목적은 읽어야 할 자리를 지목하는 것입니다.
+    """
+    pending = [item for item in report.claims if item.unverified_limitations]
+    if not pending:
+        return []
+    lines = ["", "### 검토 필요 — 의미검증 미완료", "",
+             "아래 한정은 발췌가 원문에 실재하는 것까지만 확인했고, 그 발췌가 한정을 "
+             "뒷받침하는지는 판단을 받지 못했습니다. 개시로 적혀 있으나 확정된 개시가 "
+             "아니므로, 해당 구성의 등급은 동일급을 받지 못하도록 상한이 걸려 있습니다. "
+             "원문으로 직접 확인하십시오.", ""]
+    for item in pending:
+        heading = "전제부" if item.is_preamble else item.label
+        for limitation in item.unverified_limitations:
+            lines.append(f"- ({heading}) {_clip(limitation, 100)}")
     return lines
 
 
@@ -1087,11 +1457,31 @@ def _metric_line(item: ClaimResult) -> str:
     """
     parts = []
     if item.total_limitations:
-        parts.append(f"한정 {item.disclosed_limitations}/{item.total_limitations} 개시")
+        parts.append(_limitation_tally(item))
     parts.append(f"{item.emoji} {item.grade}")
     if item.evidence_locations:
         parts.append(f"근거 {item.evidence_locations}곳")
     return " · ".join(parts)
+
+
+def _limitation_tally(item: ClaimResult) -> str:
+    """한정 집계 한 줄. 미완료가 있으면 세 칸으로 갈라 적습니다.
+
+    "한정 3/3 개시 · ⚠️ 의미검증 미완료 3건"은 스스로를 반박합니다 — 셋 다 개시인데 셋 다
+    미완료일 수는 없습니다. 내부의 disclosed 값을 보존하는 것과 그 값을 그대로 보여 주는
+    것은 다른 문제입니다. 읽는 사람에게 필요한 것은 "확인된 것이 몇 개인가"이고, 그 답은
+    미완료를 개시에 포함한 분자로는 나오지 않습니다.
+
+    미완료가 없으면 종전 형식을 그대로 씁니다. 흔한 경우의 표기를 바꾸면 옛 보고서와
+    대조가 안 되고, 세 칸을 늘 적으면 0이 두 개 붙은 줄이 매번 나갑니다.
+    """
+    pending = item.unverified_limitation_count
+    if not pending:
+        return f"한정 {item.disclosed_limitations}/{item.total_limitations} 개시"
+    confirmed = max(item.disclosed_limitations - pending, 0)
+    uncovered = max(item.total_limitations - item.disclosed_limitations, 0)
+    return (f"한정 {item.total_limitations}개 — 개시 확인 {confirmed} · "
+            f"⚠️ 의미검증 미완료 {pending} · 미개시 {uncovered}")
 
 
 def _coverage_summary(results: list[ClaimResult]) -> str:
@@ -1107,8 +1497,15 @@ def _coverage_summary(results: list[ClaimResult]) -> str:
         return f"구성 {len(substantive)}개 — 판정을 받지 못해 집계하지 않았습니다"
     full = sum(1 for result in substantive if result.status == "개시됨")
     partial = sum(1 for result in substantive if result.status == "부분 개시")
-    uncovered = len(substantive) - full - partial
-    return (f"구성 {len(substantive)}개 — 완전개시 {full} · 부분개시 {partial} · 미대응 {uncovered}")
+    # 확인된 개시가 하나도 없는 구성은 따로 셉니다. 부분개시에 섞으면 "구성 5개 중 2개가
+    # 부분 개시"라는 집계가 실제로는 "2개는 아무것도 확인하지 못함"을 감춥니다. 결론을
+    # 정하는 것이 구성별 등급이 아니라 이 집계이므로, 여기서 감추면 결론이 흔들립니다.
+    reserved = sum(1 for result in substantive if result.status == "판정 유보")
+    uncovered = len(substantive) - full - partial - reserved
+    summary = f"구성 {len(substantive)}개 — 완전개시 {full} · 부분개시 {partial}"
+    if reserved:
+        summary += f" · ⚠️ 판정유보 {reserved}"
+    return f"{summary} · 미대응 {uncovered}"
 
 
 def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
@@ -1131,6 +1528,11 @@ def _limitation_evidence_lines(item: ClaimResult) -> list[str]:
         if proof.semantic_relation:
             note = f" — {proof.semantic_note}" if proof.semantic_note else ""
             lines.append(f"  ↳ 발췌 문언 그대로는 아니며 {proof.semantic_relation}{note}")
+        # 검증을 받은 근거에만 위 단서가 붙으므로, 받지 못한 근거는 아무 표시가 없으면
+        # **가장 튼튼한 근거로** 읽힙니다. 신호가 뒤집히지 않도록 사실을 그대로 적습니다.
+        elif proof.verification_incomplete:
+            lines.append("  ↳ ⚠️ 의미검증 미완료 — 발췌가 원문에 실재하는 것은 확인했으나, "
+                         "이 발췌가 한정을 뒷받침하는지는 판단을 받지 못했습니다")
     return lines
 
 

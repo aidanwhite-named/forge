@@ -130,19 +130,152 @@ def atomic_coverage(match: ElementMatch) -> float | None:
     점검 결과가 없을 때 None을 쓰는 근거: 누락 한정 수만으로는 분모(전체 하위 제한 수)를
     알 수 없습니다. 누락이 있으면 _build_matches가 이미 판정을 '일부 차이' 이하로 강등하고
     quality_key도 누락 수를 세므로, 여기서 추정값을 지어내지 않아도 벌점은 반영됩니다.
+
+    **분자는 확인된 개시만 셉니다.** 보고서 정량 지표(limitation_counts)와 분자가 다른 것은
+    이 모듈 첫 줄에 적힌 그대로입니다 — 문헌 선정에 쓰는 값과 보고서에 찍히는 값은 서로 다른
+    질문에 답합니다. 보고서는 "이 문헌에 무엇이 있다고 판정했나"를 적어야 하므로 미완료를
+    빼면 없는 누락을 지어내게 되고, 선정은 "무엇이 확인되었나"를 물어야 하므로 확인되지 않은
+    한정 위에서 문헌 순위가 뒤집히면 안 됩니다.
     """
-    disclosed, total = disclosed_count(
-        match.limitation_checks, set(match.combination_resolved))
-    return disclosed / total if total else None
+    states = limitation_states(match.limitation_checks, set(match.combination_resolved))
+    if not states:
+        return None
+    return sum(1 for _, state in states if state == DISCLOSED) / len(states)
 
 
-def _satisfied_groups(checks: list) -> set[str]:
-    return {check.alternative_group for check in checks
-            if check.disclosed and check.alternative_group}
+# --- 한정 하나의 상태: 개시 · 미완료 · 누락 --------------------------------------
+# 의미검증이 응답에서 항목을 빠뜨리면 그 한정은 검증을 **받지 못한** 상태로 남습니다
+# (entailment._mark_unchecked). 이것을 개시나 누락 어느 한쪽에 접으면 반대 방향의 오류가
+# 하나씩 생깁니다.
+#
+#   개시로 접으면 — 검증을 건너뛴 한정이 보고서에서 가장 튼튼한 근거로 보입니다. 의미검증을
+#   통과한 근거에만 "발췌 문언 그대로는 아니며…" 단서가 붙으므로, 검증을 받지 못한 근거는
+#   무표시, 즉 원문 그대로로 읽힙니다. 실측에서 🟢을 받은 구성 D·E의 한정이 정확히 그것들이었습니다.
+#
+#   누락으로 접으면 — "검증기가 응답을 빠뜨렸다"가 "이 문헌에 그 한정이 없다"라는 **문헌에
+#   대한 사실 주장**으로 바뀝니다. 그 문장은 그대로 보고서의 차이점 줄로 나갑니다.
+#
+# 그래서 disclosed를 뒤집지 않고 상태를 하나 더 둡니다. 등급·신규성·문헌 선정·근거 출력이
+# 전부 이 함수 하나를 보고, 각자 semantic_status를 다시 해석하지 않습니다.
+DISCLOSED = "disclosed"
+UNVERIFIED = "unverified"
+MISSING = "missing"
+_STATE_RANK = {MISSING: 0, UNVERIFIED: 1, DISCLOSED: 2}
+# 의미검증을 **시도했으나** 판단을 받지 못한 상태만 미완료로 봅니다. "not_run"은 원문 대조를
+# 통과한 발췌 묶음이 없어 대상에 아예 오르지 않은 한정이라 성격이 다릅니다 — 그쪽은
+# quote·verify 게이트(ineligible_reason·chain._directly_disclosed)가 이미 따로 막고 있고,
+# 여기까지 미완료로 묶으면 정상 경로의 사건 대부분이 미완료로 찍혀 상한이 무의미해집니다.
+UNVERIFIED_SEMANTIC_STATUS = "error"
 
 
-def _is_disclosed(check, satisfied: set[str]) -> bool:
-    return bool(check.disclosed or (check.alternative_group and check.alternative_group in satisfied))
+def is_unverified_check(check) -> bool:
+    """이 점검 하나가 의미검증을 받지 못한 상태인지. 대안 묶음은 보지 않습니다.
+
+    근거 한 줄에 단서를 붙일지 정하는 자리(report._limitation_evidence_lines)가 필요로 하는
+    것은 묶음 단위 상태가 아니라 **그 발췌를 낸 점검**의 상태입니다. 상태 문자열을 소비자가
+    직접 비교하지 않도록 여기에 둡니다.
+    """
+    return bool(check is not None and check.disclosed
+                and check.semantic_status == UNVERIFIED_SEMANTIC_STATUS)
+
+
+def _raw_state(check, resolved: set[str], resolved_groups: set[str]) -> str:
+    if check.limitation in resolved or (check.alternative_group
+                                        and check.alternative_group in resolved_groups):
+        return DISCLOSED
+    if not check.disclosed:
+        return MISSING
+    return UNVERIFIED if check.semantic_status == UNVERIFIED_SEMANTIC_STATUS else DISCLOSED
+
+
+def limitation_states(checks: list, resolved: set[str] | None = None) -> list[tuple]:
+    """접힌 한정마다 (점검, 상태). counted_checks와 같은 순서·같은 자릿수입니다.
+
+    대안 묶음은 묶음 전체가 한 상태를 갖습니다. 확인된 대안이 하나라도 있으면 개시이고,
+    확인되지 않은 대안만 남았으면 미완료입니다 — "A 또는 B 중 하나"에서 A가 검증을 통과했다면
+    B의 검증이 빠졌다는 사실은 그 요구사항의 충족 여부를 바꾸지 못합니다.
+
+    resolved는 채택 조합의 다른 인용발명이 댄 한정입니다(disclosed_count와 같은 입력).
+    결합 심사를 거쳐 들어온 값이므로 개시로 봅니다.
+    """
+    resolved = resolved or set()
+    resolved_groups = {check.alternative_group for check in checks
+                       if check.limitation in resolved and check.alternative_group}
+    group_state: dict[str, str] = {}
+    for check in checks:
+        if not check.alternative_group:
+            continue
+        group_state[check.alternative_group] = max(
+            group_state.get(check.alternative_group, MISSING),
+            _raw_state(check, resolved, resolved_groups),
+            key=_STATE_RANK.get)
+    return [(check, group_state[check.alternative_group] if check.alternative_group
+             else _raw_state(check, resolved, resolved_groups))
+            for check in counted_checks(checks)]
+
+
+def is_reserved(match: ElementMatch | None) -> bool:
+    """확인된 개시가 하나도 없이 미검증만 남은 대응. **차이가 아니라 판단 없음**입니다.
+
+    등급·서술·차이점·결론·내부 지표가 전부 이 하나를 봅니다. 자리마다 조건을 다시 적으면
+    한 보고서가 서로 다른 말을 합니다 — 지표는 '판정 유보'인데 결론은 '차이가 남습니다'로
+    나간 것이 실측 형태입니다.
+
+    누락뿐인 대응(미검증 0건)은 여기에 해당하지 않습니다. 그쪽은 개시가 없다고 **판정된**
+    것이고, 차이로 적는 것이 맞습니다.
+    """
+    states = limitation_states(match.limitation_checks,
+                               set(match.combination_resolved)) if match else []
+    return bool(states
+                and any(state == UNVERIFIED for _, state in states)
+                and not any(state == DISCLOSED for _, state in states))
+
+
+def limitation_state_map(match: ElementMatch | None) -> dict[str, str]:
+    """한정 문언 → 상태. 감사 데이터와 회귀 기대값이 한정 단위로 걸릴 수 있게 합니다.
+
+    대안 묶음은 counted_checks가 접은 대표 하나만 실립니다. 묶음 전체가 한 요구사항이므로
+    대안마다 상태를 적으면 같은 요구사항이 여러 줄로 세어집니다.
+    """
+    if match is None:
+        return {}
+    return {check.limitation: state
+            for check, state in limitation_states(match.limitation_checks,
+                                                  set(match.combination_resolved))
+            if check.limitation}
+
+
+def reserved_labels(claim: Claim, matches: dict[str, ElementMatch]) -> list[str]:
+    """판정을 유보한 구성. residual(차이가 남는 구성)과 반드시 갈라 셉니다."""
+    return [element.label for element in claim.elements
+            if is_reserved(matches.get(element.label))]
+
+
+def unverified_count(match: ElementMatch | None) -> int:
+    """의미검증을 받지 못한 한정 수. 구성 원문 한 줄 점검(whole_element)도 함께 셉니다."""
+    if match is None:
+        return 0
+    states = limitation_states(match.limitation_checks, set(match.combination_resolved))
+    return sum(1 for _, state in states if state == UNVERIFIED)
+
+
+def unverified_limitations(match: ElementMatch | None) -> list[str]:
+    """보고서에 적을 미완료 한정 문언. whole_element는 뺍니다.
+
+    구성 원문 한 줄을 통째로 점검한 경우의 limitation은 구성 문언 전체라, 차이점 줄에 그대로
+    실으면 구성을 한 번 더 읽어 주는 문장이 됩니다(models.missing_limitations와 같은 규율).
+    개수는 unverified_count가 whole_element까지 세므로 상한 판단에서는 빠지지 않습니다.
+    """
+    if match is None:
+        return []
+    texts: list[str] = []
+    for check, state in limitation_states(match.limitation_checks,
+                                          set(match.combination_resolved)):
+        if state != UNVERIFIED or not check.limitation or check.whole_element:
+            continue
+        if check.limitation not in texts:
+            texts.append(check.limitation)
+    return texts
 
 
 # --- 판정 등급 산출 -----------------------------------------------------------
@@ -173,28 +306,35 @@ def derive_judgment(checks: list, *, has_evidence: bool, terminology: str = "equ
       core 일부 개시 → "일부 유사"
       core 전부 개시 → different_purpose면 "일부 유사"
                        qualifier 누락이 있으면 "일부 차이"
+                       의미검증 미완료가 있으면 "일부 차이" (상한)
                        전부 개시면 terminology에 따라 "동일" 또는 "실질적 동일"
 
     has_evidence는 원문 대조에 걸 수 있는 발췌가 하나라도 있는지입니다. "차이"와 "대응 없음"의
     차이가 정확히 이것이라(compare.py: "관련 원문도 제시할 수 없다면 '차이'가 아니라 '대응 없음'"),
     이 구분을 등급 산출에서 잃으면 보고서가 "가장 가까운 기재"를 붙일 근거를 잃습니다.
+
+    **미완료는 개시 쪽에 세고 상한만 씌웁니다.** 누락 쪽에 세면 core가 하나 빠진 것이 되어
+    "일부 유사"로 내려가는데, 그 등급의 뜻은 "이 문헌에 그 동작이 없다"입니다. 확인하지 못한
+    것을 없는 것으로 적는 셈이라 방향이 반대인 오류가 됩니다. 반대로 개시로만 세고 상한을
+    두지 않으면 검증을 건너뛴 한정이 동일급 판정을 받습니다 — 실측 과대판정이 그것입니다.
     """
-    counted = counted_checks(checks)
-    if not counted:
+    states = limitation_states(checks)
+    if not states:
         # 점검 자체가 없으면 등급을 세울 근거가 없습니다. compare._requirements가 구성 원문
         # 한 줄이라도 core로 만들어 주므로 정상 경로에서는 오지 않습니다.
         return "대응 없음"
-    satisfied = _satisfied_groups(checks)
     # core를 선언하지 않은 분해 결과에서는 전체 한정이 그 역할을 합니다.
-    gate = [check for check in counted if check.kind == "core"] or counted
-    disclosed_gate = sum(1 for check in gate if _is_disclosed(check, satisfied))
-    if disclosed_gate == 0:
+    gate = [pair for pair in states if pair[0].kind == "core"] or states
+    held_gate = sum(1 for _, state in gate if state != MISSING)
+    if held_gate == 0:
         return "차이" if has_evidence else "대응 없음"
-    if disclosed_gate < len(gate):
+    if held_gate < len(gate):
         return "일부 유사"
     if different_purpose:
         return "일부 유사"
-    if any(not _is_disclosed(check, satisfied) for check in counted):
+    if any(state == MISSING for _, state in states):
+        return "일부 차이"
+    if any(state == UNVERIFIED for _, state in states):
         return "일부 차이"
     return "동일" if terminology == "identical" else "실질적 동일"
 
@@ -208,6 +348,21 @@ DIRECTNESS_FACTOR = {"direct": 1.0, "inferred": 0.85, "absent": 0.55}
 # 유사도는 그와 별개로 **근거의 실재 여부**를 반영해야 합니다. 그러지 않으면 지어낸 발췌 위에
 # 세운 대응과 원문으로 확인된 대응이 보고서에서 같은 숫자로 나갑니다.
 UNVERIFIED_EVIDENCE_FACTOR = 0.70
+# 의미검증을 받지 못한 한정의 비중만큼 유사도를 낮춥니다. 위 계수와 같은 성격입니다 —
+# 그쪽은 "발췌가 원문에 실재하는가", 이쪽은 "그 발췌가 한정을 뒷받침하는가"이고, 둘 다
+# 판정 라벨과 **별개로** 근거의 실재를 반영해야 합니다.
+#
+# 이 계수가 없으면 라벨이 전부를 지배합니다. 등급 상한이 미검증 셀을 '일부 차이'(0.55)에
+# 묶어 두어도, 실제로 한정을 확인한 '일부 유사'(0.35) 셀보다 여전히 높습니다. atomic_coverage는
+# 0.70~1.00 사이에서만 움직여 그 차이를 뒤집지 못합니다. 실측 형태로 재현하면 주 인용발명
+# 점수가 32.42 대 4.57로, 아무것도 확인하지 못한 문헌이 주 인용발명이 됐습니다.
+#
+# 값은 UNVERIFIED_EVIDENCE_FACTOR와 같게 둡니다. 두 계수가 재는 것이 같은 종류의 결손이라
+# 무게를 다르게 줄 근거가 없고, 무엇보다 이 계수는 atomic_coverage(이미 확정 개시만 셈)와
+# **곱해집니다**. 한 등급 강등에 해당하는 0.64를 쓰면 두 항이 같은 사실을 두 번 깎아 사실상
+# 두 등급이 내려가고, 실제로 그 값에서는 문헌이 주 인용발명 자격(CRITICAL_GAP)에서 떨어져
+# 구성이 "어느 인용발명에서도 확인되지 않음"으로 적혔습니다 — 원문 발췌가 있는데도 그렇습니다.
+UNVERIFIED_SEMANTIC_FACTOR = UNVERIFIED_EVIDENCE_FACTOR
 
 
 def item_similarity(match: ElementMatch | None) -> float:
@@ -219,9 +374,37 @@ def item_similarity(match: ElementMatch | None) -> float:
     factor = DIRECTNESS_FACTOR.get(match.directness, 1.0)
     if not match.quote or match.verify not in VERIFY_OK:
         factor *= UNVERIFIED_EVIDENCE_FACTOR
+    factor *= _semantic_factor(match)
     if atomic is None:
         return base * factor
     return base * (0.70 + 0.30 * atomic) * factor
+
+
+def _semantic_factor(match: ElementMatch) -> float:
+    """의미검증을 받지 못한 한정의 비중에 따른 감쇠. **확정 개시가 0이면 0입니다.**
+
+    비중으로 두는 이유: 다섯 중 하나가 미검증인 셀과 전부 미검증인 셀은 같은 것이 아닙니다.
+    앞의 것을 뒤의 것과 똑같이 깎으면, 대부분을 확인한 문헌이 아무것도 확인하지 못한 문헌과
+    같은 자리에 놓입니다.
+
+    **확정 개시가 하나도 없으면 계수가 아니라 0입니다.** 감쇠 계수를 아무리 낮게 잡아도
+    "확인이 0인 문헌이 확인이 1인 문헌을 밀어내지 않는다"는 보장이 서지 않습니다 — 한정
+    2개짜리에 맞춘 값이 5개짜리에서 다시 뒤집혔습니다(4.14 대 4.09). 이것은 크기의 문제가
+    아니라 순서의 문제라 계수로 표현할 수 없고, 규칙으로 두어야 합니다. 내부 지표가 묻는
+    것은 "무엇이 확인되었나"이므로, 확인된 것이 없으면 0이 정확한 답이기도 합니다.
+
+    누락뿐인 셀(미검증 0건)에는 적용하지 않습니다. 그쪽은 개시가 없다고 **판정된** 것이고
+    atomic_coverage와 판정 라벨이 이미 그 사실을 반영합니다.
+    """
+    states = limitation_states(match.limitation_checks, set(match.combination_resolved))
+    if not states:
+        return 1.0
+    unverified = sum(1 for _, state in states if state == UNVERIFIED)
+    if not unverified:
+        return 1.0
+    if is_reserved(match):
+        return 0.0
+    return 1.0 - (1.0 - UNVERIFIED_SEMANTIC_FACTOR) * (unverified / len(states))
 
 
 def direct_similarity(match: ElementMatch | None) -> float:
@@ -383,7 +566,6 @@ def has_correspondence(match: ElementMatch | None) -> bool:
     '차이'는 라벨 정의 자체가 "관련 기재는 있으나 청구항 구성을 개시한다고 보기 어렵다"이므로
     대응으로 세지 않습니다. 검증에 실패한 근거도 여기서 걸러집니다.
     """
-    atomic = atomic_coverage(match) if match is not None else None
     return bool(
         match
         and match.judgment not in NO_CORRESPONDENCE_JUDGMENTS
@@ -391,8 +573,20 @@ def has_correspondence(match: ElementMatch | None) -> bool:
         and match.directness != "absent"
         and match.verify in VERIFY_OK
         # 모델 판정이 잘못 들어오더라도 하위 제한 점검이 0/N이면 대응 기재로 세지 않습니다.
-        and (atomic is None or atomic > 0.0)
+        #
+        # **커버율(atomic_coverage)로 묻지 않습니다.** 그 값은 확정 개시만 세므로, 한정이
+        # 전부 미검증인 셀도 0.0이 되어 여기서 걸립니다. 그러면 원문 발췌가 그대로 있는
+        # 구성이 uncovered로 떨어지고 결론이 "어느 인용발명에서도 확인되지 않았습니다"라고
+        # 적습니다 — 손에 든 문헌을 다시 찾아 나서게 만드는 거짓 진술이고, 불변식 P1이
+        # 막으려는 바로 그것입니다. 이 게이트가 물어야 하는 것은 "확인되었는가"가 아니라
+        # "없다고 판정되었는가"이므로, 전부 누락일 때만 걸러 냅니다.
+        and _anything_not_missing(match)
     )
+
+
+def _anything_not_missing(match: ElementMatch) -> bool:
+    states = limitation_states(match.limitation_checks, set(match.combination_resolved))
+    return not states or any(state != MISSING for _, state in states)
 
 
 def no_correspondence_labels(claim: Claim, matches: dict[str, ElementMatch]) -> list[str]:
@@ -431,11 +625,19 @@ def disclosed_limitations(match: ElementMatch | None) -> set[str]:
     구성 단위 대응(has_correspondence)으로는 부족합니다 — 그 구성에 대응은 있어도 정작
     빠진 그 한정은 없을 수 있고, 그때 "이 문헌에 기재가 있다"고 적으면 없는 개시를
     단언하게 됩니다. 검증(verify)까지 요구하는 것은 has_correspondence와 같은 이유입니다.
+
+    **의미검증을 받지 못한 한정은 여기서 빠집니다.** 이 집합이 곧 filled_limitations를 거쳐
+    "주 인용발명이 빠뜨린 그 한정을 이 문헌이 댔다"는 결합의 확정 근거가 됩니다. 확인하지
+    못한 한정으로 그 문장을 세우면, 등급 상한으로 막아 둔 미완료가 문헌 선정 쪽으로 우회해
+    들어옵니다 — 상한은 표시를 누를 뿐 결합을 막지 못하기 때문입니다.
+
+    아래 함수들과 마찬가지로 판정 라벨은 보지 않습니다. 1차 사실만 봅니다.
     """
     if match is None or match.error:
         return set()
     return {check.limitation for check in match.limitation_checks
-            if check.disclosed and check.limitation and check.verify in VERIFY_OK}
+            if check.disclosed and check.limitation and check.verify in VERIFY_OK
+            and not is_unverified_check(check)}
 
 
 # --- 한정 단위 사실 계층 -------------------------------------------------------
@@ -489,8 +691,26 @@ def evidenced_limitations(match: ElementMatch | None) -> set[str]:
     개시로 확정된 것과 축 결손으로 기각된 것을 함께 봅니다. 결합 후보를 고를 때 물어야 할
     질문은 "이 문헌이 이 구성을 개시했는가"가 아니라 "이 문헌이 여기에 보탤 원문이 있는가"
     이기 때문입니다. 부 인용발명은 원래 구성 전체로는 주 인용발명보다 약합니다.
+
+    **의미검증을 받지 못한 것도 함께 봅니다.** 그 한정에도 원문 대조를 통과한 발췌가 그대로
+    있습니다(그것이 의미검증 대상이 되는 전제조건입니다). 여기서 빠뜨리면 불변식 P1이
+    "공백으로 적었으나 문헌에 근거가 있다"를 볼 수 없게 되는데, 미검증 구성이 uncovered로
+    떨어지는 경우가 정확히 P1이 잡아야 할 상황입니다 — 감시자가 감시할 자리에서 눈을 감습니다.
     """
-    return disclosed_limitations(match) | rejected_limitations(match)
+    return (disclosed_limitations(match) | rejected_limitations(match)
+            | unchecked_limitations(match))
+
+
+def unchecked_limitations(match: ElementMatch | None) -> set[str]:
+    """의미검증을 받지 못했으나 **원문 대조는 통과한** 한정의 문언.
+
+    rejected_limitations와 짝입니다. 그쪽은 "판단해 봤더니 뒷받침하지 못한다", 이쪽은
+    "판단을 받지 못했다"이고, 둘 다 그 문헌에 원문이 있다는 사실은 같습니다.
+    """
+    if match is None or match.error:
+        return set()
+    return {check.limitation for check in match.limitation_checks
+            if is_unverified_check(check) and check.limitation and check.verify in VERIFY_OK}
 
 
 def has_evidence(match: ElementMatch | None) -> bool:
@@ -568,23 +788,33 @@ def best_match(candidates: list[ElementMatch | None]) -> ElementMatch | None:
 def quality_key(match: ElementMatch | None) -> tuple:
     """대응의 우열. 점수 하나로 줄이지 않고 요구 우선순위 그대로 사전식 비교합니다.
 
-    판정 강도 → 직접성 → 원문 발췌 → 검증 상태 → 누락 한정 수 → 내부 유사도 순입니다.
+    판정 강도 → 직접성 → 원문 발췌 → 검증 상태 → 누락 한정 수 → 의미검증 미완료 수 →
+    내부 유사도 순입니다.
+
+    미완료 수가 여기 들어가는 이유: 등급이 같고 근거 품질도 같다면 **검증을 받은 셀**이
+    결합의 근거가 되어야 합니다. 등급 상한(derive_judgment)만으로는 두 셀이 같은 칸에
+    나란히 놓이는 경우를 가르지 못하고, 그때 입력 순서가 채택 문헌을 정하게 됩니다.
     """
     if match is None:
-        return (0, 0, 0, 0, 0, 0.0)
+        return (0, 0, 0, 0, 0, 0, 0.0)
     return (
         JUDGMENT_RANK.get(match.judgment, 0),
         DIRECTNESS_RANK.get(match.directness, 0),
         1 if match.quote else 0,
         VERIFY_RANK.get(match.verify, 0),
         -len(match.missing_limitations),
+        -unverified_count(match),
         round(item_similarity(match), 6),
     )
 
 
 def decisive_key(match: ElementMatch | None) -> tuple:
-    """동률 해소용 마지막 점수를 뺀 실질 비교 키. '명확히 우수'의 기준입니다."""
-    return quality_key(match)[:5]
+    """동률 해소용 마지막 점수를 뺀 실질 비교 키. '명확히 우수'의 기준입니다.
+
+    미완료 수까지 포함합니다(내부 유사도만 뺍니다). 검증을 받은 셀과 받지 못한 셀의 차이는
+    미세한 점수 차가 아니라 실질적인 근거 품질 차이라, 보완으로 인정해야 합니다.
+    """
+    return quality_key(match)[:6]
 
 
 def is_complete(match: ElementMatch | None) -> bool:
@@ -596,6 +826,7 @@ def is_complete(match: ElementMatch | None) -> bool:
         and match.quote
         and match.verify in VERIFY_OK
         and not match.missing_limitations
+        and not unverified_count(match)
     )
 
 
@@ -608,6 +839,10 @@ def supplement_reason(match: ElementMatch | None) -> str:
         reasons.append(f"{match.judgment} 판정")
     if match.missing_limitations:
         reasons.append(f"누락 한정 {len(match.missing_limitations)}건")
+    # 누락과 **따로** 적습니다. 둘을 합쳐 세면 "이 문헌에 없는 한정"과 "확인하지 못한 한정"이
+    # 한 숫자가 되어, 보완 문헌을 찾아야 하는지 검증을 다시 돌려야 하는지 구별되지 않습니다.
+    if unverified_count(match):
+        reasons.append(f"의미검증 미완료 {unverified_count(match)}건")
     if match.directness != "direct":
         reasons.append(f"직접 개시 아님({match.directness})")
     if not match.quote:
@@ -714,9 +949,21 @@ def residual_difference(match: ElementMatch | None) -> list[str]:
             return ["관련 기재는 있으나 청구항 한정 전체의 개시는 확인되지 않았습니다"]
         return ["대응되는 기재가 확인되지 않았습니다"]
     residual = list(match.missing_limitations)
+    # 미완료를 누락 목록에 섞지 않고 별도 문장으로 적습니다. 누락으로 적으면 "이 문헌에 그
+    # 한정이 없다"가 되고, 아예 적지 않으면 등급이 왜 상한에 걸렸는지가 본문에서 사라져
+    # 결론과 본문이 어긋납니다(report.report_invariants가 실측에서 잡은 형태입니다).
+    unverified = unverified_limitations(match)
+    if unverified:
+        residual.append(f"{'; '.join(unverified)} 한정은 의미검증을 수행하지 못해 "
+                        "개시가 확인되지 않았습니다")
+    # 확인된 개시가 하나도 없으면 여기서 끝냅니다. "'일부 차이' 판정에 그쳐 하위 한정까지
+    # 동일하다고 보기 어렵습니다"를 덧붙이면, 상한으로 눌러 둔 라벨을 대비해 본 결과인 것처럼
+    # 되읽게 됩니다 — 그 라벨 자체가 판단을 받지 못해서 나온 값입니다.
+    if is_reserved(match):
+        return residual
     if match.judgment not in FULL_JUDGMENTS:
         residual.append(f"{match.judgment} 판정에 그쳐 하위 한정까지 동일하다고 보기 어렵습니다")
-    elif match.directness != "direct":
+    if match.directness != "direct":
         residual.append("직접 개시가 아니라 추론에 의한 대응입니다")
     return residual
 

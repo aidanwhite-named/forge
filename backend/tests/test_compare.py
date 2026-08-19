@@ -362,6 +362,14 @@ def test_the_prompt_requires_reading_the_document_to_the_end():
         assert "실시예" in prompt
 
 
+def test_the_prompt_does_not_promote_evaluation_data_into_the_invention_workflow():
+    """출력 뒤의 LiDAR GT 평가를 입력 센서 단계로 읽은 실측 오판을 고정한다."""
+    for prompt in (COMPARE_PROMPT, BATCH_COMPARE_PROMPT):
+        assert "ground truth" in prompt
+        assert "발명 출력물을" in prompt
+        assert "생성 방법의 입력 데이터가 아닙니다" in prompt
+
+
 def test_the_middle_of_a_document_is_not_starved_by_front_loading():
     """검색이 적중하지 못해도 본문 중반·후반이 통째로 잘리지 않는다.
 
@@ -478,6 +486,10 @@ def test_a_different_purpose_caps_a_fully_disclosed_element_at_partial_similarit
     assert derive_judgment(full, has_evidence=True, different_purpose=True) == "일부 유사"
     assert derive_judgment(full, has_evidence=True, terminology="identical",
                            different_purpose=True) == "일부 유사"
+    # qualifier가 빠져 있어도 different_purpose가 먼저다. 프롬프트의 사다리 설명은 이 순서를
+    # 그대로 적어야 한다 — 모델은 "어떤 답이 어떤 등급이 되는지"를 그 설명으로 계산한다.
+    assert derive_judgment(_checks(("core", True), ("qualifier", False)),
+                           has_evidence=True, different_purpose=True) == "일부 유사"
 
 
 def test_evidence_presence_separates_a_difference_from_no_correspondence():
@@ -577,6 +589,41 @@ def test_sampling_collapses_a_split_vote_into_one_grade():
     assert match.limitation_checks[1].disclosed is False
 
 
+def test_the_merged_reason_comes_from_a_sample_that_agrees_with_the_merged_facts():
+    """이유와 판정이 다른 표본에서 오면 한 셀이 스스로를 반박한다.
+
+    한정별 개시 여부는 다수결로 정하는데 reason은 자유 서술이라, 근거가 가장 많이 실린 표본에서
+    그냥 가져오면 "…개시되어 있으므로"라는 이유와 미개시 판정이 함께 저장된다(실측 사례).
+    """
+    claim = _sampling_claim()
+    full = _sample(True, True) | {"reason": "한정이 전부 개시되어 있으므로"}
+    partial = _sample(True, False) | {"reason": "조건 한정은 개시되어 있지 않으므로"}
+
+    merged = compare.consensus([[full], [partial], [partial]], claim)[0]
+
+    checks = {check["index"]: check["disclosed"] for check in merged["limitation_checks"]}
+    assert checks == {0: True, 1: False}     # qualifier 1/3은 미개시
+    assert merged["reason"] == "조건 한정은 개시되어 있지 않으므로"
+
+
+def test_a_reason_is_dropped_when_no_sample_matches_the_merged_facts():
+    """어느 표본도 합쳐진 사실과 맞지 않으면 그 이유는 다른 사실을 설명하는 문장이다.
+
+    비워 두면 보고서가 발췌 자체를 가리키는 중립 문구로 대체한다(report._reason_clause).
+    남겨 두면 없는 근거를 지어낸 문장이 그대로 나간다.
+    """
+    claim = _sampling_claim()
+    core_only = _sample(True, False) | {"reason": "동작은 개시되어 있으므로"}
+    qualifier_only = _sample(False, True) | {"reason": "조건은 개시되어 있으므로"}
+
+    # 두 한정 모두 1/2 동률이라 미개시로 확정된다 — 어느 표본도 (False, False)를 내지 않았다.
+    merged = compare.consensus([[core_only], [qualifier_only]], claim)[0]
+
+    checks = {check["index"]: check["disclosed"] for check in merged["limitation_checks"]}
+    assert checks == {0: False, 1: False}
+    assert merged["reason"] == ""
+
+
 def test_a_single_sample_passes_through_untouched():
     """샘플링을 끈 설정에서 이 경로는 아무것도 바꾸지 않아야 한다."""
     claim = _sampling_claim()
@@ -672,3 +719,108 @@ def test_batch_and_single_judgments_do_not_share_a_cache_key():
     same_numbers = cache.cache_key(claim, document, "", 30000, [], mode="batch", samples=3)
     assert single != batch                 # 종전에는 이 둘이 같은 파일을 놓고 서로를 덮어썼다
     assert single != same_numbers          # 예산·표본이 같아도 프롬프트가 다르면 다른 키
+
+
+# --- 표본별 원시 투표 보존 --------------------------------------------------------
+# _merge_votes가 다수결로 합치면서 개별 표본의 답을 버렸다. 남는 것은 구성 단위 비율 하나뿐이라
+# "이 한정이 2대 1로 갈렸는가, 3대 0으로 일치했는가"를 말할 수 없었고, 그 차이가 **표본마다
+# 갈린 불안정한 미대응**과 **전 표본이 일관된 확정적 공백**을 가른다.
+
+def _cast(index: int, disclosed, *, omit: bool = False) -> dict:
+    """표본 하나의 응답. omit이면 이 한정을 아예 빠뜨린 응답이다."""
+    checks = [] if omit else [{"index": index, "disclosed": disclosed,
+                               "quote": "원문 발췌 문장입니다", "chunk_id": "D1-P-0001"}]
+    return {"label": "A", "judgment": "실질적 동일", "limitation_checks": checks}
+
+
+def _tally(*responses: dict, requirement_count: int = 1) -> dict:
+    from app.compare import _merge_votes
+    votes = [(index, item) for index, item in enumerate(responses)]
+    merged = _merge_votes(votes, requirement_count, len(responses))
+    return merged["limitation_checks"][0]["sample_tally"]
+
+
+def test_every_sample_answer_is_kept_not_just_the_total():
+    tally = _tally(_cast(0, True), _cast(0, False), _cast(0, True))
+
+    assert [vote["verdict"] for vote in tally["votes"]] == ["disclosed", "missing", "disclosed"]
+    assert tally["total"] == 3
+
+
+def test_a_sample_that_skipped_the_limitation_is_absent_not_missing():
+    """응답 결손을 "미개시"로 세면 도구의 상태가 문헌에 대한 사실 주장으로 바뀐다."""
+    tally = _tally(_cast(0, True), _cast(0, None, omit=True), _cast(0, True))
+
+    assert [vote["verdict"] for vote in tally["votes"]] == ["disclosed", "absent", "disclosed"]
+
+
+def test_an_unreadable_answer_is_invalid_not_missing():
+    tally = _tally(_cast(0, True), _cast(0, "아마도"), _cast(0, False))
+
+    assert [vote["verdict"] for vote in tally["votes"]] == ["disclosed", "invalid", "missing"]
+
+
+def test_a_sample_that_answered_nothing_at_all_still_counts_as_a_sample():
+    """구성 자체에 답하지 않은 표본을 빼면 표본 수와 투표 수가 어긋난다."""
+    from app.compare import _merge_votes
+
+    merged = _merge_votes([(0, _cast(0, True)), (1, _cast(0, False))], 1, 3)
+    tally = merged["limitation_checks"][0]["sample_tally"]
+
+    assert tally["total"] == 3 and len(tally["votes"]) == 3
+    assert tally["votes"][2] == {"sample": 2, "verdict": "absent"}
+
+
+def test_the_counts_are_derived_so_they_cannot_drift_from_the_votes():
+    from app.models import SampleTally
+
+    tally = SampleTally.model_validate(_tally(_cast(0, True), _cast(0, False),
+                                              _cast(0, True)))
+
+    assert (tally.disclosed, tally.missing) == (2, 1)
+    assert tally.disclosed + tally.missing + tally.count("absent") + tally.count("invalid") \
+        == tally.total
+    assert tally.split                                    # 2대 1은 갈린 것이다
+
+
+def test_a_unanimous_limitation_is_not_reported_as_split():
+    from app.models import SampleTally
+
+    tally = SampleTally.model_validate(_tally(_cast(0, False), _cast(0, False),
+                                              _cast(0, False)))
+
+    assert (tally.disclosed, tally.missing, tally.split) == (0, 3, False)
+
+
+def test_a_legacy_cell_says_it_has_no_votes_instead_of_inventing_them():
+    """비율에서 되짚어 만들면 있지도 않았던 표본 답이 기록에 생긴다."""
+    from app.models import LimitationCheck
+
+    legacy = LimitationCheck.model_validate({"index": 0, "limitation": "a", "disclosed": False})
+
+    assert legacy.sample_tally.available is False
+    assert legacy.sample_tally.votes == []
+
+
+def test_recording_the_votes_does_not_change_a_single_judgment():
+    """3-a는 **관측**이다. 다수결·만장일치 계산은 종전 그대로여야 한다.
+
+    기록을 더하면서 판정이 달라지면 이 단계의 값은 관측이 아니라 변경이고, 그러면 앞선
+    실행과의 비교가 성립하지 않는다.
+    """
+    from app.compare import _merge_votes
+
+    cases = [
+        (_cast(0, True), _cast(0, True), _cast(0, False)),      # 2대 1 개시
+        (_cast(0, True), _cast(0, False), _cast(0, False)),     # 1대 2 미개시
+        (_cast(0, True), _cast(0, True), _cast(0, True)),       # 만장일치 개시
+        (_cast(0, False), _cast(0, None, omit=True), _cast(0, False)),
+    ]
+    for responses in cases:
+        merged = _merge_votes([(i, item) for i, item in enumerate(responses)], 1, len(responses))
+        check = merged["limitation_checks"][0]
+        supporting = sum(1 for item in responses
+                         if item["limitation_checks"] and
+                         item["limitation_checks"][0]["disclosed"] is True)
+        # 종전 규칙: 과반이 개시라고 해야 개시이고, 동률은 미개시다.
+        assert check["disclosed"] is (supporting * 2 > len(responses))

@@ -24,7 +24,7 @@ from .compare import (DEPENDENT_DOCUMENT_BUDGET_CHARS, DOCUMENT_BUDGET_CHARS,
                       parent_context)
 from .config import (COMPARE_CLAIM_BATCH, COMPARE_MAX_WORKERS, COMPARE_SAMPLES,
                      load_runtime_settings)
-from .consistency import cross_document_notes, enforce_antecedents
+from .consistency import cross_document_notes, enforce_antecedents, reference_warnings
 from .entailment import validate_combination, validate_entailment
 from .models import AnalysisResult, ChainInfo, Claim, Document, ElementMatch
 from .report import (build_claim_report, build_mappings, pipeline_invariants,
@@ -63,7 +63,8 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
             decomposition: dict | None = None,
             cache_keys: set[str] | None = None,
             priority_date: str = "",
-            pinned_decomposition: dict | None = None) -> AnalysisResult:
+            pinned_decomposition: dict | None = None,
+            decomposition_confirmed: bool = False) -> AnalysisResult:
     """cache_keys를 주면 이 분석이 사용한 판정 캐시 키를 담아 돌려줍니다.
 
     캐시 항목에는 문헌 원문 발췌가 들어 있어서, 분석을 지울 때 그 항목도 함께 지워야
@@ -76,8 +77,13 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     validation = list(assign_importance(
         claims, decomposition, claims_text,
         pinned_decomposition=pinned_decomposition,
+        user_confirmed=decomposition_confirmed,
     ))
     validation += input_quality_warnings(claims)
+    # 확정하지 못한 지시 관계는 **본문에** 적습니다. 그런 연결로는 등급을 건드리지 않으므로
+    # (consistency.enforce_antecedents), 여기 적지 않으면 도구가 확정하지 못했다는 사실도
+    # 청구항 문언이 어긋나 있을 수 있다는 신호도 어디에도 남지 않습니다.
+    validation += reference_warnings(claims)
     validation += _date_eligibility_warnings(documents, priority_date)
     by_id = {document.id: document for document in documents}
 
@@ -90,7 +96,7 @@ def analyze(job_id: str, claims_text: str, documents: list[Document],
     # 문자열 대조는 인용문이 PDF에 있다는 사실만 확인합니다. 그 문장이 한정의 입력·동작·출력과
     # 인과관계를 실제로 뒷받침하는지는 좁은 독립 검증으로 다시 확인합니다. 청구항을 함께 넘겨
     # 앞 구성에서 물려받은 지시 대상을 이 구성의 요구사항으로 세지 않게 합니다.
-    verify_notes += validate_entailment(matches, by_id, cache_keys, claims)
+    verify_notes += validate_entailment(matches, by_id, cache_keys, claims, progress)
     # 의미검증은 문헌별로 따로 호출되므로 서로의 판단을 보지 못합니다. 같은 한정이
     # 문헌 간에 갈린 곳을 찾아 남깁니다(되돌리지는 않습니다).
     verify_notes += cross_document_notes(
@@ -184,7 +190,8 @@ def extend_with_dependent_claims(existing: AnalysisResult, claims_text: str,
 
     by_id = {document.id: document for document in documents}
     existing.verify_notes = list(existing.verify_notes) + verify_matches(matches, by_id)
-    existing.verify_notes += validate_entailment(matches, by_id, cache_keys, all_claims)
+    existing.verify_notes += validate_entailment(matches, by_id, cache_keys, all_claims,
+                                                  progress)
     chains = {report.claim_number: report.chain for report in existing.reports}
     new_matrices: dict[int, dict[str, dict[str, ElementMatch]]] = {}
     added: list[Claim] = []
@@ -236,7 +243,7 @@ def _resolve_pending(claim: Claim, chain: ChainInfo, matrix: dict, chains: dict[
         progress(f"청구항 {claim.number} 결합 근거 확인 — 구성 "
                  f"{', '.join(chain.combination_pending)}")
     notes = validate_combination(claim, list(chain.combination_pending), matrix,
-                                 adopted, by_id, cache_keys)
+                                 adopted, by_id, cache_keys, progress)
     if not notes:
         return chain, []
     return build_chain(claim, matrix, chains, all_claims), notes

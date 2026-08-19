@@ -18,21 +18,12 @@
 import re
 
 from .coverage import JUDGMENT_RANK, has_correspondence, judgment_at_rank
-from .models import Claim, ElementMatch
+from .models import Claim, ElementMatch, Reference, ReferenceAlias
 
-# 지시 대상 어구가 끝나는 자리. 조사·연결어미를 만나면 거기까지가 대상입니다.
-# 위치 관계를 나타내는 명사(사이·중·간·내·외)는 뒤에 조사가 바로 붙어 공백이 없으므로
-# 따로 끊습니다. 끊지 않으면 "제2 반사부재 사이"가 통째로 지시 대상이 되어, 정작 앞
-# 구성에 있는 "제2반사부재"와 문자열이 어긋납니다.
-#
-# **조사는 겹쳐 붙습니다(`+`).** 하나만 끊으면 "상기 결함탐지부로부터"에서 '로' 뒤가 공백이
-# 아니라 '부터'라 그 자리를 넘기고, 다음 경계인 '부터 '에서 끊어 지시 대상이 "결함탐지부로"가
-# 됩니다. 앞 구성의 문언은 "…결함탐지부"이므로 이 어구는 어디에도 걸리지 않고, 그 구성은
-# **지시 관계가 아예 없는 것**으로 처리됩니다. 실측에서 로부터/으로부터 형태의 참조
-# (결함탐지부·수평구조물검출부·3차원모델생성부·문자인식부)가 이렇게 통째로 유실됐습니다.
-_BOUNDARY = re.compile(
-    r"(?:사이|중|간|내부|외부|내|외)(?=[에의를은는]|\s|$)"
-    r"|(?:은|는|이|가|을|를|에|의|와|과|로|으로|및|또는|에서|부터|까지)+(?:\s|$)")
+# 위치 관계를 나타내는 명사(사이·중·간·내·외)에서 후보 넓히기를 멈춥니다. 넘어가면 "제2
+# 반사부재 사이"까지 후보가 되는데, 앞 구성의 문언은 "제2반사부재"라 더 긴 쪽이 걸릴 일은
+# 없습니다. 다만 후보를 일찍 잘라 두면 무관한 낱말이 섞이지 않습니다.
+_POSITIONAL = re.compile(r"(?:사이|중|간|내부|외부|내|외)(?=[에의를은는]|\s|$)")
 # 상한의 하한선. 원문 대조를 통과한 발췌가 있으면 **부분 대응**까지는 남깁니다.
 #
 # '차이'까지 내리면 그 구성은 미대응이 되고, 그 문헌은 조합에서 빠져 근거 목록에서도
@@ -42,28 +33,127 @@ _BOUNDARY = re.compile(
 _PARTIAL = JUDGMENT_RANK["일부 유사"]
 
 
-def _heads(text: str) -> list[str]:
-    """"상기 …" 뒤에서 지시 대상 어구만 끊어 냅니다. 표기는 청구항 문언 그대로 둡니다."""
-    heads: list[str] = []
-    for fragment in re.split(r"상기", str(text or ""))[1:]:
-        head = _BOUNDARY.split(fragment.strip(), 1)[0].strip(" ,.;·")
-        if len(re.sub(r"\s+", "", head)) >= 2:
-            heads.append(head)
-    return heads
+# 지시 어구 후보를 넓혀 보는 최대 어절 수. 청구항의 지시 대상은 길어야 대여섯 어절이고,
+# 그보다 길게 잡으면 문장 뒤쪽의 무관한 낱말까지 후보에 들어옵니다.
+_MAX_HEAD_WORDS = 6
+# 후보 꼬리에서 떼어 낼 조사. **어구의 끝을 찍는 데 쓰지 않습니다** — 이미 어절 경계로 자른
+# 후보의 꼬리만 다듬습니다. 어디서 끝나는지는 앞 구성의 문언이 정합니다(_heads).
+#
+# 겹쳐 붙는 조사를 한 번에 뗍니다(`+`). "…결함탐지부로부터"에서 '로'만 떼면 "결함탐지부로"가
+# 남아 앞 구성의 "…결함탐지부"와 어긋나고, 그 참조는 통째로 유실됩니다.
+_TAIL = re.compile(r"(?:은|는|이|가|을|를|에|의|와|과|로|으로|및|또는|에서|부터|까지)+$")
 
 
-def anaphora(text: str) -> list[str]:
-    """"상기 …"가 가리키는 대상 어구를 공백을 지운 형태로 뽑습니다.
+def _candidates(fragment: str) -> list[tuple[str, bool]]:
+    """"상기 …" 뒤의 지시 어구 후보를 **어절 경계로 넓혀 가며** 만듭니다. (어구, 닫혔는지).
 
-    공보와 청구항은 같은 용어를 띄어쓰기만 달리 적는 일이 흔해서("제1반사부재" ↔
-    "제1 반사부재") 공백을 지운 뒤 비교합니다.
+    조사 하나로 어구의 끝을 찍는 방식은 조사가 어구 **안에** 있으면 그 자리에서 잘립니다.
+    실측: "상기 복수의 3차원 기준점들"이 '복수의'의 '의'에서 잘려 지시 대상이 **"복수"**가
+    됐습니다. 그런 낱말을 도입한 구성은 없으므로 그 참조는 통째로 유실됩니다.
+
+    어디서 끝나는지는 문법만으로 정할 수 없습니다("상기 검출부의 출력"의 대상은 검출부이고,
+    "상기 복수의 기준점"의 대상은 복수의 기준점입니다). 그래서 여기서는 **정하지 않고**
+    후보만 늘어놓고, 실제로 앞 구성이 도입한 어구인지로 고르는 일은 호출부가 합니다.
+
+    **닫혔는지**는 그 자리에서 어구가 문법적으로 끝났는지입니다. 조사가 붙었거나(…기준점들**의**,
+    …수집부**에**) 문장·경계가 왔으면 닫힌 것이고, 조사 없이 다음 낱말이 이어지면(가시 두상 →
+    **영상**) 어구 한가운데를 자른 것입니다. 뒤엣것으로 앞 구성에 걸리면 그 연결은 **공통
+    접두어 추측**이지 지시 관계의 확인이 아닙니다 — 호출부가 그 둘을 갈라 씁니다.
     """
-    targets: list[str] = []
-    for head in _heads(text):
-        collapsed = re.sub(r"\s+", "", head)
-        if collapsed not in targets:
-            targets.append(collapsed)
-    return targets
+    stopped = _POSITIONAL.split(fragment.strip(), 1)[0]
+    words = stopped.split()
+    limit = min(len(words), _MAX_HEAD_WORDS)
+    candidates: dict[str, bool] = {}
+    for size in range(1, limit + 1):
+        joined = " ".join(words[:size])
+        head = _TAIL.sub("", joined).strip(" ,.;·")
+        if len(re.sub(r"\s+", "", head)) < 2:
+            continue
+        # 꼬리 조사를 실제로 떼어 냈거나, 후보를 더 넓힐 자리가 없으면(위치 명사·어절 상한·
+        # 문장 끝) 그 자리에서 어구가 닫힌 것입니다.
+        #
+        # 같은 어구가 두 크기에서 나오면 **닫힌 쪽으로 셉니다.** "…점군 및"은 4어절에서
+        # 열린 채로, 5어절에서 '및'을 떼며 닫힌 채로 같은 문자열이 나오는데, 먼저 본 것을
+        # 남기면 닫힌 어구가 열린 것으로 기록되어 확인된 연결이 추측으로 강등됩니다.
+        candidates[head] = candidates.get(head, False) or head != joined or size == limit
+    return list(candidates.items())
+
+
+def _heads(text: str, preceding: list[tuple[str, str, bool]]) -> list[Reference]:
+    """"상기 …"가 가리키는 지시 관계. 어구·도입 구성과 **그 연결의 확실성**.
+
+    후보 중 **앞 구성에 실제로 있는 것**을 고릅니다. 어구의 끝을 문법으로 찍지 않고 앞 구성의
+    문언으로 확인하므로, 조사가 어구 안에 있어도 유실되지 않습니다.
+
+    **가장 긴 후보를 고르되, 그 후보가 어구를 다 덮었는지로 확실성을 가릅니다.** 짧은 후보를
+    닫혔다는 이유로 먼저 고르면 안 됩니다 — "복수의 3차원 기준점들"에서 '의'를 뗀 **"복수"**가
+    닫힌 두 글자 후보로 이기고, 그것이 바로 이 모듈이 고쳐 온 오류입니다.
+
+    어구 한가운데를 자른 접두어가 앞 구성에 우연히 걸리는 일이 잦습니다. 실측한 오연결입니다.
+
+        (A) 가시 두상 **영역**을 추출함
+        (B) 가시 두상 **색상**을 산출함
+        (C) 상기 가시 두상 **영상**을 처리함     ← "가시 두상"만으로는 A인지 B인지 모릅니다
+
+    조사 없이 다음 낱말로 이어지는 자리에서 끊긴 연결(fuzzy)과, 그 어구를 도입한 구성이 둘
+    이상인 연결(ambiguous)은 **추측**입니다. 지우지는 않습니다 — (E)의 "가시 두상 영역"을
+    (G)가 "가시 두상 영상"으로 받아 적은 실측처럼, 청구항의 표기 흔들림을 잡아내는 것도 이
+    추측이기 때문입니다. 다만 등급 상한의 근거로는 쓰지 않습니다(enforce_antecedents).
+    """
+    found: list[Reference] = []
+    for fragment in re.split(r"상기", str(text or ""))[1:]:
+        resolved = [(len(re.sub(r"\s+", "", head)), closed, head, hit)
+                    for head, closed in _candidates(fragment)
+                    if (hit := _introducers(re.sub(r"\s+", "", head), preceding))]
+        if not resolved:
+            continue
+        _, closed, head, sources = max(resolved)
+        quality = "direct" if closed and len(sources) == 1 else (
+            "ambiguous" if len(sources) > 1 else "fuzzy")
+        found.append(Reference(term=head, source=sources[0], quality=quality,
+                               candidates=list(sources)))
+    return found
+
+
+def references(claim: Claim) -> dict[str, list[Reference]]:
+    """구성마다 (지시 어구 원문, 그 어구를 도입한 구성 라벨).
+
+    antecedents()와 antecedent_terms()가 **같은 자료**를 씁니다. 전에는 둘이 각자 청구항을
+    훑으면서 어구를 조금씩 다르게 끊었고, 그래서 같은 참조가 한쪽에는 잡히고 다른 쪽에는
+    안 잡히는 일이 생겼습니다. 지시 관계는 하나이므로 읽는 자리도 하나여야 합니다.
+    """
+    collapsed = [(element.label, re.sub(r"\s+", "", element.text), element.is_preamble)
+                 for element in claim.elements]
+    # 사람이 확정한 별칭만 승격시킵니다. 확정되지 않은 항목은 목록에 있어도 추측 그대로입니다 —
+    # 확정 화면에 올랐다는 사실과 사람이 그렇다고 답했다는 사실은 다릅니다.
+    settled = {(alias.target, alias.term): alias
+               for alias in claim.aliases if alias.settled}
+    links: dict[str, list[Reference]] = {}
+    for index, element in enumerate(claim.elements):
+        # 같은 어구를 한 구성이 두 번 받아 쓰면(H가 "상기 복수의 3차원 기준점들의 …"과 "상기
+        # 복수의 3차원 기준점들 각각에 …"을 함께 쓰는 식) 같은 연결이 확실성만 달리 두 번
+        # 나옵니다. 강한 쪽으로 모읍니다 — 한 번이라도 확인된 연결을 추측으로 적으면, 걸려야
+        # 할 상한이 걸리지 않습니다.
+        best: dict[tuple[str, str], Reference] = {}
+        for found in _heads(element.text, collapsed[:index]):
+            # 확정된 별칭은 **사용자가 고른 후보로** 갈아 끼웁니다. 애매한 참조에서 해소기가
+            # 기본으로 집은 후보와 사람이 고른 후보가 다를 수 있고, 그 자리가 바로 사람에게
+            # 물은 이유입니다. 해소기의 기본값을 남겨 두면 물어본 의미가 없습니다.
+            # **지금 해소기가 찾은 후보**에 대조합니다. 별칭이 지고 있는 후보 목록은 확정 당시의
+            # 것이라, 청구항이 바뀌어 후보에서 빠진 선택도 자기 목록 안에서는 여전히 성립합니다.
+            # 그것을 통과시키면 사용자가 보지 않은 연결이 확정된 채로 판정에 들어갑니다.
+            alias = settled.get((element.label, found.term))
+            if alias is not None and alias.selected_source not in found.candidates:
+                alias = None
+            if alias is not None and not found.confirmed:
+                found = found.model_copy(update={"quality": "confirmed_alias",
+                                                 "source": alias.selected_source})
+            key = (found.term, found.source)
+            if key not in best or (found.confirmed and not best[key].confirmed):
+                best[key] = found
+        if best:
+            links[element.label] = list(best.values())
+    return links
 
 
 def antecedent_terms(claim: Claim) -> dict[str, list[str]]:
@@ -76,18 +166,16 @@ def antecedent_terms(claim: Claim) -> dict[str, list[str]]:
     분해된 한정 문언은 지시어를 풀어 적으므로("상기 플라이휠의 회전 운동을 …" → "크랭크-슬라이드
     기구부가 플라이휠의 회전 운동을 …으로 변환함") 한정만 봐서는 그 낱말이 이 구성의 요구사항인지
     앞 구성에서 온 지시 대상인지 구분할 수 없습니다. 구분은 구성 원문에서만 읽어 낼 수 있습니다.
+
+    **antecedents()와 같은 이유로 확인된 연결만 돌려줍니다.** 이 값은 관측용이 아니라 의미검증의
+    입력입니다(entailment._references). 프롬프트는 여기 실린 낱말을 "이미 앞 구성이 세워 둔
+    대상"으로 놓고 **그 낱말이 근거에 없다는 이유로 기각하지 말라**고 지시하므로, 추측으로 이은
+    어구를 실으면 등급 상한은 안 걸어도 개시 판정의 요구사항이 느슨해집니다. 오연결이 만드는
+    오류가 근거 없는 **강등**에서 근거 없는 **인정**으로 방향만 바뀔 뿐입니다.
     """
-    collapsed = [(element.label, re.sub(r"\s+", "", element.text)) for element in claim.elements]
-    terms: dict[str, list[str]] = {}
-    for index, element in enumerate(claim.elements):
-        for head in _heads(element.text):
-            target = re.sub(r"\s+", "", head)
-            if not any(target in text for _, text in collapsed[:index]):
-                continue
-            bucket = terms.setdefault(element.label, [])
-            if head not in bucket:
-                bucket.append(head)
-    return terms
+    return {label: terms
+            for label, found in references(claim).items()
+            if (terms := list(dict.fromkeys(item.term for item in found if item.confirmed)))}
 
 
 def antecedents(claim: Claim) -> dict[str, list[str]]:
@@ -112,19 +200,111 @@ def antecedents(claim: Claim) -> dict[str, list[str]]:
 
     이 방향의 오류는 P3 불변식이 잡지 못합니다(report._grades_never_exceed_their_own_evidence는
     등급이 유도값보다 **높은** 쪽만 봅니다). 여기서 틀리면 어디서도 걸리지 않습니다.
+
+    **확인된 연결만 돌려줍니다.** 이 값을 쓰는 곳은 전부 판정을 바꾸는 자리입니다 — 등급 상한
+    (enforce_antecedents), 결합 상한 복원(chain), 차이점 서술(report). 추측을 섞어 두면 그
+    셋이 각자 "여기서는 걸러야 한다"를 기억해야 하고, 한 곳이라도 잊으면 근거 없는 강등이
+    조용히 나갑니다. 추측까지 필요한 곳은 references()를 직접 봅니다.
     """
-    collapsed = [(element.label, re.sub(r"\s+", "", element.text), element.is_preamble)
-                 for element in claim.elements]
-    links: dict[str, list[str]] = {}
-    for index, element in enumerate(claim.elements):
-        for target in anaphora(element.text):
-            source = _introducer(target, collapsed[:index])
-            if source is None:
+    return {label: sources
+            for label, found in references(claim).items()
+            if (sources := list(dict.fromkeys(item.source for item in found if item.confirmed)))}
+
+
+def pending_aliases(claim: Claim) -> list[ReferenceAlias]:
+    """확정을 기다리는 별칭 후보. 결정론적 해소가 **확정하지 못한 것만** 올립니다.
+
+    **모델에게 묻지 않습니다.** 여기 오르는 후보는 이미 문언에서 읽어 낸 것이고, 모델이 더할
+    수 있는 것은 "영역과 영상이 같은 대상인가" 같은 의미 판단뿐인데 그것이 바로 사람이 해야
+    한다고 정한 판단입니다. 추측 위에 추측을 얹지 않습니다.
+
+    이미 확정된 항목은 상태를 그대로 지고 남습니다 — 확정 화면을 다시 열었을 때 사용자가
+    앞서 무엇을 확정했는지 보여야 하고, 그 값이 곧 다음 실행의 입력입니다.
+    """
+    stored = {(alias.target, alias.term): alias for alias in claim.aliases}
+    pending: dict[tuple[str, str], ReferenceAlias] = {}
+    for target, found in references(claim).items():
+        for item in found:
+            if item.quality == "direct":
                 continue
-            bucket = links.setdefault(element.label, [])
-            if source not in bucket:
-                bucket.append(source)
-    return links
+            key = (target, item.term)
+            kept = stored.get(key)
+            # 후보가 하나면 고를 것이 없습니다. 비워 두면 "선택되지 않음"이 되어 화면에서
+            # 확정 자체를 할 수 없고(체크박스가 선택을 기다립니다), 실제 사건의 후보는 대부분
+            # 이 형태입니다. 남은 결정이 확정 여부 하나뿐인 자리이므로 미리 채웁니다 —
+            # 채우는 것은 **선택**이지 확정이 아니라, confirmed는 그대로 거짓입니다.
+            default = item.candidates[0] if len(item.candidates) == 1 else ""
+            pending[key] = ReferenceAlias(
+                target=target, term=item.term, candidates=list(item.candidates),
+                # 앞서 고른 값은 **여전히 후보 안에 있을 때만** 지고 남습니다. 청구항이나
+                # 해소 결과가 바뀌어 후보에서 빠진 선택을 되살리면, 사용자가 보지 않은 연결이
+                # 확정된 채로 다음 실행에 들어갑니다.
+                selected_source=(kept.selected_source
+                                 if kept and kept.selected_source in item.candidates
+                                 else default),
+                confirmed=bool(kept and kept.confirmed
+                               and kept.selected_source in item.candidates))
+    return list(pending.values())
+
+
+def reference_warnings(claims: list[Claim]) -> list[str]:
+    """확정하지 못한 지시 관계. **보고서 본문에 나갑니다**(verify_notes가 아닙니다).
+
+    enforce_antecedents가 이런 연결로는 등급을 건드리지 않으므로, 적어 두지 않으면 그 판단은
+    어디에도 남지 않습니다. 그러면 두 가지가 함께 사라집니다 — 도구가 지시 관계를 확정하지
+    못했다는 사실과, **청구항 문언 자체가 어긋나 있을 수 있다는 신호**입니다. 실측에서 한
+    구성이 세운 "가시 두상 영역"을 다음 구성이 "가시 두상 영상"으로 받아 적었는데, 그것은
+    도구가 고칠 문제가 아니라 사람이 청구항을 손봐야 할 문제였습니다.
+    """
+    warnings: list[str] = []
+    for claim in claims:
+        for label, found in references(claim).items():
+            for item in (entry for entry in found if not entry.confirmed):
+                where = (f"구성 {', '.join(item.candidates)} 중 하나로 좁히지 못했습니다"
+                         if item.quality == "ambiguous"
+                         else f"구성 {item.source}으로 추정했습니다(어구가 온전히 일치하지 않음)")
+                warnings.append(
+                    f"청구항 {claim.number} ({label})의 \"{item.term}\"은 지시 대상을 {where}. "
+                    "등급 상한의 근거로는 쓰지 않았으니 청구항 문언을 확인하십시오.")
+    return warnings
+
+
+def _introduces(target: str, text: str) -> bool:
+    """이 구성이 그 어구를 **도입**하는지. 되받아 쓰기만 하는 것은 도입이 아닙니다.
+
+    청구항에서 도입과 참조는 문언으로 갈립니다 — 도입한 자리에는 "상기"가 없고, 되받는
+    자리에는 있습니다. 단순 포함으로 보면 그 둘이 구별되지 않아, 같은 대상을 여러 구성이
+    이어 참조하는 흔한 청구항에서 지시 대상이 도입자가 아니라 **바로 앞의 참조자**로 잡힙니다.
+    그러면 enforce_antecedents가 min(선행 구성 판정)으로 상한을 잡으므로, 아무 관계 없는
+    구성의 미대응이 등급을 끌어내립니다.
+
+        (A) … 데이터수집부                          ← 도입
+        (B) 상기 데이터수집부에 수집된 … 결함탐지부      ← 되받을 뿐
+        (D) 상기 데이터수집부에 수집된 … 수평구조물검출부  ← 지시 대상은 A다
+
+    B의 문언은 D가 쓴 어구를 통째로 품으므로, 긴 어구를 우선하면 D의 지시 대상이 B가 됩니다.
+    "상기"가 앞에 붙었는지만 보면 그 자리가 도입인지 참조인지 바로 갈립니다.
+    """
+    start = text.find(target)
+    while start != -1:
+        if not text[:start].endswith("상기"):
+            return True
+        start = text.find(target, start + 1)
+    return False
+
+
+def _introducers(target: str, preceding: list[tuple[str, str, bool]]) -> list[str]:
+    """이 어구를 도입한 구성 **전부**. 앞선 것이 먼저 옵니다.
+
+    하나만 돌려주면 "이 어구를 도입한 구성이 여럿이라 어느 쪽인지 모른다"는 사실이 사라집니다.
+    그 상태에서 첫 번째를 골라 등급 상한의 근거로 쓰면, 맞게 개시된 구성이 근거 없이 강등될
+    수 있습니다 — 참조 누락(상한이 안 걸림)보다 나쁜 방향입니다.
+    """
+    named = [label for label, text, is_preamble in preceding
+             if _introduces(target, text) and not is_preamble]
+    if named:
+        return named
+    return [label for label, text, _ in preceding if _introduces(target, text)]
 
 
 def _introducer(target: str, preceding: list[tuple[str, str, bool]]) -> str | None:
@@ -141,9 +321,9 @@ def _introducer(target: str, preceding: list[tuple[str, str, bool]]) -> str | No
     실제 구성이 그 어구를 도입했다면 그쪽이 지시 대상입니다.
     """
     for label, text, is_preamble in preceding:
-        if target in text and not is_preamble:
+        if _introduces(target, text) and not is_preamble:
             return label
-    return next((label for label, text, _ in preceding if target in text), None)
+    return next((label for label, text, _ in preceding if _introduces(target, text)), None)
 
 
 # --- 교차문헌 일관성 ----------------------------------------------------------
@@ -207,8 +387,17 @@ def enforce_antecedents(claim: Claim, matrix: dict[str, dict[str, ElementMatch]]
 
     상한은 **같은 문헌 안에서만** 걸립니다. 문헌 A가 앞 구성을, 문헌 B가 뒤 구성을 개시한
     경우는 정상적인 결합이므로 건드리지 않습니다 — 결합은 이후 선정 단계가 판단합니다.
+
+    **확인된 지시 관계만 상한의 근거입니다.** 어구 한가운데서 끊긴 연결이나 도입 구성이 둘
+    이상인 연결은 청구항 문언에서 확인된 것이 아니라 공통 부분에서 미루어 짐작한 것이고, 그런
+    짐작으로 등급을 내리면 **맞게 개시된 구성이 근거 없이 강등됩니다.** 참조를 놓치는 쪽은
+    상한이 안 걸릴 뿐이지만 이쪽은 없는 결격을 만들어 내므로, 방향이 더 나쁩니다.
+
+    짐작을 지우지는 않습니다. 청구항 문언 자체가 어긋나 있을 수도 있으므로(실측: 한 구성이
+    세운 "가시 두상 영역"을 다음 구성이 "가시 두상 영상"으로 받아 적음) 그 사실을 노트로
+    남겨 사람이 확인하게 합니다.
     """
-    links = antecedents(claim)
+    links = antecedents(claim)          # 확인된 연결만 담깁니다
     if not links:
         return []
     notes: list[str] = []

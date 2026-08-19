@@ -384,3 +384,226 @@ def test_a_claim_missing_from_one_run_does_not_stop_aggregation():
 
     assert merged["claims"]["1"]["runs"] == 3
     assert merged["claims"]["1"]["observed_runs"] == 2
+
+
+# --- 문헌별 단독 셀 ------------------------------------------------------------
+# 결합 후 보고서 행에만 기대값을 걸면, "주 인용발명 단독으로 개시"와 "보조 인용발명이
+# 메워 준 것"이 같은 값으로 관측된다. 실측 과대판정(구성 E)이 정확히 그 형태였다.
+
+def _with_cells(observation: dict, cells: dict) -> dict:
+    observation["claims"]["1"]["elements"]["A"]["cells"] = cells
+    return observation
+
+
+def test_a_standalone_cell_can_be_scored_apart_from_the_combined_row():
+    """결합 후 행은 통과하는데 문헌 단독 셀이 과대한 경우를 잡는다."""
+    observation = _with_cells(_observation("실질적 동일"), {
+        "2": {"judgment": "실질적 동일", "directness": "direct", "verify": "verified",
+              "missing": 0, "adopted": True},
+        "1": {"judgment": "일부 유사", "directness": "direct", "verify": "verified",
+              "missing": 0, "adopted": False}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "min_grade": "일부 차이",                       # 결합 후 행은 이대로 좋다
+        "cells": {"2": {"max_grade": "일부 차이"}}}}}}   # 문헌 2 단독으로는 여기까지
+
+    findings = regress.score(observation, expected)
+    failed = [item for item in findings if not item["ok"]]
+
+    assert len(failed) == 1
+    assert "문헌 2 단독" in failed[0]["where"] and "최대" in failed[0]["reason"]
+
+
+def test_a_standalone_cell_expectation_that_holds_passes():
+    observation = _with_cells(_observation("실질적 동일"), {
+        "2": {"judgment": "일부 차이", "missing": 1, "adopted": True}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"2": {"max_grade": "일부 차이", "missing": 1, "adopted": True}}}}}}
+
+    assert all(item["ok"] for item in regress.score(observation, expected))
+
+
+def test_a_cell_expectation_against_an_old_observation_fails_loudly():
+    """기대값을 적어 두었는데 관측에 셀이 없으면 조용히 통과시키지 않는다.
+
+    채점되지 않는 기대값이 가장 위험하다 — 하니스가 켜져 있다고 믿게 된다.
+    """
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"2": {"max_grade": "일부 차이"}}}}}}
+
+    findings = regress.score(_observation("실질적 동일"), expected)
+    failed = [item for item in findings if not item["ok"]]
+
+    assert len(failed) == 1 and "문헌별 셀이 없습니다" in failed[0]["reason"]
+
+
+def test_diff_reports_a_standalone_cell_that_flipped_under_an_unchanged_row():
+    """보고서 행이 그대로여도 결합의 근거가 바뀐 것은 회귀다."""
+    before = _with_cells(_observation("실질적 동일"), {
+        "1": {"judgment": "실질적 동일", "missing": 0, "adopted": True},
+        "2": {"judgment": "차이", "missing": 2, "adopted": False}})
+    after = _with_cells(_observation("실질적 동일"), {
+        "1": {"judgment": "차이", "missing": 2, "adopted": False},
+        "2": {"judgment": "실질적 동일", "missing": 0, "adopted": True}})
+
+    lines = regress.diff(before, after)
+
+    assert len(lines) == 2
+    assert any("문헌 1 단독: 실질적 동일 채택 → 차이 누락2" in line for line in lines)
+    assert regress.diff(before, before) == []
+
+
+def test_diff_ignores_cells_that_the_old_observation_never_recorded():
+    before = _observation("실질적 동일")
+    after = _with_cells(_observation("실질적 동일"),
+                        {"1": {"judgment": "실질적 동일", "missing": 0, "adopted": True}})
+
+    assert regress.diff(before, after) == []
+
+
+def test_aggregate_keeps_a_standalone_cell_that_moves_between_runs():
+    """셀 하나가 갈리면 채택 문헌이 통째로 바뀐다. 동률은 낮은 등급으로 대표한다."""
+    high = _with_cells(_observation("실질적 동일"),
+                       {"2": {"judgment": "실질적 동일", "missing": 0, "adopted": True}})
+    low = _with_cells(_observation("실질적 동일"),
+                      {"2": {"judgment": "일부 유사", "missing": 2, "adopted": False}})
+
+    merged = regress.aggregate([high, low])
+    cell = merged["claims"]["1"]["elements"]["A"]["cells"]["2"]
+
+    assert cell["judgment"] == "일부 유사"          # 동률 → 낮은 등급
+    assert cell["stability"] == "1/2"
+    assert cell["spread"] == {"실질적 동일": 1, "일부 유사": 1}
+    assert cell["adopted"] is False                 # 과반이 아니면 채택으로 적지 않는다
+
+
+def test_aggregate_keeps_every_cell_field_the_expectations_can_score():
+    """집계가 필드를 버리면 --runs 2 이상에서 그 기대값이 조용히 채점되지 않는다.
+
+    채점되지 않는 기대값은 없는 기대값보다 나쁘다 — 하니스가 켜져 있다고 믿게 만든다.
+    """
+    runs = [_with_cells(_observation("일부 차이"), {"2": {
+        "judgment": "일부 차이", "directness": "direct", "verify": "verified",
+        "missing": 0, "unverified": 3, "adopted": True}}) for _ in range(2)]
+
+    cell = regress.aggregate(runs)["claims"]["1"]["elements"]["A"]["cells"]["2"]
+
+    assert cell["unverified"] == 3
+    assert cell["directness"] == "direct" and cell["verify"] == "verified"
+    # 집계본도 그대로 채점되어야 한다.
+    expected = {"adjudicated": True, "claims": {"1": {"A": {"cells": {"2": {
+        "unverified": 3, "directness": "direct", "verify": "verified"}}}}}}
+    assert all(item["ok"] for item in regress.score(regress.aggregate(runs), expected))
+
+
+def test_aggregate_resolves_a_split_directness_conservatively():
+    """동률을 좋은 쪽으로 대표하면 불안정이 안정으로 보인다. 등급 집계와 같은 철학이다."""
+    direct = _with_cells(_observation("일부 차이"),
+                         {"2": {"judgment": "일부 차이", "directness": "direct",
+                                "verify": "verified"}})
+    inferred = _with_cells(_observation("일부 차이"),
+                           {"2": {"judgment": "일부 차이", "directness": "inferred",
+                                  "verify": "partial"}})
+
+    forward = regress.aggregate([direct, inferred])["claims"]["1"]["elements"]["A"]["cells"]["2"]
+    backward = regress.aggregate([inferred, direct])["claims"]["1"]["elements"]["A"]["cells"]["2"]
+
+    assert forward == backward                        # 회차 순서가 대표값을 바꾸지 않는다
+    assert forward["directness"] == "inferred"        # 사전순이면 낙관적인 direct가 뽑힌다
+    assert forward["verify"] == "partial"
+
+
+def test_a_limitation_level_expectation_catches_the_wrong_limitation_being_rejected():
+    """등급만 걸면 검증기가 **문제의 한정은 계속 인정한 채** 다른 한정을 기각해도 통과한다."""
+    observation = _with_cells(_observation("일부 유사"), {"2": {
+        "judgment": "일부 유사", "missing": 1, "unverified": 0, "adopted": True,
+        "limitations": {"절대좌표계에 대응하는 최종 3D 모델을 생성함": "disclosed",
+                        "전역 좌표 정합을 최적화함": "missing"}}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "max_grade": "일부 차이",                                  # 등급 기대는 통과하지만
+        "cells": {"2": {"must_reject_contains": ["절대좌표계"]}}}}}}  # 한정 기대가 잡는다
+
+    failed = [item for item in regress.score(observation, expected) if not item["ok"]]
+
+    assert len(failed) == 1
+    assert "must_reject_contains" in failed[0]["reason"] and "disclosed" in failed[0]["reason"]
+
+
+def test_a_rejected_limitation_satisfies_the_expectation():
+    observation = _with_cells(_observation("일부 유사"), {"2": {
+        "judgment": "일부 유사",
+        "limitations": {"절대좌표계에 대응하는 최종 3D 모델을 생성함": "missing"}}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"2": {"must_reject_contains": ["절대좌표계"]}}}}}}
+
+    assert all(item["ok"] for item in regress.score(observation, expected))
+
+
+def test_an_unverified_limitation_does_not_count_as_rejected():
+    """미완료는 기각이 아니다. 확인하지 못한 것으로 기대값을 만족시키면 안 된다."""
+    observation = _with_cells(_observation("일부 차이"), {"2": {
+        "judgment": "일부 차이",
+        "limitations": {"절대좌표계에 대응하는 최종 3D 모델을 생성함": "unverified"}}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"2": {"must_reject_contains": ["절대좌표계"]}}}}}}
+
+    failed = [item for item in regress.score(observation, expected) if not item["ok"]]
+    assert len(failed) == 1 and "unverified" in failed[0]["reason"]
+
+
+def test_a_phrase_that_no_longer_appears_in_the_decomposition_fails_loudly():
+    """분해가 그 어구를 잃으면 기대값은 아무것도 지키지 못한다. 조용히 통과시키지 않는다."""
+    observation = _with_cells(_observation("일부 유사"), {"2": {
+        "judgment": "일부 유사", "limitations": {"전역 좌표 정합을 최적화함": "missing"}}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"2": {"must_reject_contains": ["절대좌표계"]}}}}}}
+
+    failed = [item for item in regress.score(observation, expected) if not item["ok"]]
+    assert len(failed) == 1 and "분해에 없습니다" in failed[0]["reason"]
+
+
+def test_must_disclose_is_not_satisfied_by_an_unverified_limitation():
+    observation = _with_cells(_observation("일부 차이"), {"1": {
+        "judgment": "일부 차이",
+        "limitations": {"절대좌표계에 대응하는 최종 3D 모델을 생성함": "unverified"}}})
+    expected = {"adjudicated": True, "claims": {"1": {"A": {
+        "cells": {"1": {"must_disclose_contains": ["절대좌표계"]}}}}}}
+
+    assert [item["ok"] for item in regress.score(observation, expected)] == [False]
+
+
+def test_a_novelty_expectation_checks_containment_not_equality():
+    observation = _observation("실질적 동일")
+    observation["claims"]["1"]["novelty_missing"] = {"2": ["A", "E"], "1": ["B"]}
+    expected = {"adjudicated": True, "claims": {"1": {"_novelty_missing": {"2": ["E"]}}}}
+
+    assert all(item["ok"] for item in regress.score(observation, expected))
+
+    expected["claims"]["1"]["_novelty_missing"] = {"1": ["E"]}
+    failed = [item for item in regress.score(observation, expected) if not item["ok"]]
+    assert len(failed) == 1 and "E이 없습니다" in failed[0]["reason"]
+
+
+def test_a_limitation_that_moves_between_runs_satisfies_neither_rule():
+    """불안정을 어느 방향으로도 통과로 읽으면 안 된다 — 규칙마다 안전한 방향이 반대다."""
+    high = _with_cells(_observation("실질적 동일"),
+                       {"2": {"judgment": "실질적 동일", "limitations": {"절대좌표계 한정": "disclosed"}}})
+    low = _with_cells(_observation("일부 유사"),
+                      {"2": {"judgment": "일부 유사", "limitations": {"절대좌표계 한정": "missing"}}})
+
+    merged = regress.aggregate([high, low])
+    assert merged["claims"]["1"]["elements"]["A"]["cells"]["2"]["limitations"] == {
+        "절대좌표계 한정": regress.UNSTABLE_STATE}
+
+    for rule in ("must_reject_contains", "must_disclose_contains"):
+        expected = {"adjudicated": True, "claims": {"1": {"A": {
+            "cells": {"2": {rule: ["절대좌표계"]}}}}}}
+        assert not all(item["ok"] for item in regress.score(merged, expected)), rule
+
+
+def test_aggregate_keeps_cells_absent_when_a_run_never_recorded_them():
+    with_cells = _with_cells(_observation("동일"), {"1": {"judgment": "동일"}})
+    without = _observation("동일")
+
+    merged = regress.aggregate([with_cells, without])
+
+    assert merged["claims"]["1"]["elements"]["A"]["cells"] is None

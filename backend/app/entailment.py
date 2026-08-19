@@ -7,21 +7,29 @@ compare 단계의 LLM은 문헌을 탐색하면서 판정까지 한 번에 수�
 """
 import hashlib
 import json
+import threading
 from collections import defaultdict
-from .agy import AnalysisCancelled, run_cli
+from .agy import AnalysisCancelled, run_cli, run_parallel
 from .cache import ENTAILMENT_CACHE_DIR, ENTAILMENT_KEY_PREFIX, fingerprint
-from .config import load_runtime_settings
+from .config import ENTAILMENT_MAX_WORKERS, load_runtime_settings
 from .consistency import antecedent_terms
-from .coverage import JUDGMENT_RANK, derive_judgment, judgment_at_rank
-from .models import Claim, Document, ElementMatch, LimitationCheck, missing_limitations
+from .coverage import JUDGMENT_RANK, derive_judgment, is_unverified_check, judgment_at_rank
+from .models import (Claim, Document, ElementMatch, LimitationCheck, SemanticEvent,
+                     missing_limitations)
 from .pdf import chunk_text
 
 CACHE_DIR = ENTAILMENT_CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# 인용문이 속한 단락의 국소 문맥만 의미검증에 제공합니다. 특허 단락은 보통 이보다 훨씬
-# 짧지만, 비정상적으로 큰 청크 하나가 검증 프롬프트 대부분을 차지하지 않도록 상한을 둡니다.
-MAX_SOURCE_CONTEXT_CHARS = 12000
+# 인용문 주변이면 의미검증에는 충분합니다. 논문 페이지 청크 전체(종종 1만 자 이상)를 한정마다
+# 반복하면 CLI의 긴 프롬프트 파일 경로를 타고 검증이 통째로 실패하므로 국소 문맥만 보냅니다.
+MAX_SOURCE_CONTEXT_CHARS = 3500
+# 한 항목에 여러 근거·형제 한정의 문맥이 반복될 때의 총량. 원문 quote와 section은 남기고 긴
+# source_context만 줄이므로, 근거 위치와 핵심 문언을 잃지 않으면서 파일 전달 경로를 피합니다.
+MAX_ITEM_SOURCE_CONTEXT_CHARS = 9000
+# 한 문헌의 모든 한정을 한 번에 묻지 않습니다. 실측에서는 7건 요청 하나가 실패하면서 강한
+# 융합 근거까지 전부 미검증으로 바뀌었습니다. 작은 배치면 실패 범위도 그 배치로 제한됩니다.
+MAX_ENTAILMENT_ITEMS_PER_CALL = 2
 
 def entailment_generation() -> str:
     """의미검증 프롬프트의 세대. 구성대비 프롬프트와 별도로 셉니다.
@@ -83,32 +91,36 @@ PDF 원문 대조를 통과한 근거 묶음만 보고 그 묶음이 한정 전�
   지목하지 못하면서 기각했다면 명칭 차이를 근거 결손으로 잘못 읽은 것입니다.
   같은 문헌 안에서 어떤 한정에는 개시를 인정하고 다른 한정에는 같은 성격의 기재를 부정하는
   일이 없도록, 판단 기준을 항목 사이에서 일관되게 유지하십시오.
-- **주체 정체성과 방향성을 별도로 확인하십시오.** 청구항이 같은 모델·네트워크·부재에 여러
-  역할을 귀속시키면 근거도 같은 실체에 그 역할을 귀속시켜야 합니다. 광학계를 모델링하는
-  프록시와 별개의 영상 생성 뉴럴 네트워크를 합쳐 하나의 "광학계를 모델링하는 뉴럴 네트워크"로
-  읽지 마십시오. 이 경우 supported=false이고 reason에 **주체 정체성 축 결손**이라고 적으십시오.
-- 학습에 사용된 프록시·교사 모델·손실 함수의 역할을 학습 대상 네트워크 자체의 역할로 옮기지
-  마십시오. 원문이 두 실체가 동일하거나 학습 후 그 역할을 승계한다고 명시할 때만 연결합니다.
-- 입력→출력 방향이 반대이면 supported=false입니다. 타겟 영상을 입력받아 위상 패턴을 출력하는
-  모델은 보정 영상을 입력받아 타겟 영상을 출력하는 모델을 뒷받침하지 않습니다. 네트워크 밖에서
-  보정행렬을 영상에 적용해 디스플레이로 보내는 절차도, 그 보정 영상이 학습된 네트워크의 입력이고
-  목표 영상이 그 네트워크의 출력이라는 원문 연결이 없으면 뒷받침하지 않습니다. reason에는
-  **방향성 축 결손** 또는 **네트워크 경계 결손**을 명시하십시오.
-- 주체 정체성 검사는 **현재 item의 limitation이 함께 요구하는 역할**에만 적용하십시오. 현재
-  item이 단순히 "뉴럴 네트워크를 학습함"이라면 실제로 학습되는 뉴럴 네트워크의 근거가 있는지
-  판단하고, 형제 한정인 "그 네트워크가 광학계를 모델링함"의 실패를 가져와 함께 기각하지
-  마십시오. 다만 "신경망 학습과 유사하다"는 비유는 실제 뉴럴 네트워크 학습의 근거가 아닙니다.
-- 입력/출력 이미지 **세트 획득** 한정에서는 같은 캘리브레이션 흐름의 제시·공급된
-  stimulus/target 이미지와 대응하는 촬영·관찰 결과가 복수로 존재하면 입력측·출력측 이미지쌍을
-  뒷받침할 수 있습니다. 이때 정확한 명칭보다 제시→촬영 대응과 복수성을 봅니다. 그러나 특정
-  도파관에 입력되어 그 도파관으로부터 출력된다는 별도 한정은 이 일반 영상쌍으로 추론하지 말고,
-  도파관 및 인과 경로를 직접 확인하십시오.
-- 인과 한정의 evidence 묶음에 (1) 시스템에 입력측 영상을 실제로 제시하는 문장과 (2) 그
-  결과 이미지가 **해당 시스템을 통해** 촬영·출력된다는 문장이 같은 장치·실시 흐름으로 들어
-  있으면, 두 문장을 연결하여 인과 경로를 뒷받침할 수 있습니다. 특히 "images were taken through
-  a diffractive waveguide eyepiece" 같은 실제 통과·촬영 문장은 단순히 "display may be a
-  waveguide display"라는 장치 유형 총론과 다릅니다. 전자는 입력 제시 문장과 같은 흐름이면
-  supported=true가 가능하고, 후자만 있으면 인과관계 축 결손입니다.
+- **한정어 축: 기능적 동등으로 수식어를 지우지 마십시오.** functional_equivalent는 같은 것을
+  다르게 부르는 문제를 푸는 도구이지, 청구항이 **좁혀 놓은 범위를 넓히는** 도구가 아닙니다.
+  한정에 붙은 수식어(절대·최종·실시간·사용자별·암호화된·비접촉·단일 …)는 그 자체가 요구사항이므로,
+  나머지가 아무리 잘 대응해도 그 수식어가 요구하는 것이 근거에 없으면 supported=false이고
+  reason에 **한정어 축 결손**이라고 적으십시오. 근거가 상위 개념만 보이고 한정이 그 하위
+  개념을 요구할 때, 상위 개념의 개시로 하위 개념을 인정하는 것이 이 축의 전형적인 실패입니다.
+- **기준계 한정은 "무엇에 대해 고정되어 있는가"로 가르십시오.** 좌표·시각·값의 기준이 걸린
+  한정에서 다음 둘은 다른 것입니다.
+  - **내부 통일 기준**: 여러 부분 결과를 서로 맞춰 하나로 정합한 것. global·common·unified·
+    world·연결된·정합된 같은 말이 붙어도, 그 기준을 정하는 것이 데이터 내부의 상대 관계뿐이면
+    여기에 해당합니다. 임의의 원점·축·축척을 갖습니다.
+  - **외부 고정 기준**: 데이터 밖의 기준(측지 기준계·지상기준점·표준시·인증된 원기 등)에 묶여
+    절대적으로 결정된 것.
+  청구항이 뒤엣것을 요구하면 앞엣것의 개시로는 충족되지 않습니다. 특히 정확도·정밀도·일관성을
+  말하는 문장(accurate·precise·robust·consistent·오차가 작다)은 **상대 정확도**의 진술이므로
+  외부 고정 기준의 근거가 아닙니다. 인정하려면 외부 기준이 **같은 복원·산출 흐름 안에서 최종
+  결과물을 실제로 구속한다**는 기재가 있어야 합니다.
+- **자원이 쓰인 자리를 옮기지 마십시오.** 어떤 자원(위치정보·사전·색인·보조 센서)이 문헌에서
+  후보 탐색·이웃 선별·필터링·초기화에만 쓰였다면, 그 자원의 존재를 최종 결과물에 대한 구속의
+  근거로 이식할 수 없습니다. 같은 이름의 자원이 등장한다는 사실과 그것이 청구된 자리에서
+  청구된 역할을 한다는 사실은 별개입니다. reason에는 그 자원이 원문에서 **실제로 쓰인 자리**를
+  적고 청구된 자리와 어떻게 다른지 밝히십시오.
+- **주체와 흐름의 자리를 보존하십시오.** 별개 주체의 역할을 하나로 합치거나, 입력→출력 방향을
+  뒤집거나, 어떤 자원이 실제로 쓰인 단계와 청구된 단계를 바꾸면 supported=false입니다. 이 검사는
+  현재 limitation이 함께 요구하는 관계에만 적용하고 형제 한정의 실패를 가져오지 마십시오.
+- item의 claim_flow는 청구항 전체의 단계 순서이고 evidence의 section은 원문에서 그 근거가 놓인
+  자리입니다. 개별 문장의 명사·동작뿐 아니라 그 문장이 **문헌의 발명 본체에서 수행되는 단계인지**
+  확인하십시오. 비교실험·성능평가·정답(ground truth) 생성·검증·사후 측정에만 쓰인 센서나 데이터는,
+  원문이 제안 방법의 입력이라고 명시하지 않는 한 청구된 생성 흐름의 입력으로 옮겨 읽지 마십시오.
+  발명 출력물을 먼저 만든 뒤 그것과 비교하려고 취득한 데이터는 시간·인과 위치가 반대입니다.
 - 근거가 **배경기술·해결 과제·연구 동기·요약·향후 적용 가능성**을 서술한 문장이면 그 자체로는
   개시가 아닙니다. "…가 되기 어렵다", "…에 적용될 수 있을 것이다", "본 연구의 목표는 …"
   같은 문장은 그 구성을 실제로 수행하는 실시 기재가 따로 확인될 때만 supported=true입니다.
@@ -135,9 +147,20 @@ items의 item_id를 하나도 빠짐없이 정확히 한 번씩 반환하십시�
 
 def validate_entailment(matches: list[ElementMatch], documents: dict[str, Document],
                         cache_keys: set[str] | None = None,
-                        claims: list[Claim] | None = None) -> list[str]:
-    """원문 검증을 통과한 disclosed 한정만 재심하고 결과를 제자리에서 반영합니다."""
+                        claims: list[Claim] | None = None,
+                        progress=None) -> list[str]:
+    """원문 검증을 통과한 disclosed 한정만 재심하고 결과를 제자리에서 반영합니다.
+
+    배치는 서로를 참조하지 않고 소요 시간의 거의 전부가 CLI 응답 대기라, 구성대비 셀과 같은
+    이유로 **동시에** 돌립니다. 이 단계는 호출 수가 파이프라인에서 가장 많습니다 — 실측
+    1청구항 × 문헌 3건에서 구성대비 3회 대 의미검증 18회였고, 직렬로 돌던 동안 전체 시간의
+    절반 이상을 혼자 썼습니다.
+
+    **결과는 완료 순서에 기대지 않습니다.** 노트 순서가 곧 보고서의 줄 순서이므로 배치를
+    제출 순서로 다시 모읍니다. 요청 페이로드도 병렬 구간에 들어가기 전에 만들어 둡니다.
+    """
     references = _references(claims)
+    claim_flows = _claim_flows(claims)
     grouped: dict[str, list[tuple[ElementMatch, LimitationCheck]]] = defaultdict(list)
     for match in matches:
         if match.error:
@@ -146,63 +169,214 @@ def validate_entailment(matches: list[ElementMatch], documents: dict[str, Docume
             if check.disclosed and _verified_bundle(check):
                 grouped[match.document_id].append((match, check))
 
-    notes: list[str] = []
+    # 노트를 낼 단위를 **순서대로** 늘어놓습니다. 문서를 찾지 못한 자리는 CLI를 부르지 않으므로
+    # 여기서 바로 처리하고, 나머지 배치만 병렬로 돕니다. 이렇게 두면 병렬 실행 여부와 무관하게
+    # 노트가 종전과 같은 순서로 모입니다.
+    slots: list[dict] = []
     for document_id, targets in grouped.items():
         document = documents.get(document_id)
         if document is None:
+            resolved: list[str] = []
             _mark_all_unchecked(targets, "의미검증 대상 문서를 찾을 수 없습니다.",
-                                f"문서 ID {document_id}", notes)
+                                f"문서 ID {document_id}", resolved)
+            slots.append({"notes": resolved})
             continue
-        items = [_item(match, check, references, document) for match, check in targets]
-        payload = {"document_id": document_id, "filename": document.filename, "items": items}
-        try:
-            raw = _cached_run(payload, cache_keys)
-        except AnalysisCancelled:
-            raise
-        except RuntimeError as exc:
+        for batch in _batches(targets, MAX_ENTAILMENT_ITEMS_PER_CALL):
+            # 요청 페이로드는 병렬 구간 **밖에서** 만듭니다. _item은 match 상태를 읽는데 그
+            # 상태는 같은 match의 다른 한정을 맡은 배치가 바꿉니다. 워커 안에서 만들면 같은
+            # 입력에서도 요청 내용이 완료 순서를 따라 달라집니다.
+            slots.append({
+                "targets": batch, "document": document, "label": document.filename,
+                "items": [_item(match, check, references, document,
+                                claim_flows.get(match.claim_number, []))
+                          for match, check in batch],
+            })
+
+    _run_batches(slots, progress, "의미검증",
+                 lambda slot, lock: _validate_target_batch(
+                     slot["targets"], slot["document"], slot["items"], cache_keys, lock))
+    return [note for slot in slots for note in slot.get("notes") or []]
+
+
+def _run_batches(slots: list[dict], progress, label: str, worker) -> None:
+    """CLI를 부르는 배치 slot을 동시에 처리하고 결과 노트를 각 slot에 담습니다.
+
+    판정 반영은 **하나의 잠금 아래에서** 이루어집니다. 한 match의 한정들이 여러 배치로 갈릴 수
+    있는데(_batches는 (match, check) 쌍을 평평하게 자릅니다), _reconcile_match는 그 match의
+    한정 전체를 다시 읽어 등급 상한을 정하기 때문입니다. 잠그지 않으면 두 배치가 같은 match를
+    동시에 고쳐 상한이 부분 상태에서 계산됩니다. 느린 쪽은 CLI 호출이고 그것은 잠금 밖에 있어
+    병렬화의 이득은 그대로 남습니다.
+    """
+    pending = [slot for slot in slots if "notes" not in slot]
+    if not pending:
+        return
+    lock = threading.Lock()
+    total = len(pending)
+    done = 0
+
+    def task(slot: dict):
+        def run():
+            nonlocal done
+            # 노트를 **먼저** 담습니다. 진행률 보고가 취소를 올리더라도 이 배치가 방금 받은
+            # 판정과 그 사유는 남아야 합니다 — 버리면 다음 실행에서 또 받게 됩니다
+            # (_compare_cells가 같은 이유로 취소를 나중에 처리합니다).
+            slot["notes"] = worker(slot, lock)
+            with lock:
+                done += 1
+                position = done
+            if progress:
+                progress(f"{label} {position}/{total} — {slot['label']}", position, total)
+        return run
+
+    outcomes = run_parallel([task(slot) for slot in pending], ENTAILMENT_MAX_WORKERS)
+    for _, error in outcomes:
+        if isinstance(error, AnalysisCancelled):
+            raise error
+    for slot, (_, error) in zip(pending, outcomes):
+        if error is not None and "notes" not in slot:
+            raise error
+
+
+def _batches(items: list, size: int) -> list[list]:
+    """작은 고정 배치. 항목 하나의 실패가 같은 문헌의 모든 판정을 지우지 않게 합니다."""
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def _validate_target_batch(targets: list[tuple[ElementMatch, LimitationCheck]], document: Document,
+                           items: list[dict], cache_keys: set[str] | None,
+                           lock: threading.Lock) -> list[str]:
+    """배치 하나를 심사합니다. **CLI 호출은 잠금 밖, 판정 반영은 잠금 안**입니다.
+
+    items는 호출부가 병렬 구간 밖에서 만들어 넘깁니다(validate_entailment). notes는 이 배치의
+    지역 목록이라 잠글 필요가 없습니다.
+    """
+    payload = {"document_id": document.id, "filename": document.filename, "items": items}
+    notes: list[str] = []
+    try:
+        raw = _cached_run(payload, cache_keys)
+    except AnalysisCancelled:
+        raise
+    except RuntimeError as exc:
+        with lock:
             _mark_all_unchecked(targets, f"근거 의미검증에 실패했습니다: {exc}",
                                 document.filename, notes)
-            continue
+        return notes
 
-        returned = _returned(raw)
-        touched: set[int] = set()
-        for match, check in targets:
-            item_id = _item_id(match, check)
-            verdict = returned.get(item_id)
-            if verdict is None or not isinstance(verdict.get("supported"), bool):
-                _mark_unchecked(match, check, "의미검증 응답에 이 한정의 판단이 없습니다.")
-                notes.append(f"청구항 {match.claim_number} ({match.label}) / {document.filename}: "
-                             f"한정 {check.index}의 의미검증을 수행하지 못했습니다.")
-                continue
-            relation = str(verdict.get("relation") or "unsupported").strip()
-            if relation not in _RELATIONS:
-                relation = "unsupported"
-            reason = " ".join(str(verdict.get("reason") or "").split())
-            if verdict["supported"]:
-                check.semantic_status = "accepted"
-                check.semantic_relation = relation if relation != "unsupported" else "explicit"
-                check.semantic_note = reason
-                directness = str(verdict.get("directness") or "").strip()
-                if directness not in _DIRECTNESS:
-                    directness = "inferred" if relation == "necessary_implicit" else "direct"
-                # 독립 검증은 최초 판정을 올리지 않고 상한만 씌웁니다.
-                if directness == "inferred" and match.directness == "direct":
-                    match.directness = "inferred"
-            else:
-                check.semantic_status = "rejected"
-                check.semantic_relation = "unsupported"
-                check.semantic_note = reason or "근거 묶음이 원자 한정 전체를 뒷받침하지 않습니다."
-                check.disclosed = False
-                notes.append(
-                    f"청구항 {match.claim_number} ({match.label}) / {document.filename}: "
-                    f"한정 {check.index} 개시를 의미검증에서 제외했습니다 ({check.semantic_note})")
-            touched.add(id(match))
-
-        for match, _ in targets:
-            if id(match) in touched:
-                _reconcile_match(match)
-                touched.discard(id(match))
+    returned, reask_notes = _fill_missing_verdicts(returned=_returned(raw), items=items,
+                                                   payload=payload, cache_keys=cache_keys)
+    notes += reask_notes
+    with lock:
+        notes += _apply_verdicts(targets, returned, document)
     return notes
+
+
+def _apply_verdicts(targets: list[tuple[ElementMatch, LimitationCheck]], returned: dict[str, dict],
+                    document: Document) -> list[str]:
+    """받은 판단을 한정과 셀에 반영합니다. **호출부가 잠근 상태에서** 부릅니다."""
+    notes: list[str] = []
+    touched: set[int] = set()
+    for match, check in targets:
+        verdict = returned.get(_item_id(match, check))
+        if verdict is None or not isinstance(verdict.get("supported"), bool):
+            _mark_unchecked(match, check, "의미검증 응답에 이 한정의 판단이 없습니다.")
+            notes.append(f"청구항 {match.claim_number} ({match.label}) / {document.filename}: "
+                         f"한정 {check.index}의 의미검증을 수행하지 못했습니다.")
+            touched.add(id(match))
+            continue
+        relation = str(verdict.get("relation") or "unsupported").strip()
+        if relation not in _RELATIONS:
+            relation = "unsupported"
+        reason = " ".join(str(verdict.get("reason") or "").split())
+        if verdict["supported"]:
+            check.semantic_status = "accepted"
+            check.semantic_relation = relation if relation != "unsupported" else "explicit"
+            check.semantic_note = reason
+            directness = str(verdict.get("directness") or "").strip()
+            if directness not in _DIRECTNESS:
+                directness = "inferred" if relation == "necessary_implicit" else "direct"
+            if directness == "inferred" and match.directness == "direct":
+                match.directness = "inferred"
+            check.record(SemanticEvent(
+                stage="의미검증", outcome="인정", note=check.semantic_note))
+        else:
+            check.semantic_status = "rejected"
+            check.semantic_relation = "unsupported"
+            check.semantic_note = reason or "근거 묶음이 원자 한정 전체를 뒷받침하지 않습니다."
+            check.disclosed = False
+            check.record(SemanticEvent(
+                stage="의미검증", outcome="기각", note=check.semantic_note))
+            notes.append(f"청구항 {match.claim_number} ({match.label}) / {document.filename}: "
+                         f"한정 {check.index} 개시를 의미검증에서 제외했습니다 ({check.semantic_note})")
+        touched.add(id(match))
+
+    for match, _ in targets:
+        if id(match) in touched:
+            _reconcile_match(match)
+            touched.discard(id(match))
+    return notes
+
+
+# 한 문헌에서 결손이 이보다 많으면 단건 재질의로 좁히지 않습니다. 그 정도면 응답 하나가
+# 잘린 것이 아니라 요청 자체가 감당 못 할 크기라는 뜻이고, 단건 호출 수십 번으로 메우면
+# 실행 시간이 검증 단계에 통째로 잠깁니다. 남는 것은 미완료로 두고 보고서가 표시합니다.
+MAX_SINGLE_REASKS = 12
+
+
+def _fill_missing_verdicts(returned: dict[str, dict], items: list[dict], payload: dict,
+                           cache_keys: set[str] | None) -> tuple[dict[str, dict], list[str]]:
+    """응답에서 빠진 item_id만 다시 묻습니다. 묶음으로 한 번, 그래도 남으면 하나씩.
+
+    **왜 재질의인가.** _cached_run은 결손 응답을 캐시에 남기지만 않을 뿐 그대로 돌려주고,
+    그 결손은 같은 실행 안에서 회복되지 않았습니다. 실측에서 한 실행이 7건을 빠뜨렸고 그것이
+    그대로 미완료로 굳었습니다. 미완료 상태는 과대판정을 막는 안전망이지 목표가 아닙니다 —
+    막을 수 있는 결손을 막지 않으면 보고서의 절반이 "확인하지 못했습니다"로 덮입니다.
+
+    **왜 두 단계인가.** 결손의 흔한 원인은 항목 수입니다. 빠진 것만 모아 다시 물으면 목록이
+    짧아져 대개 채워지고, 호출도 한 번이면 끝납니다. 그래도 빠지는 항목은 그 항목 자체에
+    까다로운 데가 있는 경우라, 하나만 담은 요청으로 좁혀야 답이 옵니다.
+
+    **회복하지 못한 것은 조용히 넘기지 않습니다.** 호출을 두 번 더 하고도 판단을 받지 못한
+    항목은 그대로 미완료로 남고, 부르는 쪽이 _mark_unchecked로 표시합니다. 여기서는 몇 건을
+    다시 물어 몇 건이 회복됐는지만 노트에 남깁니다 — 결손이 상시화되면 그 사실이 보여야
+    프롬프트나 항목 수를 손볼 수 있습니다.
+    """
+    pending = [item for item in items if not _has_verdict(returned, item)]
+    if not pending:
+        return returned, []
+    requested = len(pending)
+
+    if len(pending) > 1:
+        returned |= _returned(_ask_subset(payload, pending, cache_keys))
+        pending = [item for item in pending if not _has_verdict(returned, item)]
+    if len(pending) <= MAX_SINGLE_REASKS:
+        for item in list(pending):
+            returned |= _returned(_ask_subset(payload, [item], cache_keys))
+        pending = [item for item in pending if not _has_verdict(returned, item)]
+
+    recovered = requested - len(pending)
+    note = (f"{payload['filename']}: 의미검증 응답에서 {requested}건이 빠져 다시 물었고 "
+            f"{recovered}건을 회복했습니다.")
+    if pending:
+        note += f" {len(pending)}건은 끝내 판단을 받지 못했습니다."
+    return returned, [note]
+
+
+def _ask_subset(payload: dict, items: list[dict], cache_keys: set[str] | None) -> dict:
+    """같은 문헌·같은 프롬프트로 항목만 줄여 다시 묻습니다. 실패는 빈 응답으로 둡니다.
+
+    재질의는 보조 검증의 보조입니다. 여기서 예외를 올리면 결손 한 건이 청구항 전체를
+    미판정으로 돌리게 되는데, 그것은 _mark_unchecked가 피하려는 것과 같은 사고입니다.
+    """
+    try:
+        return _cached_run({**payload, "items": items}, cache_keys)
+    except AnalysisCancelled:
+        raise
+    except RuntimeError:
+        return {}
+
+
+def _has_verdict(returned: dict[str, dict], item: dict) -> bool:
+    return isinstance((returned.get(item["item_id"]) or {}).get("supported"), bool)
 
 
 def _verified_bundle(check: LimitationCheck) -> list:
@@ -227,9 +401,17 @@ def _references(claims: list[Claim] | None) -> dict[tuple[int, str], list[str]]:
             for label, terms in antecedent_terms(claim).items()}
 
 
+def _claim_flows(claims: list[Claim] | None) -> dict[int, list[dict[str, str]]]:
+    """한정 하나를 청구항의 전체 시간·인과 흐름 안에서 읽기 위한 최소 문맥."""
+    return {claim.number: [{"label": element.label, "text": element.text}
+                           for element in claim.elements]
+            for claim in claims or []}
+
+
 def _item(match: ElementMatch, check: LimitationCheck,
           references: dict[tuple[int, str], list[str]] | None = None,
-          document: Document | None = None) -> dict:
+          document: Document | None = None,
+          claim_flow: list[dict[str, str]] | None = None) -> dict:
     evidence = []
     seen: set[tuple[str, str]] = set()
     for chunk_id, quote, translation, alignment in _verified_bundle(check):
@@ -239,19 +421,39 @@ def _item(match: ElementMatch, check: LimitationCheck,
         seen.add(key)
         row = {"chunk_id": chunk_id, "original": quote,
                "translation": translation, "alignment": alignment}
+        section = _source_section(document, chunk_id)
+        if section:
+            row["section"] = section
         context = _source_context(document, chunk_id, quote)
         if context:
             row["source_context"] = context
         evidence.append(row)
     item = {"item_id": _item_id(match, check), "element_label": match.label,
             "limitation": check.limitation, "kind": check.kind, "evidence": evidence}
+    if claim_flow:
+        item["claim_flow"] = claim_flow
     siblings = _sibling_context(match, check, seen, document)
     if siblings:
         item["element_context"] = siblings
     terms = (references or {}).get((match.claim_number, match.label))
     if terms:
         item["reference_terms"] = terms
+    _trim_item_source_context(item)
     return item
+
+
+def _trim_item_source_context(item: dict) -> None:
+    """한 항목에서 반복되는 국소 원문 문맥만 예산 안으로 자릅니다."""
+    remaining = MAX_ITEM_SOURCE_CONTEXT_CHARS
+    for row in [*(item.get("evidence") or []), *(item.get("element_context") or [])]:
+        context = str(row.get("source_context") or "")
+        if not context:
+            continue
+        if remaining <= 0:
+            row.pop("source_context", None)
+            continue
+        row["source_context"] = context[:remaining]
+        remaining -= len(row["source_context"])
 
 
 def _sibling_context(match: ElementMatch, check: LimitationCheck,
@@ -280,11 +482,21 @@ def _sibling_context(match: ElementMatch, check: LimitationCheck,
             row = {"chunk_id": chunk_id, "original": quote,
                    "translation": translation, "alignment": alignment,
                    "from_limitation": sibling.limitation}
+            section = _source_section(document, chunk_id)
+            if section:
+                row["section"] = section
             context = _source_context(document, chunk_id, quote)
             if context:
                 row["source_context"] = context
             rows.append(row)
     return rows
+
+
+def _source_section(document: Document | None, chunk_id: str) -> str:
+    if document is None or not chunk_id:
+        return ""
+    chunk = next((item for item in document.chunks if item.chunk_id == chunk_id), None)
+    return chunk.section if chunk else ""
 
 
 def _source_context(document: Document | None, chunk_id: str, quote: str) -> str:
@@ -339,7 +551,11 @@ def _reconcile_match(match: ElementMatch) -> None:
     match.missing_limitations = missing_limitations(match.limitation_checks)
     checks = match.limitation_checks
     rejected = [check for check in checks if check.semantic_status == "rejected"]
-    if not rejected:
+    # 검증을 받지 못한 한정도 재산출 대상입니다. 개시는 그대로 두지만 등급은 동일급을 받을
+    # 수 없어야 하고(coverage.derive_judgment의 상한), 그 상한이 실제로 걸리려면 여기를
+    # 지나가야 합니다.
+    unchecked = [check for check in checks if is_unverified_check(check)]
+    if not rejected and not unchecked:
         return
     # 최초 판정과 **같은 사다리**로 다시 산출합니다(coverage.derive_judgment). 이 단계가 바꾼
     # 것은 한정별 disclosed뿐이므로, 등급은 그 결과로 따라와야 합니다. 여기에 별도 상한
@@ -356,6 +572,11 @@ def _reconcile_match(match: ElementMatch) -> None:
     if JUDGMENT_RANK.get(match.judgment, 0) > JUDGMENT_RANK[cap]:
         match.downgraded_from = match.downgraded_from or match.judgment
         match.judgment = judgment_at_rank(JUDGMENT_RANK[cap])
+    # 사유는 **기각이 있을 때만** 고쳐 씁니다. 결손만 있는 셀에 "검증된 인용문만으로는
+    # 뒷받침하지 못한다"고 적으면, 판단을 받지 못한 것을 판단해 본 결과로 바꿔 적게 됩니다.
+    # 결손 사실은 check.semantic_note와 보고서의 미완료 표시가 따로 나릅니다.
+    if not rejected:
+        return
     # whole_element 점검의 limitation은 구성 원문 한 줄 전체라, 차이점 줄에 그대로 실으면
     # 구성 문언을 한 번 더 읽어 주는 문장이 됩니다.
     limitations = "; ".join(check.limitation for check in rejected
@@ -384,9 +605,18 @@ def _mark_unchecked(match: ElementMatch, check: LimitationCheck, message: str) -
 
 
 def _mark_all_unchecked(targets, message: str, where: str, notes: list[str]) -> None:
-    """문헌 단위로 의미검증이 통째로 실패한 경우. 노트는 한 줄만 남깁니다."""
+    """문헌 단위로 의미검증이 통째로 실패한 경우. 노트는 한 줄만 남깁니다.
+
+    **재산출까지 반드시 여기서 부릅니다.** 항목이 몇 건 빠진 경로는 아래 루프가 재산출을
+    부르지만, 호출 자체가 실패한 경로는 그대로 `continue`로 빠져나갑니다. 그러면 한정은
+    전부 미완료인데 등급만 '실질적 동일'로 남아, 결손 응답에는 걸리던 상한이 **더 나쁜
+    경우**(한 건도 검증하지 못함)에는 걸리지 않습니다. 안전장치를 우회하는 경로를 하나라도
+    남기면 그 경로로만 새어 나갑니다 — 이 파이프라인이 되풀이한 형태입니다.
+    """
     for match, check in targets:
         _mark_unchecked(match, check, message)
+    for match in {id(match): match for match, _ in targets}.values():
+        _reconcile_match(match)
     notes.append(f"{where}: {message} (한정 {len(targets)}건의 의미검증을 건너뛰었습니다)")
 
 
@@ -412,8 +642,10 @@ def _cached_run(payload: dict, cache_keys: set[str] | None = None,
             pass
         # 항목이 빠진 응답은 다시 물어야 합니다. 남겨 두면 그 결손이 매 실행마다 재생됩니다.
         path.unlink(missing_ok=True)
-    prompt = f"{ENTAILMENT_PROMPT}\nCONTEXT:\n{json.dumps(payload, ensure_ascii=False)}"
-    value = run_cli(prompt, expect="entailments")
+    # 결합 검증은 COMBINATION_PROMPT를 넘깁니다. 여기서 ENTAILMENT_PROMPT로 다시 덮으면 캐시
+    # 키는 '결합 질문'인데 실제 모델은 '문헌 단독 질문'을 받아, 등급과 잔여차이가 어긋납니다.
+    request = f"{prompt}\nCONTEXT:\n{json.dumps(payload, ensure_ascii=False)}"
+    value = run_cli(request, expect="entailments")
     # 온전한 응답만 캐시합니다. 비교 셀이 경고가 없을 때만 저장되는 것과 같은 규율입니다
     # (pipeline._compare_cells). 스키마만 맞고 item_id가 빠진 응답은 run_cli의 재시도에
     # 걸리지 않으므로, 여기서 막지 않으면 한 번의 결손이 캐시에 고착됩니다.
@@ -435,8 +667,7 @@ def _returned(raw: dict) -> dict[str, dict]:
 def _covers_all_items(raw: dict, payload: dict) -> bool:
     """요청한 item_id마다 supported 불리언이 하나씩 돌아왔는지 확인합니다."""
     returned = _returned(raw)
-    return all(isinstance((returned.get(item["item_id"]) or {}).get("supported"), bool)
-               for item in payload["items"])
+    return all(_has_verdict(returned, item) for item in payload["items"])
 
 
 # --- 결합 단위 의미검증 --------------------------------------------------------
@@ -458,6 +689,8 @@ COMBINATION_PROMPT = """[역할]
 - combination_context는 **다른 인용발명**의 문장입니다. 그 문장이 evidence와 같은 실시 흐름일 필요는
   없습니다. 다만 그 문장이 실제로 청구된 축을 개시해야 하고, 배경기술·연구 동기·향후 적용
   가능성 서술은 개시로 보지 않습니다.
+- claim_flow와 evidence의 section을 보고, 평가·정답 생성·사후 검증에만 쓰인 구성을 발명 본체의
+  입력이나 처리 단계로 옮겨 결합하지 마십시오.
 - 문헌들이 서로 다른 대상을 다루고 있어 합쳐도 청구된 관계가 세워지지 않으면 false입니다.
   예를 들어 한 문헌이 A를 모델링하고 다른 문헌이 B라는 별개 대상을 다룬다면, 둘을 합쳐도
   "A를 모델링함"이 되지 않습니다.
@@ -479,7 +712,7 @@ MAX_COMBINATION_CONTEXT = 24
 
 def validate_combination(claim: Claim, labels: list[str], matrix: dict, adopted: list[str],
                          documents: dict[str, Document],
-                         cache_keys: set[str] | None = None) -> list[str]:
+                         cache_keys: set[str] | None = None, progress=None) -> list[str]:
     """축 결손으로 기각된 한정을 **채택 조합 전체**의 근거 위에서 다시 심사합니다.
 
     validate_entailment는 문헌별로 호출되므로 다른 인용발명이 무엇을 개시했는지 볼 수 없습니다.
@@ -495,6 +728,7 @@ def validate_combination(claim: Claim, labels: list[str], matrix: dict, adopted:
     """
     items: list[dict] = []
     targets: list[tuple[ElementMatch, LimitationCheck]] = []
+    claim_flow = _claim_flows([claim]).get(claim.number, [])
     for label in labels:
         context = _combination_context(claim, label, matrix, adopted, documents)
         if not context:
@@ -506,7 +740,7 @@ def validate_combination(claim: Claim, labels: list[str], matrix: dict, adopted:
             for check in match.limitation_checks:
                 if check.semantic_status != "rejected":
                     continue
-                item = _item(match, check, None, documents.get(document_id))
+                item = _item(match, check, None, documents.get(document_id), claim_flow)
                 item["rejected_reason"] = check.semantic_note
                 item["combination_context"] = context
                 items.append(item)
@@ -514,48 +748,74 @@ def validate_combination(claim: Claim, labels: list[str], matrix: dict, adopted:
     if not items:
         return []
 
+    slots = [{"targets": [target for _, target in batch],
+              "items": [item for item, _ in batch],
+              "label": f"청구항 {claim.number}"}
+             for batch in _batches(list(zip(items, targets)), MAX_ENTAILMENT_ITEMS_PER_CALL)]
+    _run_batches(slots, progress, "결합 근거 확인",
+                 lambda slot, lock: _combination_batch(claim, adopted, slot["targets"],
+                                                       slot["items"], documents, cache_keys, lock))
+    return [note for slot in slots for note in slot.get("notes") or []]
+
+
+def _combination_batch(claim: Claim, adopted: list[str],
+                       batch_targets: list[tuple[ElementMatch, LimitationCheck]],
+                       batch_items: list[dict], documents: dict[str, Document],
+                       cache_keys: set[str] | None, lock: threading.Lock) -> list[str]:
+    """결합 심사 배치 하나. 문헌 단독 심사와 같은 규율입니다 — 호출은 잠금 밖, 반영은 잠금 안.
+
+    한 match의 한정들이 여러 배치로 갈릴 수 있어 _reconcile_match가 겹칠 수 있습니다
+    (_run_batches 참조).
+    """
     notes: list[str] = []
-    payload = {"claim_number": claim.number, "adopted_documents": adopted, "items": items}
+    payload = {"claim_number": claim.number, "adopted_documents": adopted,
+               "items": batch_items}
     try:
         raw = _cached_run(payload, cache_keys, prompt=COMBINATION_PROMPT)
     except AnalysisCancelled:
         raise
     except RuntimeError as exc:
-        # 결합 심사를 받지 못하면 문헌 단독 판단이 그대로 남습니다. 유보 상태가 유지되므로
-        # 보고서는 계속 "결합 위에서 확인 필요"라고 적습니다 — 없는 결론을 지어내지 않습니다.
-        return [f"청구항 {claim.number}: 결합 단위 의미검증에 실패해 유보 상태로 두었습니다: {exc}"]
+        # 실패한 작은 배치만 유보합니다. 다른 한정의 결합 판단까지 함께 버리지 않습니다.
+        return [f"청구항 {claim.number}: 결합 단위 의미검증에 실패해 유보 상태로 "
+                f"두었습니다: {exc}"]
 
     returned = _returned(raw)
-    touched: set[int] = set()
-    for match, check in targets:
-        verdict = returned.get(_item_id(match, check))
-        if verdict is None or not isinstance(verdict.get("supported"), bool):
-            continue                       # 판단을 받지 못한 항목은 유보 그대로 둡니다.
-        reason = " ".join(str(verdict.get("reason") or "").split())
-        if verdict["supported"]:
-            supplied = [str(item) for item in verdict.get("supplied_by") or []
-                        if str(item) in set(adopted) and str(item) != match.document_id]
-            if not supplied:
-                # 빠진 축을 댄 문헌을 지목하지 못한 인정은 받지 않습니다. 그것은 결합이 아니라
-                # 문헌 단독 판단을 뒤집는 것이고, 그 판단은 앞 단계가 이미 내렸습니다.
-                continue
-            check.semantic_status = "accepted_in_combination"
-            check.semantic_note = reason or "채택 조합 전체의 근거가 이 한정을 뒷받침합니다."
-            check.combination_documents = supplied
-            notes.append(f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
-                         f"한정 {check.index}을 결합 근거로 인정했습니다 "
-                         f"(빠진 축은 문헌 {', '.join(supplied)}가 개시 — {check.semantic_note})")
-        else:
-            check.semantic_status = "rejected_in_combination"
-            check.semantic_note = reason or "채택 조합 전체로도 이 한정을 뒷받침하지 못합니다."
-            notes.append(f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
-                         f"한정 {check.index}은 결합 근거로도 확인되지 않았습니다 ({check.semantic_note})")
-        touched.add(id(match))
+    with lock:
+        touched: set[int] = set()
+        for match, check in batch_targets:
+            verdict = returned.get(_item_id(match, check))
+            if verdict is None or not isinstance(verdict.get("supported"), bool):
+                continue                       # 판단을 받지 못한 항목은 유보 그대로 둡니다.
+            reason = " ".join(str(verdict.get("reason") or "").split())
+            if verdict["supported"]:
+                supplied = [str(item) for item in verdict.get("supplied_by") or []
+                            if str(item) in set(adopted) and str(item) != match.document_id]
+                if not supplied:
+                    continue
+                check.semantic_status = "accepted_in_combination"
+                check.semantic_note = reason or "채택 조합 전체의 근거가 이 한정을 뒷받침합니다."
+                check.combination_documents = supplied
+                check.record(SemanticEvent(
+                    stage="결합검증", outcome="인정", note=check.semantic_note,
+                    supplied_by=list(supplied)))
+                notes.append(
+                    f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
+                    f"한정 {check.index}을 결합 근거로 인정했습니다 "
+                    f"(빠진 축은 문헌 {', '.join(supplied)}가 개시 — {check.semantic_note})")
+            else:
+                check.semantic_status = "rejected_in_combination"
+                check.semantic_note = reason or "채택 조합 전체로도 이 한정을 뒷받침하지 못합니다."
+                check.record(SemanticEvent(
+                    stage="결합검증", outcome="기각", note=check.semantic_note))
+                notes.append(
+                    f"청구항 {claim.number} ({match.label}) / {documents[match.document_id].filename}: "
+                    f"한정 {check.index}은 결합 근거로도 확인되지 않았습니다 ({check.semantic_note})")
+            touched.add(id(match))
 
-    for match, _ in targets:
-        if id(match) in touched:
-            _reconcile_match(match)
-            touched.discard(id(match))
+        for match, _ in batch_targets:
+            if id(match) in touched:
+                _reconcile_match(match)
+                touched.discard(id(match))
     return notes
 
 

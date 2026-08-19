@@ -2,10 +2,11 @@ import fitz
 import json
 import threading
 import time
+import pytest
 from fastapi.testclient import TestClient
 
 from app import agy, cache, main
-from app.models import AnalysisResult
+from app.models import AnalysisResult, Limitation
 
 client = TestClient(main.app)
 
@@ -57,7 +58,7 @@ def post_job():
 
 def fake_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
                 decomposition=None, cache_keys=None, priority_date="",
-                pinned_decomposition=None):
+                pinned_decomposition=None, decomposition_confirmed=False):
     if progress:
         progress("구성대비 1/1")
     if decomposition is not None:
@@ -98,7 +99,7 @@ def test_async_job_can_be_cancelled_without_leaving_a_report(monkeypatch):
 
     def slow_result(job_id, claims_text, documents, analysis_prompt="", progress=None,
                     decomposition=None, cache_keys=None, priority_date="",
-                    pinned_decomposition=None):
+                    pinned_decomposition=None, decomposition_confirmed=False):
         entered.set()
         while not agy.is_cancelled(job_id):
             time.sleep(0.01)
@@ -242,7 +243,7 @@ def test_cell_progress_is_exposed_as_numbers(monkeypatch):
     """진행률을 문자열에만 담으면 화면이 진행 바를 그릴 수 없습니다."""
     def analyze_with_progress(job_id, claims_text, documents, analysis_prompt="", progress=None,
                               decomposition=None, cache_keys=None, priority_date="",
-                              pinned_decomposition=None):
+                              pinned_decomposition=None, decomposition_confirmed=False):
         progress("구성대비 3/8 — 청구항 1 × prior.pdf", 3, 8)
         assert client.get(f"/api/jobs/{job_id}").json()["progress"] == {"done": 3, "total": 8}
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
@@ -575,8 +576,9 @@ def test_the_confirmed_decomposition_is_what_the_analysis_runs_on(monkeypatch):
 
     def capture(job_id, claims_text, documents, analysis_prompt="", progress=None,
                 decomposition=None, cache_keys=None, priority_date="",
-                pinned_decomposition=None):
+                pinned_decomposition=None, decomposition_confirmed=False):
         seen["pinned"] = pinned_decomposition
+        seen["confirmed"] = decomposition_confirmed
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
 
     monkeypatch.setattr(main, "analyze", capture)
@@ -590,6 +592,9 @@ def test_the_confirmed_decomposition_is_what_the_analysis_runs_on(monkeypatch):
     confirm_decomposition(job_id, edited)
 
     assert seen["pinned"]["claims"] == edited["claims"]
+    # 확정본은 회귀 고정 분해와 같은 인자로 들어가므로, 출처를 함께 넘기지 않으면 보고서가
+    # 사용자가 확정한 분해를 실험용 고정 파일에서 읽은 것으로 알린다(claims.assign_importance).
+    assert seen["confirmed"] is True
     client.delete(f"/api/history/{job_id}")
 
 
@@ -696,7 +701,7 @@ def test_what_lands_in_claim_elements_is_exactly_what_was_confirmed(monkeypatch)
 
     def analyze_with_the_real_decomposition(
             job_id, claims_text, documents, analysis_prompt="", progress=None,
-            decomposition=None, cache_keys=None, priority_date="", pinned_decomposition=None):
+            decomposition=None, cache_keys=None, priority_date="", pinned_decomposition=None, decomposition_confirmed=False):
         parsed = parse_claims(claims_text)
         assign_importance(parsed, decomposition, claims_text,
                           pinned_decomposition=pinned_decomposition)
@@ -730,7 +735,7 @@ def test_only_one_worker_starts_when_confirmations_race(monkeypatch):
 
     def slow_analyze(job_id, claims_text, documents, analysis_prompt="", progress=None,
                      decomposition=None, cache_keys=None, priority_date="",
-                     pinned_decomposition=None):
+                     pinned_decomposition=None, decomposition_confirmed=False):
         started.release()
         running.wait(timeout=2)
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
@@ -794,7 +799,7 @@ def test_the_stored_decomposition_is_the_normalised_one(monkeypatch):
 
     def capture(job_id, claims_text, documents, analysis_prompt="", progress=None,
                 decomposition=None, cache_keys=None, priority_date="",
-                pinned_decomposition=None):
+                pinned_decomposition=None, decomposition_confirmed=False):
         seen["pinned"] = pinned_decomposition
         return AnalysisResult(job_id=job_id, claim_mapping=[], reports=[], validation=[])
 
@@ -844,3 +849,182 @@ def test_orphan_staging_folders_are_swept_at_startup():
 
     assert not orphan.exists()
     assert main.STAGING_DIR.exists()
+
+
+# --- 지시 관계 확정 관문 --------------------------------------------------------
+# 별칭은 개시 인정(의미검증의 reference_terms)과 등급 강등(enforce_antecedents)을 둘 다 바꾼다.
+# 화면이 체크박스만 내주더라도 확정 요청은 그냥 JSON이므로, 서버가 제안 목록과 대조해야 한다.
+
+ALIAS_CLAIM = ("(A) 가시 두상 영역을 추출하는 단계 (B) 비가시 두피 영역을 추정하는 단계 "
+               "(C) 상기 가시 두상 영상과 상기 비가시 두피 영역을 결합하는 단계")
+
+
+@pytest.fixture
+def alias_job(monkeypatch):
+    """확정 대기 상태의 작업 하나. **CLI를 부르지 않는다** — 분해 제안도 분석도 스텁이다."""
+    def proposed(claims_text: str):
+        from app.claims import parse_claims, dump_decomposition
+        claims = parse_claims(claims_text)
+        for claim in claims:
+            for element in claim.elements:
+                element.limitations = [Limitation(text=f"{element.text} 수행함", kind="core")]
+                element.search_terms = ["두상"]
+        return dump_decomposition(claims), []
+
+    monkeypatch.setattr("app.main.propose_decomposition", proposed)
+    monkeypatch.setattr(main, "analyze", fake_result)
+    job_id = client.post("/api/jobs/prepare").json()["job_id"]
+    client.post(f"/api/jobs/{job_id}/start", data={"claims": ALIAS_CLAIM},
+                files={"pdf_files": ("prior.pdf", pdf_bytes(), "application/pdf")})
+    join_worker(job_id)
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "awaiting_decomposition"
+    yield job_id
+    client.delete(f"/api/history/{job_id}")
+
+
+def test_the_gate_offers_the_unconfirmed_reference(alias_job):
+    """확정하지 못한 지시 관계가 분해와 **같은 화면**으로 나간다."""
+    payload = client.get(f"/api/jobs/{alias_job}/decomposition").json()
+
+    assert payload["aliases"]["1"] == [
+        {"target": "C", "term": "가시 두상", "candidates": ["A"],
+         "selected_source": "A", "confirmed": False}]
+
+
+def test_checking_the_box_and_posting_confirms_the_link(alias_job):
+    """체크 → POST → 확정 경로 전체. 확정본이 분석 입력으로 그대로 넘어간다."""
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    draft["aliases"]["1"][0].update({"confirmed": True, "selected_source": "A"})
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+    join_worker(alias_job)
+
+    assert response.status_code == 202
+    settled = response.json()["decomposition"]["aliases"]["1"][0]
+    assert (settled["confirmed"], settled["selected_source"]) == (True, "A")
+
+
+def test_an_invented_alias_is_rejected(alias_job):
+    """제안되지 않은 지시 관계를 보내면 사람이 본 적 없는 연결이 판정에 들어간다."""
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    draft["aliases"]["1"].append({"target": "C", "term": "비가시 두피", "candidates": ["B"],
+                                  "selected_source": "B", "confirmed": True})
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+
+    assert response.status_code == 400
+    assert "제안되지 않은" in response.json()["detail"]
+
+
+def test_a_source_outside_the_offered_candidates_is_rejected(alias_job):
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    draft["aliases"]["1"][0].update({"confirmed": True, "selected_source": "B"})
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+
+    assert response.status_code == 400
+    assert "후보" in response.json()["detail"]
+
+
+def test_widening_the_candidate_list_is_rejected(alias_job):
+    """후보 목록을 늘려 보내면 고를 수 있는 범위가 사용자 손에서 넓어진다."""
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    draft["aliases"]["1"][0].update({"candidates": ["A", "B"], "confirmed": True,
+                                     "selected_source": "B"})
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+
+    assert response.status_code == 400
+    assert "후보는 고칠 수 없습니다" in response.json()["detail"]
+
+
+def test_a_confirmation_never_reaches_the_shared_decomposition_cache(alias_job):
+    """확정은 **특정 사람이 특정 사건에서 내린 판단**이라 청구항 문언이 같다고 물려주지 않는다.
+
+    캐시의 다른 값은 모델이 만든 도출이므로 재사용이 비용 절약이지만, 이것을 물려주면 다음
+    실행은 그 사용자가 본 적도 없는 판단 위에서 돌면서 보고서에는 아무 표시도 남지 않는다.
+    """
+    from app import cache
+    from app.claims import decomposition_generation
+
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    draft["aliases"]["1"][0].update({"confirmed": True, "selected_source": "A"})
+    client.post(f"/api/jobs/{alias_job}/decomposition/confirm", json={"decomposition": draft})
+    join_worker(alias_job)
+
+    shared = cache.load_decomposition(
+        cache.decomposition_key(ALIAS_CLAIM, decomposition_generation()))
+    assert shared is None or "aliases" not in shared
+
+
+def test_moving_an_alias_to_another_claim_is_rejected(alias_job):
+    """청구항 번호가 키에 없으면 target·term만 같아도 통과한다.
+
+    별칭이 가리키는 앞 구성은 청구항마다 다르므로, 옮겨진 확정은 사람이 본 적 없는 연결이다.
+    """
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    moved = {**draft["aliases"]["1"][0], "confirmed": True, "selected_source": "A"}
+    draft["aliases"] = {"2": [moved]}
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+
+    assert response.status_code == 400
+    assert "제안되지 않은" in response.json()["detail"]
+
+
+def test_a_duplicated_alias_is_rejected(alias_job):
+    """같은 별칭이 두 번 오면 나중 것이 앞선 것을 덮어, 확정한 것과 반영된 것이 갈린다."""
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    first = {**draft["aliases"]["1"][0], "confirmed": True, "selected_source": "A"}
+    draft["aliases"]["1"] = [first, {**first, "confirmed": False}]
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+
+    assert response.status_code == 400
+    assert "두 번 있습니다" in response.json()["detail"]
+
+
+def test_the_gate_is_confirmable_without_editing_the_payload(alias_job):
+    """화면이 내주는 값 그대로 **체크만** 해서 확정할 수 있어야 한다.
+
+    후보가 하나인 관계에서 selected_source가 비어 있으면 화면의 체크박스가 잠긴 채로 남아
+    확정할 방법이 없다. 실제 사건의 후보는 대부분 이 형태다.
+    """
+    draft = client.get(f"/api/jobs/{alias_job}/decomposition").json()["decomposition"]
+    assert draft["aliases"]["1"][0]["selected_source"]          # 화면이 고를 것이 없다
+    draft["aliases"]["1"][0]["confirmed"] = True                # 사용자는 체크만 한다
+
+    response = client.post(f"/api/jobs/{alias_job}/decomposition/confirm",
+                           json={"decomposition": draft})
+    join_worker(alias_job)
+
+    assert response.status_code == 202
+
+
+def test_a_legacy_shared_cache_entry_cannot_confirm_anything(alias_job, monkeypatch):
+    """이 규칙이 생기기 전에 저장된 확정이 공유 캐시에 남아 있어도 되살아나면 안 된다."""
+    from app import cache
+    from app.claims import assign_importance, decomposition_generation, parse_claims
+
+    claims = parse_claims(ALIAS_CLAIM)
+    poisoned = {"version": decomposition_generation(), "claims": {
+        "1": [{"label": element.label, "text": element.text, "importance": 3, "is_sub": False,
+               "search_terms": ["두상"],
+               "limitations": [{"text": f"{element.text} 수행함", "kind": "core",
+                                "alternative_group": ""}]}
+              for element in claims[0].elements]},
+        "aliases": {"1": [{"target": "C", "term": "가시 두상", "candidates": ["A"],
+                           "selected_source": "A", "confirmed": True}]}}
+    cache.store_decomposition(
+        cache.decomposition_key(ALIAS_CLAIM, decomposition_generation()), poisoned)
+
+    fresh = parse_claims(ALIAS_CLAIM)
+    assign_importance(fresh, {}, ALIAS_CLAIM)
+
+    assert fresh[0].aliases == []
